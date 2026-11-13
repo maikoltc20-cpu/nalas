@@ -1,0 +1,37 @@
+# NALAS Piloto — Cloudflare Workers Free + Neon Free PostgreSQL
+# Sin servicios adicionales facturables (sin Queues, Durable Objects, Hyperdrive ni R2).
+
+name = "nalas-piloto"
+main = "src/worker.ts"
+compatibility_date = "2026-03-01"
+compatibility_flags = ["nodejs_compat"]
+
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+run_worker_first = ["/api/*"]
+not_found_handling = "single-page-application"
+
+[triggers]
+# Revisión periódica de reintentos pendientes cada 30 minutos (48/día; permite auto-suspensión de Neon Free).
+# Cuando META_OUTBOUND_ENABLED="false", scheduled() finaliza sin abrir conexiones ni consultar Neon.
+# El intento inmediato tras recibir mensajes por webhook se mantiene activo mediante ctx.waitUntil().
+crons = ["*/30 * * * *"]
+
+[vars]
+NODE_ENV = "production"
+NALAS_DISABLE_DEMO_LOGIN = "true"
+META_BUSINESS_ID = "biz_nexo"
+# Mantener en "false" hasta validar webhook y credenciales definitivas de WhatsApp Cloud API
+META_OUTBOUND_ENABLED = "false"
+
+# Configurar únicamente como Secrets en Cloudflare Dashboard (Workers & Pages -> Settings -> Variables and Secrets)
+# o con "npx wrangler secret put <NOMBRE>" (nunca incluir valores secretos en este repositorio):
+#   - DATABASE_URL              (obligatorio: cadena Neon "-pooler")
+#   - NALAS_SESSION_SECRET      (obligatorio: >= 32 caracteres aleatorios)
+#   - NALAS_ADMIN_EMAIL         (obligatorio para login/inicialización controlada)
+#   - NALAS_ADMIN_PASSWORD      (obligatorio para login/inicialización controlada)
+#   - NALAS_INIT_SECRET         (opcional: token dedicado para POST /api/system/initialize)
+#   - META_APP_SECRET           (obligatorio al validar firma de Meta Webhook)
+#   - APP_URL                   (opcional: https://<worker>.<subdominio>.workers.dev)
+#   - META_WHATSAPP_ACCESS_TOKEN / META_PHONE_NUMBER_ID (solo al habilitar envíos reales más adelante)

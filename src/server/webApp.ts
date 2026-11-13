@@ -1,0 +1,1415 @@
+import { Hono } from 'hono';
+import type {
+  CommercialStatus,
+  Edition,
+  Environment,
+  FlowStep,
+  Opportunity,
+  OutOfScriptRule,
+  ProPolicyVersion,
+  RulesetVersion,
+} from '../shared/types.ts';
+import { runAcceptanceSuite } from './modules/acceptanceRunner.ts';
+import {
+  assertPermission,
+  createBusinessAccount,
+  resolveActorContext,
+} from './modules/accounts.ts';
+import {
+  authenticateUserCredentials,
+  buildClearSessionCookieHeader,
+  buildSetSessionCookieHeader,
+  hashPassword,
+  isDemoQuickLoginEnabled,
+  resolveAuthenticatedUserFromCookieHeader,
+  signSessionToken,
+} from './modules/auth.ts';
+import { buildCleanBackupExport } from './modules/backupExport.ts';
+import { evaluateRuleset } from './modules/basicEngine.ts';
+import {
+  buildDynamicLeadsCsv,
+  updateOpportunityStatus,
+} from './modules/commercial.ts';
+import {
+  publishFlowDraft,
+  rollbackFlowVersion,
+  saveFlowDraft,
+  updateProPolicy,
+  validateFlowAndDependencies,
+  validateRulesetDependencies,
+} from './modules/config.ts';
+import { appendAudit, getCostSummary } from './modules/consumptionAndAudit.ts';
+import {
+  assertControlledInitSecretsPresent,
+  getDatabaseInitStatus,
+  initializeDatabaseControlled,
+  isAuthorizedForInitialSetup,
+} from './modules/dbInit.ts';
+import {
+  processInboundMessage,
+  runSerializedForConversation,
+  sendInitialBasicGreeting,
+  startOrGetSimulatorConversation,
+} from './modules/conversations.ts';
+import {
+  listAvailableAdapters,
+  processOutboxEvent,
+  swapConnectionAdapter,
+} from './modules/integrations.ts';
+import {
+  getMetaIntegrationConfig,
+  isMetaOutboundEnabled,
+  processDueOutboxRetries,
+  processMetaWebhookEvents,
+  regenerateServerVerifyToken,
+  verifyMetaChallenge,
+  verifyMetaSignature,
+} from './modules/metaWebhook.ts';
+import {
+  assertTenantScope,
+  createBackupSnapshot,
+  getStorageBackendInfo,
+  readStore,
+  restoreBackupSnapshot,
+  withStoreTransaction,
+} from './modules/persistence.ts';
+import { getEnv, isWorkerRuntime } from './runtimeContext.ts';
+
+type AppVariables = {
+  authUserId?: string;
+};
+
+export const webApp = new Hono<{ Variables: AppVariables }>();
+
+function getActorContext(c: {
+  get: (key: 'authUserId') => string | undefined;
+  req: { header: (name: string) => string | undefined; query: (name: string) => string | undefined };
+}): { userId: string; businessId: string } {
+  const userId = c.get('authUserId');
+  if (!userId) {
+    const err = new Error('Sesión no autenticada.');
+    (err as Error & { statusCode?: number }).statusCode = 401;
+    throw err;
+  }
+  const businessId = String(c.req.header('x-nalas-business-id') || c.req.query('businessId') || 'biz_opting');
+  return { userId, businessId };
+}
+
+function isHttpsRequest(req: Request, headerGetter: (name: string) => string | undefined): boolean {
+  if (headerGetter('x-forwarded-proto') === 'https') return true;
+  try {
+    return new URL(req.url).protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+function errorResponse(err: unknown): Response {
+  const status = (err as { statusCode?: number })?.statusCode ?? 400;
+  const message = err instanceof Error ? err.message : 'Error interno del servidor';
+  const issues = (err as { issues?: unknown })?.issues;
+  return new Response(JSON.stringify({ error: message, issues }), {
+    status,
+    headers: { 'Content-Type': 'application/json; charset=utf-8' },
+  });
+}
+
+function assertPlatformAdmin(store: Awaited<ReturnType<typeof readStore>>, userId: string) {
+  const actor = store.users.find((u) => u.id === userId);
+  if (!actor || !actor.isPlatformAdmin) {
+    const err = new Error('Acceso restringido a administración de plataforma NALAS.');
+    (err as Error & { statusCode?: number }).statusCode = 403;
+    throw err;
+  }
+  return actor;
+}
+
+// ---------------------------------------------------------------------------
+// 0. Public Healthcheck & Authentication Endpoints
+// ---------------------------------------------------------------------------
+
+webApp.get('/api/health', (c) => {
+  const storage = getStorageBackendInfo();
+  return c.json({
+    ok: true,
+    runtime: isWorkerRuntime() ? 'cloudflare_workers' : 'node',
+    storageBackend: storage.backend,
+    persistentAcrossRestarts: storage.persistentAcrossRestarts,
+    outboundEnabled: isMetaOutboundEnabled(),
+    timestamp: new Date().toISOString(),
+  });
+});
+
+webApp.get('/api/system/status', async (c) => {
+  try {
+    const storage = getStorageBackendInfo();
+    const initStatus = await getDatabaseInitStatus();
+    return c.json({
+      ok: true,
+      runtime: isWorkerRuntime() ? 'cloudflare_workers' : 'node',
+      storageBackend: storage.backend,
+      persistentAcrossRestarts: storage.persistentAcrossRestarts,
+      outboundEnabled: isMetaOutboundEnabled(),
+      initialized: initStatus.initialized,
+      tablesCreated: initStatus.tablesCreated,
+    });
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.post('/api/system/initialize', async (c) => {
+  try {
+    const body = (await c.req.json().catch(() => ({}))) as {
+      initSecret?: string;
+      adminEmail?: string;
+      adminPassword?: string;
+      forceSchemaSync?: boolean;
+    };
+    const initStatus = await getDatabaseInitStatus();
+
+    if (initStatus.initialized) {
+      const uid = await resolveAuthenticatedUserFromCookieHeader(c.req.header('cookie'));
+      if (!uid) {
+        return c.json(
+          { error: 'La base de datos ya fue inicializada. Iniciá sesión con tu cuenta de administrador.' },
+          { status: 409 }
+        );
+      }
+      const store = await readStore();
+      assertPlatformAdmin(store, uid);
+      const result = await initializeDatabaseControlled({
+        actorUserId: uid,
+        forceSchemaSync: Boolean(body.forceSchemaSync),
+      });
+      return c.json(result);
+    }
+
+    assertControlledInitSecretsPresent();
+    const providedInitSecret =
+      c.req.header('x-nalas-init-secret') ?? (typeof body.initSecret === 'string' ? body.initSecret : undefined);
+    const authorized = isAuthorizedForInitialSetup({
+      initSecret: providedInitSecret,
+      adminEmail: typeof body.adminEmail === 'string' ? body.adminEmail : undefined,
+      adminPassword: typeof body.adminPassword === 'string' ? body.adminPassword : undefined,
+    });
+    if (!authorized) {
+      return c.json(
+        { error: 'Credenciales de administrador o secreto de inicialización inválidos.' },
+        { status: 401 }
+      );
+    }
+
+    const result = await initializeDatabaseControlled({
+      actorUserId: 'inicializacion_controlada',
+      forceSchemaSync: true,
+    });
+    return c.json(result, { status: 201 });
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.get('/api/auth/session', async (c) => {
+  try {
+    const storage = getStorageBackendInfo();
+    const initStatus = await getDatabaseInitStatus();
+    if (!initStatus.initialized) {
+      return c.json({
+        authenticated: false,
+        user: null,
+        initialized: false,
+        demoQuickLoginEnabled: false,
+        demoUsers: [],
+        storage,
+      });
+    }
+
+    const userId = await resolveAuthenticatedUserFromCookieHeader(c.req.header('cookie'));
+    const store = await readStore();
+    const user = userId ? store.users.find((u) => u.id === userId) ?? null : null;
+    const demoQuickLoginEnabled = isDemoQuickLoginEnabled();
+    return c.json({
+      authenticated: Boolean(user),
+      user,
+      initialized: true,
+      demoQuickLoginEnabled,
+      demoUsers: demoQuickLoginEnabled
+        ? store.users.map((u) => ({
+            id: u.id,
+            name: u.name,
+            email: u.email,
+            isPlatformAdmin: u.isPlatformAdmin,
+          }))
+        : [],
+      storage,
+    });
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.post('/api/auth/login', async (c) => {
+  try {
+    const body = (await c.req.json().catch(() => ({}))) as { email?: string; password?: string };
+    const email = String(body.email || '');
+    const password = String(body.password || '');
+    const store = await readStore();
+    const user = await authenticateUserCredentials(store, email, password);
+    if (!user) {
+      return c.json({ error: 'Correo o contraseña inválidos.' }, { status: 401 });
+    }
+    const token = await signSessionToken(user.id);
+    const https = isHttpsRequest(c.req.raw, (n) => c.req.header(n));
+    c.header('Set-Cookie', buildSetSessionCookieHeader(https, token));
+    return c.json({ authenticated: true, user });
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.post('/api/auth/demo-switch', async (c) => {
+  try {
+    if (!isDemoQuickLoginEnabled()) {
+      return c.json(
+        {
+          error:
+            'El cambio rápido de usuario está deshabilitado en producción. Iniciá sesión con tus credenciales.',
+        },
+        { status: 403 }
+      );
+    }
+    const body = (await c.req.json().catch(() => ({}))) as { userId?: string };
+    const targetUserId = String(body.userId || '').trim();
+    const store = await readStore();
+    const user = store.users.find((u) => u.id === targetUserId);
+    if (!user) {
+      return c.json({ error: 'Usuario de prueba no encontrado.' }, { status: 404 });
+    }
+    const token = await signSessionToken(user.id);
+    const https = isHttpsRequest(c.req.raw, (n) => c.req.header(n));
+    c.header('Set-Cookie', buildSetSessionCookieHeader(https, token));
+    return c.json({ authenticated: true, user });
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.post('/api/auth/logout', (c) => {
+  const https = isHttpsRequest(c.req.raw, (n) => c.req.header(n));
+  c.header('Set-Cookie', buildClearSessionCookieHeader(https));
+  return c.json({ authenticated: false });
+});
+
+// Panel API authentication barrier
+webApp.use('/api/*', async (c, next) => {
+  const pathname = c.req.path;
+  if (
+    pathname === '/api/health' ||
+    pathname === '/api/system/status' ||
+    pathname === '/api/system/initialize' ||
+    pathname.startsWith('/api/auth/') ||
+    pathname === '/api/webhooks/meta/whatsapp'
+  ) {
+    await next();
+    return;
+  }
+  try {
+    const uid = await resolveAuthenticatedUserFromCookieHeader(c.req.header('cookie'));
+    if (!uid) {
+      return c.json(
+        { error: 'Sesión no autenticada. Iniciá sesión para acceder al panel.' },
+        { status: 401 }
+      );
+    }
+    const store = await readStore();
+    const exists = store.users.some((u) => u.id === uid);
+    if (!exists) {
+      const https = isHttpsRequest(c.req.raw, (n) => c.req.header(n));
+      c.header('Set-Cookie', buildClearSessionCookieHeader(https));
+      return c.json({ error: 'Usuario de sesión inválido o revocado.' }, { status: 401 });
+    }
+    c.set('authUserId', uid);
+    await next();
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.post('/api/auth/change-password', async (c) => {
+  try {
+    const { userId } = getActorContext(c);
+    const body = (await c.req.json().catch(() => ({}))) as { newPassword?: string };
+    const nextPassword = String(body.newPassword || '');
+    if (nextPassword.length < 10) {
+      return c.json(
+        { error: 'La nueva contraseña debe tener al menos 10 caracteres.' },
+        { status: 400 }
+      );
+    }
+    const hash = await hashPassword(nextPassword);
+    await withStoreTransaction((store) => {
+      if (!store.userCredentials) store.userCredentials = [];
+      const now = new Date().toISOString();
+      const idx = store.userCredentials.findIndex((cred) => cred.userId === userId);
+      if (idx >= 0) {
+        store.userCredentials[idx] = { userId, passwordHash: hash, updatedAt: now };
+      } else {
+        store.userCredentials.push({ userId, passwordHash: hash, updatedAt: now });
+      }
+      appendAudit(store, {
+        businessId: 'plataforma',
+        actorUserId: userId,
+        module: 'cuentas_acceso',
+        action: 'actualizar_contrasena',
+        detail: `Credencial de acceso actualizada para usuario ${userId}.`,
+      });
+    });
+    return c.json({ ok: true });
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 1. Platform / Admin NALAS endpoints
+// ---------------------------------------------------------------------------
+
+webApp.get('/api/bootstrap', async (c) => {
+  try {
+    const store = await readStore();
+    const { userId, businessId } = getActorContext(c);
+    const environment = (c.req.query('environment') === 'produccion'
+      ? 'produccion'
+      : 'prueba') as Environment;
+
+    const currentUser = store.users.find((u) => u.id === userId) ?? store.users[0];
+    let accessError: string | null = null;
+    let effectiveRole: string | null = null;
+    let viaAuditedSupportGrant: string | undefined;
+
+    try {
+      const ctx = resolveActorContext(store, currentUser.id, businessId);
+      effectiveRole = ctx.effectiveRole;
+      viaAuditedSupportGrant = ctx.viaAuditedSupportGrant;
+    } catch (e) {
+      accessError = e instanceof Error ? e.message : 'Acceso denegado';
+    }
+
+    const activeBusiness = store.businesses.find((b) => b.id === businessId);
+
+    const scoped =
+      !accessError && activeBusiness
+        ? {
+            assistants: store.assistants.filter((a) => a.businessId === businessId),
+            channelConnections: store.channelConnections.filter((cn) => cn.businessId === businessId),
+            flowVersions: store.flowVersions.filter((f) => f.businessId === businessId),
+            rulesetVersions: store.rulesetVersions.filter((r) => r.businessId === businessId),
+            proPolicyVersions: store.proPolicyVersions.filter((p) => p.businessId === businessId),
+            contacts: store.contacts.filter((ct) => ct.businessId === businessId && ct.environment === environment),
+            conversations: store.conversations.filter(
+              (cv) => cv.businessId === businessId && cv.environment === environment
+            ),
+            messages: store.messages.filter(
+              (m) => m.businessId === businessId && m.environment === environment
+            ),
+            sessions: store.sessions.filter(
+              (s) => s.businessId === businessId && s.environment === environment
+            ),
+            leads: store.leads.filter((l) => l.businessId === businessId && l.environment === environment),
+            opportunities: store.opportunities.filter(
+              (o) => o.businessId === businessId && o.environment === environment
+            ),
+            tasks: store.tasks.filter((t) => t.businessId === businessId && t.environment === environment),
+            actionAttempts: store.actionAttempts.filter(
+              (a) => a.businessId === businessId && a.environment === environment
+            ),
+            outboxEvents: store.outboxEvents.filter(
+              (o) => o.businessId === businessId && o.environment === environment
+            ),
+            auditEvents: store.auditEvents.filter((a) => a.businessId === businessId).slice(0, 60),
+            costSummary: getCostSummary(activeBusiness),
+          }
+        : null;
+
+    const isAdmin = currentUser.isPlatformAdmin;
+    const demoMode = isDemoQuickLoginEnabled();
+    const myBusinessIds = new Set(
+      store.memberships.filter((m) => m.userId === currentUser.id).map((m) => m.businessId)
+    );
+    const visibleBusinesses =
+      isAdmin || demoMode
+        ? store.businesses
+        : store.businesses.filter((b) => myBusinessIds.has(b.id));
+    const visibleBusinessIds = new Set(visibleBusinesses.map((b) => b.id));
+
+    return c.json({
+      users:
+        isAdmin || demoMode
+          ? store.users
+          : store.users.filter((u) => u.id === currentUser.id),
+      memberships:
+        isAdmin || demoMode
+          ? store.memberships
+          : store.memberships.filter((m) => visibleBusinessIds.has(m.businessId)),
+      supportGrants:
+        isAdmin || demoMode
+          ? store.supportGrants
+          : store.supportGrants.filter((g) => visibleBusinessIds.has(g.businessId)),
+      businesses: visibleBusinesses.map((b) => ({
+        ...b,
+        costSummary: getCostSummary(b),
+      })),
+      adapters: listAvailableAdapters(),
+      backups: isAdmin
+        ? store.backups.map(({ id, label, createdAt }) => ({ id, label, createdAt }))
+        : [],
+      counters: store.counters,
+      actor: {
+        user: currentUser,
+        businessId,
+        effectiveRole,
+        viaAuditedSupportGrant,
+        accessError,
+      },
+      scoped,
+    });
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.post('/api/admin/businesses', async (c) => {
+  try {
+    const { userId } = getActorContext(c);
+    const body = (await c.req.json()) as Record<string, unknown>;
+    const created = await withStoreTransaction((store) =>
+      createBusinessAccount(store, userId, {
+        name: String(body.name || '').trim(),
+        currency: String(body.currency || 'USD'),
+        timezone: String(body.timezone || 'America/Asuncion'),
+        language: String(body.language || 'es-PY'),
+        contactFormat: String(body.contactFormat || '+595 9XX XXX XXX'),
+        edition: body.edition === 'PRO' ? 'PRO' : 'BASICA',
+        monthlyAiBudgetMinor:
+          body.monthlyAiBudgetMinor !== undefined ? Number(body.monthlyAiBudgetMinor) : 1500,
+      })
+    );
+    return c.json(created, { status: 201 });
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.post('/api/admin/businesses/:businessId/subscription', async (c) => {
+  try {
+    const { userId } = getActorContext(c);
+    const targetBizId = c.req.param('businessId');
+    const body = (await c.req.json()) as Record<string, unknown>;
+    const updated = await withStoreTransaction((store) => {
+      const actor = store.users.find((u) => u.id === userId);
+      if (!actor?.isPlatformAdmin) {
+        const ctx = resolveActorContext(store, userId, targetBizId);
+        assertPermission(ctx, 'manageBillingAndPro');
+      }
+      const biz = store.businesses.find((b) => b.id === targetBizId);
+      if (!biz) throw new Error('Negocio no encontrado.');
+
+      if (body.proApproved !== undefined) {
+        biz.subscription.proApproved = Boolean(body.proApproved);
+        biz.subscription.enabledEditions = biz.subscription.proApproved
+          ? ['BASICA', 'PRO']
+          : ['BASICA'];
+        biz.subscription.planName = biz.subscription.proApproved
+          ? 'Crecimiento PRO'
+          : 'Esencial BÁSICA';
+      }
+      if (body.monthlyAiBudgetMinor !== undefined) {
+        biz.subscription.monthlyAiBudgetMinor = Math.max(0, Number(body.monthlyAiBudgetMinor));
+      }
+      if (body.spentAiMinor !== undefined) {
+        biz.subscription.spentAiMinor = Math.max(0, Number(body.spentAiMinor));
+      }
+      if (body.maxAiCallsPerMonth !== undefined) {
+        biz.subscription.maxAiCallsPerMonth = Math.max(0, Number(body.maxAiCallsPerMonth));
+      }
+
+      if (!biz.subscription.proApproved) {
+        for (const a of store.assistants.filter((x) => x.businessId === biz.id)) {
+          a.activeMode = 'BASICA';
+        }
+      }
+
+      appendAudit(store, {
+        businessId: biz.id,
+        actorUserId: userId,
+        module: 'consumo_auditoria',
+        action: 'actualizar_plan_cuotas',
+        detail: `Plan: ${biz.subscription.planName} · PRO aprobado: ${biz.subscription.proApproved} · Presupuesto IA: ${biz.subscription.monthlyAiBudgetMinor} centavos.`,
+      });
+      return biz;
+    });
+    return c.json(updated);
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.patch('/api/businesses/:businessId/settings', async (c) => {
+  try {
+    const { userId } = getActorContext(c);
+    const targetBizId = c.req.param('businessId');
+    const body = (await c.req.json()) as Record<string, unknown>;
+    const updated = await withStoreTransaction((store) => {
+      const ctx = resolveActorContext(store, userId, targetBizId);
+      assertPermission(ctx, 'activateVersions');
+      const biz = store.businesses.find((b) => b.id === targetBizId);
+      if (!biz) throw new Error('Negocio no encontrado.');
+      if (body.currency) biz.currency = String(body.currency).toUpperCase();
+      if (body.timezone) biz.timezone = String(body.timezone);
+      appendAudit(store, {
+        businessId: biz.id,
+        actorUserId: userId,
+        module: 'configuracion',
+        action: 'actualizar_preferencias_negocio',
+        detail: `Preferencias actualizadas: Moneda ${biz.currency}, Zona horaria ${biz.timezone}.`,
+      });
+      return biz;
+    });
+    return c.json(updated);
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.post('/api/admin/support-grants', async (c) => {
+  try {
+    const { userId } = getActorContext(c);
+    const body = (await c.req.json()) as Record<string, unknown>;
+    const grant = await withStoreTransaction((store) => {
+      const actor = store.users.find((u) => u.id === userId);
+      if (!actor?.isPlatformAdmin) {
+        const ctx = resolveActorContext(store, userId, String(body.businessId || ''));
+        assertPermission(ctx, 'manageUsers');
+      }
+      const newGrant = {
+        id: `sgrant_${Date.now()}`,
+        supportUserId: String(body.supportUserId || 'user_soporte'),
+        businessId: String(body.businessId),
+        reason: String(body.reason || 'Revisión técnica autorizada'),
+        grantedByUserId: userId,
+        expiresAt: new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString(),
+        active: true,
+        createdAt: new Date().toISOString(),
+      };
+      store.supportGrants.unshift(newGrant);
+      appendAudit(store, {
+        businessId: newGrant.businessId,
+        actorUserId: userId,
+        module: 'cuentas_acceso',
+        action: 'otorgar_soporte_auditado',
+        detail: `Acceso excepcional de soporte otorgado a ${newGrant.supportUserId}. Motivo: ${newGrant.reason}.`,
+      });
+      return newGrant;
+    });
+    return c.json(grant, { status: 201 });
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.post('/api/admin/support-grants/:grantId/revoke', async (c) => {
+  try {
+    const { userId } = getActorContext(c);
+    const grantId = c.req.param('grantId');
+    const grant = await withStoreTransaction((store) => {
+      const found = store.supportGrants.find((g) => g.id === grantId);
+      if (!found) throw new Error('Permiso de soporte no encontrado.');
+      const actor = store.users.find((u) => u.id === userId);
+      if (!actor?.isPlatformAdmin) {
+        const ctx = resolveActorContext(store, userId, found.businessId);
+        assertPermission(ctx, 'manageUsers');
+      }
+      found.active = false;
+      appendAudit(store, {
+        businessId: found.businessId,
+        actorUserId: userId,
+        module: 'cuentas_acceso',
+        action: 'revocar_soporte_auditado',
+        detail: `Acceso de soporte ${found.id} revocado.`,
+      });
+      return found;
+    });
+    return c.json(grant);
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.get('/api/admin/backups/export', async (c) => {
+  try {
+    const { userId } = getActorContext(c);
+    const exported = await withStoreTransaction((store) => {
+      const payload = buildCleanBackupExport(store, userId);
+      appendAudit(store, {
+        businessId:
+          payload.scope === 'plataforma_completa'
+            ? 'plataforma'
+            : (payload.store.businesses[0]?.id ?? 'plataforma'),
+        actorUserId: userId,
+        module: 'cuentas_acceso',
+        action: 'exportar_respaldo_completo',
+        detail: `Respaldo descargable generado (${payload.scope}, sin secretos, ${payload.store.businesses.length} negocios, ${payload.store.leads.length} leads).`,
+      });
+      return payload;
+    });
+    const stamp = new Date().toISOString().slice(0, 10);
+    return new Response(JSON.stringify(exported, null, 2), {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Content-Disposition': `attachment; filename="nalas-respaldo-${stamp}.json"`,
+      },
+    });
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.post('/api/admin/backups', async (c) => {
+  try {
+    const { userId } = getActorContext(c);
+    const store = await readStore();
+    assertPlatformAdmin(store, userId);
+    const body = (await c.req.json().catch(() => ({}))) as { label?: string };
+    const label = String(body.label || `Respaldo manual ${new Date().toLocaleTimeString('es-ES')}`);
+    const bkp = await createBackupSnapshot(label);
+    return c.json(bkp, { status: 201 });
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.post('/api/admin/backups/:backupId/restore', async (c) => {
+  try {
+    const { userId } = getActorContext(c);
+    const store = await readStore();
+    assertPlatformAdmin(store, userId);
+    const restored = await restoreBackupSnapshot(c.req.param('backupId'));
+    return c.json(restored);
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.post('/api/admin/acceptance-suite', async (c) => {
+  try {
+    const { userId } = getActorContext(c);
+    const store = await readStore();
+    assertPlatformAdmin(store, userId);
+    const results = await runAcceptanceSuite();
+    return c.json({
+      results,
+      passedCount: results.filter((r) => r.passed).length,
+      total: results.length,
+    });
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 2. Business Configuration (Assistants, Flows, Rules, PRO Policy, Adapters)
+// ---------------------------------------------------------------------------
+
+webApp.post('/api/assistants/:assistantId/mode', async (c) => {
+  try {
+    const { userId, businessId } = getActorContext(c);
+    const body = (await c.req.json()) as { mode?: Edition };
+    const mode = body.mode as Edition;
+    const assistantId = c.req.param('assistantId');
+    const assistant = await withStoreTransaction((store) => {
+      const ctx = resolveActorContext(store, userId, businessId);
+      assertPermission(ctx, 'activateVersions');
+      const biz = store.businesses.find((b) => b.id === businessId)!;
+      const asst = assertTenantScope(
+        store.assistants.find((a) => a.id === assistantId),
+        businessId,
+        'Asistente'
+      );
+
+      if (mode === 'PRO' && (!biz.subscription.enabledEditions.includes('PRO') || !biz.subscription.proApproved)) {
+        const err = new Error('PRO deshabilitado en este negocio hasta aprobar costos y plan.');
+        (err as Error & { statusCode?: number }).statusCode = 403;
+        throw err;
+      }
+
+      asst.activeMode = mode;
+      appendAudit(store, {
+        businessId,
+        actorUserId: userId,
+        module: 'configuracion',
+        action: 'cambiar_modo_asistente',
+        detail: `Modo activo del asistente "${asst.name}" cambiado a ${mode}.`,
+      });
+      return asst;
+    });
+    return c.json(assistant);
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.post('/api/flows/draft', async (c) => {
+  try {
+    const { userId, businessId } = getActorContext(c);
+    const body = (await c.req.json()) as {
+      steps: FlowStep[];
+      outOfScriptRules?: OutOfScriptRule[];
+      name?: string;
+    };
+    const result = await withStoreTransaction((store) => {
+      const ctx = resolveActorContext(store, userId, businessId);
+      assertPermission(ctx, 'editFlows');
+      const draft = saveFlowDraft(
+        store,
+        businessId,
+        userId,
+        body.steps,
+        body.outOfScriptRules ?? [],
+        body.name
+      );
+      const biz = store.businesses.find((b) => b.id === businessId)!;
+      const targetRuleset =
+        store.rulesetVersions.find((r) => r.businessId === businessId && r.status === 'borrador') ??
+        store.rulesetVersions.find((r) => r.id === biz.activeRulesetVersionId);
+      const issues = validateFlowAndDependencies(draft, targetRuleset);
+      return { draft, issues };
+    });
+    return c.json(result);
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.post('/api/flows/publish', async (c) => {
+  try {
+    const { userId, businessId } = getActorContext(c);
+    const result = await withStoreTransaction((store) => {
+      const ctx = resolveActorContext(store, userId, businessId);
+      assertPermission(ctx, 'activateVersions');
+      return publishFlowDraft(store, businessId, userId);
+    });
+    return c.json(result);
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.post('/api/flows/:flowVersionId/rollback', async (c) => {
+  try {
+    const { userId, businessId } = getActorContext(c);
+    const flowVersionId = c.req.param('flowVersionId');
+    const biz = await withStoreTransaction((store) => {
+      const ctx = resolveActorContext(store, userId, businessId);
+      assertPermission(ctx, 'activateVersions');
+      return rollbackFlowVersion(store, businessId, userId, flowVersionId);
+    });
+    return c.json(biz);
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.post('/api/rulesets/publish', async (c) => {
+  try {
+    const { userId, businessId } = getActorContext(c);
+    const body = (await c.req.json()) as Partial<RulesetVersion>;
+    const published = await withStoreTransaction((store) => {
+      const ctx = resolveActorContext(store, userId, businessId);
+      assertPermission(ctx, 'activateVersions');
+      const biz = store.businesses.find((b) => b.id === businessId)!;
+      const activeFlow = store.flowVersions.find((f) => f.id === biz.activeFlowVersionId)!;
+
+      const maxVer = Math.max(
+        0,
+        ...store.rulesetVersions.filter((r) => r.businessId === businessId).map((r) => r.versionNumber)
+      );
+      const nextRuleset: RulesetVersion = {
+        id: `rules_${businessId}_v${maxVer + 1}_${Date.now().toString(36)}`,
+        businessId,
+        versionNumber: maxVer + 1,
+        name: String(body.name || `Reglas ${biz.name} v${maxVer + 1}`),
+        status: 'publicada',
+        priorityStrategy: 'first_match',
+        tagStrategy: 'accumulate',
+        defaultPriority: body.defaultPriority || 'baja',
+        defaultReason: String(body.defaultReason || 'Sin coincidencia en reglas configuradas.'),
+        rules: body.rules || [],
+        createdAt: new Date().toISOString(),
+        publishedAt: new Date().toISOString(),
+      };
+
+      const issues = validateRulesetDependencies(nextRuleset, activeFlow);
+      if (issues.some((i) => i.severity === 'error')) {
+        const err = new Error(issues.map((i) => i.message).join(' | '));
+        (err as Error & { statusCode?: number; issues?: unknown }).statusCode = 400;
+        (err as Error & { issues?: unknown }).issues = issues;
+        throw err;
+      }
+
+      store.rulesetVersions.push(nextRuleset);
+      biz.activeRulesetVersionId = nextRuleset.id;
+      appendAudit(store, {
+        businessId,
+        actorUserId: userId,
+        module: 'configuracion',
+        action: 'publicar_reglas',
+        detail: `Publicado conjunto de reglas v${nextRuleset.versionNumber} (${nextRuleset.rules.length} reglas). No reclasifica históricos automáticamente.`,
+      });
+      return nextRuleset;
+    });
+    return c.json(published);
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.post('/api/rulesets/preview-reclassify', async (c) => {
+  try {
+    const { userId, businessId } = getActorContext(c);
+    const body = (await c.req.json().catch(() => ({}))) as { environment?: Environment };
+    const environment = (body.environment === 'produccion' ? 'produccion' : 'prueba') as Environment;
+    const store = await readStore();
+    const ctx = resolveActorContext(store, userId, businessId);
+    assertPermission(ctx, 'viewConversations');
+
+    const biz = store.businesses.find((b) => b.id === businessId)!;
+    const ruleset = store.rulesetVersions.find((r) => r.id === biz.activeRulesetVersionId)!;
+    const leads = store.leads.filter((l) => l.businessId === businessId && l.environment === environment);
+
+    const preview = leads.map((lead) => {
+      const simulated = evaluateRuleset(ruleset, lead.answers);
+      return {
+        leadId: lead.id,
+        currentPriority: lead.categorization.priority,
+        currentVersion: lead.categorization.rulesetVersionNumber,
+        projectedPriority: simulated.priority,
+        projectedReason: simulated.reason,
+        changed: lead.categorization.priority !== simulated.priority,
+      };
+    });
+    return c.json({ rulesetVersionNumber: ruleset.versionNumber, preview });
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.post('/api/pro-policy', async (c) => {
+  try {
+    const { userId, businessId } = getActorContext(c);
+    const body = (await c.req.json()) as Partial<ProPolicyVersion>;
+    const policy = await withStoreTransaction((store) => {
+      const ctx = resolveActorContext(store, userId, businessId);
+      assertPermission(ctx, 'manageBillingAndPro');
+      return updateProPolicy(store, businessId, userId, body);
+    });
+    return c.json(policy);
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.post('/api/connections/:connectionId/adapter', async (c) => {
+  try {
+    const { userId, businessId } = getActorContext(c);
+    const connectionId = c.req.param('connectionId');
+    const body = (await c.req.json()) as { adapterId?: string };
+    const conn = await withStoreTransaction((store) => {
+      const ctx = resolveActorContext(store, userId, businessId);
+      assertPermission(ctx, 'manageIntegrations');
+      return swapConnectionAdapter(store, businessId, connectionId, String(body.adapterId), userId);
+    });
+    return c.json(conn);
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.post('/api/outbox/:outboxId/retry', async (c) => {
+  try {
+    const { userId, businessId } = getActorContext(c);
+    const outboxId = c.req.param('outboxId');
+    const outbox = await withStoreTransaction((store) => {
+      const ctx = resolveActorContext(store, userId, businessId);
+      assertPermission(ctx, 'manageIntegrations');
+      const evt = assertTenantScope(
+        store.outboxEvents.find((o) => o.id === outboxId),
+        businessId,
+        'OutboxEvent'
+      );
+      const conn = store.channelConnections.find((cn) => cn.id === evt.connectionId)!;
+      processOutboxEvent(store, evt, conn, false);
+      return evt;
+    });
+    return c.json(outbox);
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.post('/api/outbox/process-pending', async (c) => {
+  try {
+    const { userId, businessId } = getActorContext(c);
+    const store = await readStore();
+    const ctx = resolveActorContext(store, userId, businessId);
+    assertPermission(ctx, 'manageIntegrations');
+    const res = await processDueOutboxRetries(10);
+    return c.json(res);
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 2b. Meta WhatsApp Cloud API Webhook & Secure Integration Config
+// ---------------------------------------------------------------------------
+
+webApp.get('/api/integrations/meta/config', async (c) => {
+  try {
+    const { userId, businessId } = getActorContext(c);
+    const store = await readStore();
+    const ctx = resolveActorContext(store, userId, businessId);
+    assertPermission(ctx, 'manageIntegrations');
+    const url = new URL(c.req.url);
+    const forwardedHost = c.req.header('x-forwarded-host') || c.req.header('host');
+    const forwardedProto = c.req.header('x-forwarded-proto') || url.protocol.replace(':', '');
+    const origin = forwardedHost ? `${forwardedProto}://${forwardedHost}` : url.origin;
+    const cfg = await getMetaIntegrationConfig(origin);
+    return c.json(cfg);
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.post('/api/integrations/meta/verify-token/regenerate', async (c) => {
+  try {
+    const { userId, businessId } = getActorContext(c);
+    await withStoreTransaction((store) => {
+      const ctx = resolveActorContext(store, userId, businessId);
+      assertPermission(ctx, 'manageIntegrations');
+      appendAudit(store, {
+        businessId,
+        actorUserId: userId,
+        module: 'integraciones',
+        action: 'rotar_token_verificacion_meta',
+        detail: 'Token de verificación del webhook de Meta regenerado en servidor.',
+      });
+    });
+    const rotated = await regenerateServerVerifyToken();
+    return c.json({ verifyToken: rotated.token, verifyTokenSource: rotated.source });
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+// Meta Webhook Verification Handshake (GET)
+webApp.get('/api/webhooks/meta/whatsapp', async (c) => {
+  try {
+    const mode = c.req.query('hub.mode');
+    const verifyToken = c.req.query('hub.verify_token');
+    const challenge = c.req.query('hub.challenge');
+
+    const result = await verifyMetaChallenge({ mode, verifyToken, challenge });
+    if (!result.ok) {
+      return c.text('Verificación de webhook rechazada.', { status: 403 });
+    }
+    return c.text(result.challenge, { status: 200 });
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+// Meta Webhook Inbound Messages & Delivery Statuses (POST)
+webApp.post('/api/webhooks/meta/whatsapp', async (c) => {
+  try {
+    const rawBytes = new Uint8Array(await c.req.arrayBuffer());
+    const signatureHeader = c.req.header('x-hub-signature-256');
+    const sigCheck = await verifyMetaSignature(rawBytes, signatureHeader);
+
+    if (!sigCheck.ok) {
+      await withStoreTransaction((store) => {
+        const targetBusinessId = getEnv('META_BUSINESS_ID')?.trim() || 'biz_nexo';
+        appendAudit(store, {
+          businessId: targetBusinessId,
+          environment: 'produccion',
+          actorUserId: 'integraciones',
+          module: 'integraciones',
+          action: 'webhook_meta_rechazado',
+          detail: sigCheck.reason,
+        });
+      });
+      return new Response(JSON.stringify({ error: sigCheck.reason }), {
+        status: sigCheck.status,
+        headers: { 'Content-Type': 'application/json; charset=utf-8' },
+      });
+    }
+
+    const bodyText = new TextDecoder().decode(rawBytes);
+    const payload = bodyText ? JSON.parse(bodyText) : {};
+    const summary = await processMetaWebhookEvents(payload);
+    return c.json({ status: 'ok', ...summary }, { status: 200 });
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 3. Simulator & Conversations (BÁSICA, PRO, Human Handoff)
+// ---------------------------------------------------------------------------
+
+webApp.post('/api/simulator/start', async (c) => {
+  try {
+    const { userId, businessId } = getActorContext(c);
+    const body = (await c.req.json()) as {
+      connectionId?: string;
+      externalUserId?: string;
+      contactName?: string;
+      contactPhone?: string;
+      forceNew?: boolean;
+      useDraft?: boolean;
+    };
+    const result = await withStoreTransaction(async (store) => {
+      resolveActorContext(store, userId, businessId);
+      const started = startOrGetSimulatorConversation(store, {
+        businessId,
+        connectionId: String(body.connectionId),
+        externalUserId: String(body.externalUserId || `sim_${Date.now()}`),
+        contactName: body.contactName,
+        contactPhone: body.contactPhone,
+        forceNew: Boolean(body.forceNew),
+        useDraft: Boolean(body.useDraft),
+      });
+
+      const existingMsgs = store.messages.filter((m) => m.conversationId === started.conversation.id);
+      if (existingMsgs.length === 0 && started.conversation.activeEngine === 'BASICA') {
+        sendInitialBasicGreeting(store, started.conversation.id);
+      }
+      return started;
+    });
+    return c.json(result);
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.post('/api/conversations/:conversationId/inbound', async (c) => {
+  try {
+    const { userId, businessId } = getActorContext(c);
+    const conversationId = c.req.param('conversationId');
+    const body = (await c.req.json()) as {
+      text?: string;
+      selectedOptionId?: string;
+      providerEventId?: string;
+      idempotencyKey?: string;
+      simulateOutboxFailure?: boolean;
+    };
+    const output = await runSerializedForConversation(conversationId, () =>
+      withStoreTransaction(async (store) => {
+        resolveActorContext(store, userId, businessId);
+        return processInboundMessage(store, {
+          businessId,
+          conversationId,
+          text: String(body.text ?? ''),
+          selectedOptionId: body.selectedOptionId,
+          providerEventId: body.providerEventId,
+          idempotencyKey: body.idempotencyKey,
+          simulateOutboxFailure: Boolean(body.simulateOutboxFailure),
+        });
+      })
+    );
+    return c.json(output);
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.post('/api/conversations/:conversationId/handoff/takeover', async (c) => {
+  try {
+    const { userId, businessId } = getActorContext(c);
+    const conversationId = c.req.param('conversationId');
+    const conv = await withStoreTransaction((store) => {
+      const ctx = resolveActorContext(store, userId, businessId);
+      assertPermission(ctx, 'handleHumanQueue');
+      const found = assertTenantScope(
+        store.conversations.find((cv) => cv.id === conversationId),
+        businessId,
+        'Conversación'
+      );
+      found.control = 'humano_activo';
+      found.assignedUserId = userId;
+      found.updatedAt = new Date().toISOString();
+
+      for (const task of store.tasks.filter(
+        (t) => t.conversationId === found.id && t.businessId === businessId
+      )) {
+        task.assignedUserId = userId;
+        task.status = 'en_progreso';
+        task.updatedAt = new Date().toISOString();
+      }
+
+      appendAudit(store, {
+        businessId,
+        environment: found.environment,
+        actorUserId: userId,
+        module: 'conversaciones',
+        action: 'tomar_control_humano',
+        detail: `Agente ${userId} tomó control de la conversación ${found.id}. Bot permanece pausado.`,
+        correlationId: found.id,
+      });
+      return found;
+    });
+    return c.json(conv);
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.post('/api/conversations/:conversationId/handoff/reply', async (c) => {
+  try {
+    const { userId, businessId } = getActorContext(c);
+    const conversationId = c.req.param('conversationId');
+    const body = (await c.req.json()) as { text?: string };
+    const msg = await runSerializedForConversation(conversationId, () =>
+      withStoreTransaction((store) => {
+        const ctx = resolveActorContext(store, userId, businessId);
+        assertPermission(ctx, 'handleHumanQueue');
+        const found = assertTenantScope(
+          store.conversations.find((cv) => cv.id === conversationId),
+          businessId,
+          'Conversación'
+        );
+        found.control = 'humano_activo';
+        found.assignedUserId = userId;
+        const now = new Date().toISOString();
+        found.updatedAt = now;
+        const humanMsg = {
+          id: `msg_${Date.now()}_hum`,
+          businessId,
+          environment: found.environment,
+          conversationId: found.id,
+          sender: 'agente_humano' as const,
+          text: String(body.text || ''),
+          deliveryStatus: 'entregado' as const,
+          createdAt: now,
+        };
+        store.messages.push(humanMsg);
+        return humanMsg;
+      })
+    );
+    return c.json(msg);
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.post('/api/conversations/:conversationId/handoff/resume-bot', async (c) => {
+  try {
+    const { userId, businessId } = getActorContext(c);
+    const conversationId = c.req.param('conversationId');
+    const conv = await runSerializedForConversation(conversationId, () =>
+      withStoreTransaction((store) => {
+        const ctx = resolveActorContext(store, userId, businessId);
+        assertPermission(ctx, 'handleHumanQueue');
+        const found = assertTenantScope(
+          store.conversations.find((cv) => cv.id === conversationId),
+          businessId,
+          'Conversación'
+        );
+        const biz = store.businesses.find((b) => b.id === businessId)!;
+        const assistant = store.assistants.find((a) => a.id === found.assistantId)!;
+
+        found.activeEngine =
+          assistant.activeMode === 'PRO' && biz.subscription.proApproved ? 'PRO' : 'BASICA';
+        found.control = 'bot';
+        found.updatedAt = new Date().toISOString();
+
+        appendAudit(store, {
+          businessId,
+          environment: found.environment,
+          actorUserId: userId,
+          module: 'conversaciones',
+          action: 'reanudar_bot',
+          detail: `Bot reanudado explícitamente en ${found.id} tras verificar estado actual (Motor: ${found.activeEngine}).`,
+          correlationId: found.id,
+        });
+        return found;
+      })
+    );
+    return c.json(conv);
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 4. Commercial Operation (Leads, Opportunities, Tasks, CSV Export)
+// ---------------------------------------------------------------------------
+
+webApp.patch('/api/leads/:leadId/status', async (c) => {
+  try {
+    const { userId, businessId } = getActorContext(c);
+    const leadId = c.req.param('leadId');
+    const body = (await c.req.json()) as { commercialStatus?: CommercialStatus };
+    const lead = await withStoreTransaction((store) => {
+      const ctx = resolveActorContext(store, userId, businessId);
+      assertPermission(ctx, 'handleHumanQueue');
+      const found = assertTenantScope(
+        store.leads.find((l) => l.id === leadId),
+        businessId,
+        'Lead'
+      );
+      found.commercialStatus = body.commercialStatus as CommercialStatus;
+      appendAudit(store, {
+        businessId,
+        environment: found.environment,
+        actorUserId: userId,
+        module: 'operacion_comercial',
+        action: 'actualizar_lead',
+        detail: `Lead ${found.id} actualizado a estado comercial "${found.commercialStatus}".`,
+      });
+      return found;
+    });
+    return c.json(lead);
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.get('/api/leads/export.csv', async (c) => {
+  try {
+    const { userId, businessId } = getActorContext(c);
+    const environment = (c.req.query('environment') === 'produccion'
+      ? 'produccion'
+      : 'prueba') as Environment;
+    const store = await readStore();
+    const ctx = resolveActorContext(store, userId, businessId);
+    assertPermission(ctx, 'exportLeads');
+    const csv = buildDynamicLeadsCsv(store, businessId, environment);
+    return new Response(csv, {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/csv; charset=utf-8',
+        'Content-Disposition': `attachment; filename="nalas-leads-${businessId}-${environment}.csv"`,
+      },
+    });
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.post('/api/opportunities', async (c) => {
+  try {
+    const { userId, businessId } = getActorContext(c);
+    const body = (await c.req.json()) as { leadId?: string; title?: string; amountMinor?: number };
+    const opp = await withStoreTransaction((store) => {
+      const ctx = resolveActorContext(store, userId, businessId);
+      assertPermission(ctx, 'handleHumanQueue');
+      const biz = store.businesses.find((b) => b.id === businessId)!;
+      const lead = assertTenantScope(
+        store.leads.find((l) => l.id === body.leadId),
+        businessId,
+        'Lead'
+      );
+      const now = new Date().toISOString();
+      const newOpp: Opportunity = {
+        id: `opp_${Date.now()}`,
+        businessId,
+        environment: lead.environment,
+        contactId: lead.contactId,
+        leadId: lead.id,
+        leadCommercialReference: lead.commercialReference,
+        productId: lead.productId,
+        productName: lead.productName,
+        conversationId: lead.conversationId,
+        title: String(
+          body.title ||
+            `Oportunidad ${lead.productName ?? biz.name} · ${lead.commercialReference ?? lead.id.slice(-6)}`
+        ),
+        amountMinor: Math.max(0, Math.round(Number(body.amountMinor || 0))),
+        currency: biz.currency,
+        commercialStatus: 'nuevo',
+        createdAt: now,
+        updatedAt: now,
+      };
+      store.opportunities.unshift(newOpp);
+      appendAudit(store, {
+        businessId,
+        environment: lead.environment,
+        actorUserId: userId,
+        module: 'operacion_comercial',
+        action: 'crear_oportunidad',
+        detail: `Oportunidad "${newOpp.title}" (${newOpp.amountMinor} centavos ${newOpp.currency}) creada desde lead ${lead.id}.`,
+      });
+      return newOpp;
+    });
+    return c.json(opp, { status: 201 });
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.patch('/api/opportunities/:opportunityId/status', async (c) => {
+  try {
+    const { userId, businessId } = getActorContext(c);
+    const opportunityId = c.req.param('opportunityId');
+    const body = (await c.req.json()) as {
+      commercialStatus?: CommercialStatus;
+      closingEvidence?: Opportunity['closingEvidence'];
+    };
+    const opp = await withStoreTransaction((store) => {
+      const ctx = resolveActorContext(store, userId, businessId);
+      assertPermission(ctx, 'handleHumanQueue');
+      return updateOpportunityStatus(store, {
+        businessId,
+        opportunityId,
+        actorUserId: userId,
+        commercialStatus: body.commercialStatus as CommercialStatus,
+        closingEvidence: body.closingEvidence,
+      });
+    });
+    return c.json(opp);
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.patch('/api/tasks/:taskId/resolve', async (c) => {
+  try {
+    const { userId, businessId } = getActorContext(c);
+    const taskId = c.req.param('taskId');
+    const task = await withStoreTransaction((store) => {
+      const ctx = resolveActorContext(store, userId, businessId);
+      assertPermission(ctx, 'handleHumanQueue');
+      const found = assertTenantScope(
+        store.tasks.find((t) => t.id === taskId),
+        businessId,
+        'Tarea'
+      );
+      found.status = 'resuelta';
+      found.updatedAt = new Date().toISOString();
+      appendAudit(store, {
+        businessId,
+        environment: found.environment,
+        actorUserId: userId,
+        module: 'operacion_comercial',
+        action: 'resolver_tarea',
+        detail: `Tarea ${found.id} marcada resuelta (el bot no se reanuda automáticamente).`,
+      });
+      return found;
+    });
+    return c.json(task);
+  } catch (err) {
+    return errorResponse(err);
+  }
+});

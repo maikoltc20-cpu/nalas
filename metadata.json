@@ -1,0 +1,6 @@
+{
+  "name": "NALAS — Plataforma de Atención y Operación Comercial",
+  "description": "Plataforma multi-tenant de NEXO Technologies para atención conversacional configurable (BÁSICA sin IA y PRO con IA bajo políticas), captura comercial, derivación humana y operación aislada por negocio.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
