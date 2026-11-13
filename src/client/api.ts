@@ -89,6 +89,9 @@ export interface AuthSessionResponse {
   authenticated: boolean;
   user: User | null;
   initialized: boolean;
+  dbError?: string | null;
+  googleLoginEnabled: boolean;
+  googleLinked?: boolean;
   demoQuickLoginEnabled: boolean;
   demoUsers: User[];
   storage: {

@@ -25,7 +25,9 @@ import type {
   Task,
   User,
   UserCredential,
+  UserExternalIdentity,
 } from '../../shared/types.ts';
+import { translatePgConnectionError, validateDatabaseUrl } from '../modules/urlHelper.ts';
 import { getEnv, isWorkerRuntime } from '../runtimeContext.ts';
 import { SCHEMA_STATEMENTS } from './schemaSql.ts';
 
@@ -40,14 +42,15 @@ export function isPgUndefinedTableError(err: unknown): boolean {
 }
 
 function createPgPool(): Pool {
-  const connectionString = getEnv('DATABASE_URL')?.trim();
-  if (!connectionString) {
-    throw new Error('DATABASE_URL no configurado para conexión PostgreSQL.');
+  const connectionString = validateDatabaseUrl(getEnv('DATABASE_URL'));
+  try {
+    return new Pool({
+      connectionString,
+      max: isWorkerRuntime() ? 3 : 10,
+    });
+  } catch (err) {
+    throw translatePgConnectionError(err);
   }
-  return new Pool({
-    connectionString,
-    max: isWorkerRuntime() ? 3 : 10,
-  });
 }
 
 export async function withPgPool<T>(fn: (pool: Pool) => Promise<T>): Promise<T> {
@@ -55,6 +58,8 @@ export async function withPgPool<T>(fn: (pool: Pool) => Promise<T>): Promise<T> 
     const workerPool = createPgPool();
     try {
       return await fn(workerPool);
+    } catch (err) {
+      throw translatePgConnectionError(err);
     } finally {
       await workerPool.end().catch(() => {});
     }
@@ -62,7 +67,11 @@ export async function withPgPool<T>(fn: (pool: Pool) => Promise<T>): Promise<T> 
   if (!nodePool) {
     nodePool = createPgPool();
   }
-  return fn(nodePool);
+  try {
+    return await fn(nodePool);
+  } catch (err) {
+    throw translatePgConnectionError(err);
+  }
 }
 
 export async function withPgClient<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
@@ -239,9 +248,15 @@ export async function loadStoreFromPg(client: PoolClient): Promise<NalasStore | 
     return null;
   }
 
+  const identTableRes = await client.query<{ tbl: string | null }>(
+    `SELECT to_regclass('public.nalas_user_identities') AS tbl`
+  );
+  const hasUserIdentitiesTable = Boolean(identTableRes.rows[0]?.tbl);
+
   const [
     usersRes,
     credsRes,
+    userIdentsRes,
     memRes,
     grantsRes,
     asstRes,
@@ -267,6 +282,9 @@ export async function loadStoreFromPg(client: PoolClient): Promise<NalasStore | 
   ] = await Promise.all([
     client.query('SELECT * FROM nalas_users ORDER BY id ASC'),
     client.query('SELECT * FROM nalas_user_credentials'),
+    hasUserIdentitiesTable
+      ? client.query('SELECT * FROM nalas_user_identities ORDER BY created_at ASC')
+      : Promise.resolve({ rows: [] }),
     client.query('SELECT * FROM nalas_memberships ORDER BY created_at ASC'),
     client.query('SELECT * FROM nalas_support_grants ORDER BY created_at DESC'),
     client.query('SELECT * FROM nalas_assistants ORDER BY created_at ASC'),
@@ -324,6 +342,16 @@ export async function loadStoreFromPg(client: PoolClient): Promise<NalasStore | 
     userId: r.user_id,
     passwordHash: r.password_hash,
     updatedAt: toIso(r.updated_at)!,
+  }));
+
+  const userIdentities: UserExternalIdentity[] = userIdentsRes.rows.map((r) => ({
+    id: r.id,
+    userId: r.user_id,
+    provider: r.provider,
+    providerSubject: r.provider_subject,
+    emailAtLink: r.email_at_link,
+    createdAt: toIso(r.created_at)!,
+    lastLoginAt: toIso(r.last_login_at)!,
   }));
 
   const memberships: Membership[] = memRes.rows.map((r) => ({
@@ -624,6 +652,7 @@ export async function loadStoreFromPg(client: PoolClient): Promise<NalasStore | 
     businesses,
     users,
     userCredentials,
+    userIdentities,
     memberships,
     supportGrants,
     assistants,
@@ -714,6 +743,28 @@ export async function saveStoreToPg(client: PoolClient, store: NalasStore): Prom
          updated_at = EXCLUDED.updated_at`,
       [uc.userId, uc.passwordHash, uc.updatedAt]
     );
+  }
+
+  for (const ui of store.userIdentities ?? []) {
+    try {
+      await client.query(
+        `INSERT INTO nalas_user_identities (id, user_id, provider, provider_subject, email_at_link, created_at, last_login_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)
+         ON CONFLICT (provider, provider_subject) DO UPDATE SET
+           email_at_link = EXCLUDED.email_at_link,
+           last_login_at = EXCLUDED.last_login_at`,
+        [ui.id, ui.userId, ui.provider, ui.providerSubject, ui.emailAtLink, ui.createdAt, ui.lastLoginAt]
+      );
+    } catch (err) {
+      if (isPgUndefinedTableError(err)) {
+        const schemaErr = new Error(
+          'Falta la tabla nalas_user_identities en PostgreSQL. Ejecutá la sincronización de esquema en inicialización controlada.'
+        ) as Error & { statusCode?: number };
+        schemaErr.statusCode = 503;
+        throw schemaErr;
+      }
+      throw err;
+    }
   }
 
   for (const m of store.memberships) {

@@ -43,6 +43,17 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (typeof window !== 'undefined') {
+      const params = new URLSearchParams(window.location.search);
+      const authError = params.get('authError');
+      if (authError) {
+        setErrorMsg(authError);
+        params.delete('authError');
+        const nextSearch = params.toString();
+        const nextUrl = `${window.location.pathname}${nextSearch ? `?${nextSearch}` : ''}${window.location.hash}`;
+        window.history.replaceState({}, '', nextUrl);
+      }
+    }
     loadSession();
   }, [loadSession]);
 
@@ -186,7 +197,32 @@ export default function App() {
             </div>
           )}
 
-          {authSession && !authSession.initialized ? (
+          {authSession?.dbError ? (
+            <div className="space-y-4 text-sm">
+              <div className="p-4 bg-red-50 border border-red-200 rounded-md space-y-2 text-red-900">
+                <div className="font-semibold">
+                  Error de configuración o conexión con PostgreSQL / URL del servidor
+                </div>
+                <p className="text-xs leading-relaxed text-red-800">{authSession.dbError}</p>
+                <p className="text-xs leading-relaxed text-red-800 pt-1 border-t border-red-200">
+                  Importante: iniciar sesión con Google no resuelve un problema de conexión o formato en{' '}
+                  <code className="font-mono">DATABASE_URL</code> ni en{' '}
+                  <code className="font-mono">APP_URL</code>. Verificá los Secrets del Worker en Cloudflare (sin comillas, sin el prefijo <code className="font-mono">psql</code> y sin saltos de línea).
+                </p>
+              </div>
+              <button
+                type="button"
+                disabled={loginBusy}
+                onClick={() => {
+                  setAuthLoading(true);
+                  loadSession();
+                }}
+                className="w-full py-2.5 px-4 text-sm font-medium text-white bg-slate-900 rounded-md hover:bg-slate-800 transition-colors disabled:opacity-50"
+              >
+                Reintentar conexión
+              </button>
+            </div>
+          ) : authSession && !authSession.initialized ? (
             <form onSubmit={handleControlledInitSubmit} className="space-y-4 text-sm">
               <div className="p-3.5 bg-amber-50 border border-amber-200 rounded-md text-xs text-amber-950 leading-relaxed">
                 <strong>Base de datos Neon pendiente de inicialización controlada.</strong> Las tablas y credenciales iniciales no se crean automáticamente en cada petición. Ingresá las credenciales configuradas en Secrets del Worker (o el secreto de inicialización) para ejecutar la preparación única.
@@ -275,6 +311,49 @@ export default function App() {
               >
                 {loginBusy ? 'Validando...' : 'Iniciar sesión'}
               </button>
+
+              <div className="relative flex items-center py-1">
+                <div className="flex-grow border-t border-slate-200" />
+                <span className="shrink mx-3 text-xs text-slate-400">o</span>
+                <div className="flex-grow border-t border-slate-200" />
+              </div>
+
+              <button
+                type="button"
+                disabled={loginBusy || !authSession?.googleLoginEnabled}
+                onClick={() => {
+                  setErrorMsg(null);
+                  window.location.assign('/api/auth/google/start');
+                }}
+                className="w-full py-2.5 px-4 text-sm font-medium text-slate-800 bg-white border border-slate-300 rounded-md hover:bg-slate-50 transition-colors disabled:opacity-60 disabled:cursor-not-allowed flex items-center justify-center gap-2.5"
+              >
+                <svg className="w-4 h-4 shrink-0" viewBox="0 0 24 24" aria-hidden="true">
+                  <path
+                    fill="#4285F4"
+                    d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.82-2.4 3.68v3.05h3.88c2.27-2.09 3.665-5.17 3.665-9.17Z"
+                  />
+                  <path
+                    fill="#34A853"
+                    d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.05c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.11-6.72-4.96H1.29v3.14C3.26 21.3 7.31 24 12 24Z"
+                  />
+                  <path
+                    fill="#FBBC05"
+                    d="M5.28 14.24c-.24-.72-.38-1.49-.38-2.24s.14-1.52.38-2.24V6.62H1.29C.47 8.24 0 10.06 0 12s.47 3.76 1.29 5.38l3.99-3.14Z"
+                  />
+                  <path
+                    fill="#EA4335"
+                    d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.31 0 3.26 2.7 1.29 6.62l3.99 3.14c.95-2.85 3.6-4.96 6.72-4.96Z"
+                  />
+                </svg>
+                <span>Continuar con Google</span>
+              </button>
+
+              {!authSession?.googleLoginEnabled && (
+                <p className="text-xs text-slate-500 leading-relaxed">
+                  Google OAuth pendiente: configurá <code className="font-mono">GOOGLE_CLIENT_ID</code> y{' '}
+                  <code className="font-mono">GOOGLE_CLIENT_SECRET</code> en Cloudflare Secrets para habilitar este acceso.
+                </p>
+              )}
             </form>
           )}
 
@@ -445,8 +524,23 @@ export default function App() {
                   </select>
                 </div>
               ) : (
-                <div className="text-xs text-slate-600 font-medium">
-                  Sesión: <span className="text-slate-900">{authSession.user.name}</span> ({authSession.user.email})
+                <div className="flex items-center gap-2 text-xs text-slate-600 font-medium">
+                  <span>
+                    Sesión: <span className="text-slate-900">{authSession.user.name}</span> ({authSession.user.email})
+                  </span>
+                  {authSession.googleLoginEnabled && (
+                    authSession.googleLinked ? (
+                      <span className="text-emerald-700">· Google vinculado</span>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => window.location.assign('/api/auth/google/start?mode=link')}
+                        className="text-[#1D4ED8] hover:underline"
+                      >
+                        · Vincular Google
+                      </button>
+                    )
+                  )}
                 </div>
               )}
             </div>

@@ -15,6 +15,7 @@ import {
 } from './conversations.ts';
 import { computeNextRetryIso } from './integrations.ts';
 import { getStorageBackendInfo, withStoreTransaction } from './persistence.ts';
+import { resolveSafeAppBaseUrl } from './urlHelper.ts';
 
 const META_VERIFY_TOKEN_SETTING_KEY = 'meta_verify_token';
 const textEncoder = new TextEncoder();
@@ -236,10 +237,7 @@ export function isMetaOutboundEnabled(): boolean {
 
 export async function getMetaIntegrationConfig(requestOrigin?: string) {
   const { token, source } = await readOrCreateServerVerifyToken();
-  const baseUrl = (getEnv('APP_URL')?.trim() || requestOrigin || 'http://localhost:3000').replace(
-    /\/$/,
-    ''
-  );
+  const baseUrl = resolveSafeAppBaseUrl(requestOrigin);
   const webhookPath = '/api/webhooks/meta/whatsapp';
   const storageInfo = getStorageBackendInfo();
   const kService = getEnv('K_SERVICE') || null;

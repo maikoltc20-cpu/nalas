@@ -177,6 +177,22 @@ export async function initializeDatabaseControlled(options?: {
       const configuredAdminEmail = getEnv('NALAS_ADMIN_EMAIL')?.trim().toLowerCase();
       const configuredAdminPassword = getEnv('NALAS_ADMIN_PASSWORD');
 
+      if (configuredAdminEmail) {
+        const defaultAdmin = store.users.find((u) => u.id === 'user_michael');
+        const emailAlreadyUsed = store.users.some(
+          (u) => u.id !== 'user_michael' && u.email.toLowerCase() === configuredAdminEmail
+        );
+        if (
+          defaultAdmin &&
+          defaultAdmin.email.toLowerCase() === 'michael@nexotechnologies.io' &&
+          !emailAlreadyUsed &&
+          defaultAdmin.email.toLowerCase() !== configuredAdminEmail
+        ) {
+          defaultAdmin.email = configuredAdminEmail;
+          changed = true;
+        }
+      }
+
       if (configuredAdminPassword) {
         const adminUser =
           (configuredAdminEmail

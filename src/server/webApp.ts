@@ -46,6 +46,14 @@ import {
   isAuthorizedForInitialSetup,
 } from './modules/dbInit.ts';
 import {
+  buildClearGoogleOAuthCookieHeader,
+  completeGoogleOAuthCallback,
+  createGoogleAuthorizationRequest,
+  isGoogleOAuthConfigured,
+  resolveOrLinkGoogleUser,
+} from './modules/googleOAuth.ts';
+import { resolveSafeAppBaseUrl } from './modules/urlHelper.ts';
+import {
   processInboundMessage,
   runSerializedForConversation,
   sendInitialBasicGreeting,
@@ -211,14 +219,18 @@ webApp.post('/api/system/initialize', async (c) => {
 });
 
 webApp.get('/api/auth/session', async (c) => {
+  const storage = getStorageBackendInfo();
+  const googleLoginEnabled = isGoogleOAuthConfigured();
   try {
-    const storage = getStorageBackendInfo();
     const initStatus = await getDatabaseInitStatus();
     if (!initStatus.initialized) {
       return c.json({
         authenticated: false,
         user: null,
         initialized: false,
+        dbError: null,
+        googleLoginEnabled,
+        googleLinked: false,
         demoQuickLoginEnabled: false,
         demoUsers: [],
         storage,
@@ -228,11 +240,17 @@ webApp.get('/api/auth/session', async (c) => {
     const userId = await resolveAuthenticatedUserFromCookieHeader(c.req.header('cookie'));
     const store = await readStore();
     const user = userId ? store.users.find((u) => u.id === userId) ?? null : null;
+    const googleLinked = Boolean(
+      user && store.userIdentities?.some((i) => i.userId === user.id && i.provider === 'google')
+    );
     const demoQuickLoginEnabled = isDemoQuickLoginEnabled();
     return c.json({
       authenticated: Boolean(user),
       user,
       initialized: true,
+      dbError: null,
+      googleLoginEnabled,
+      googleLinked,
       demoQuickLoginEnabled,
       demoUsers: demoQuickLoginEnabled
         ? store.users.map((u) => ({
@@ -245,9 +263,152 @@ webApp.get('/api/auth/session', async (c) => {
       storage,
     });
   } catch (err) {
-    return errorResponse(err);
+    const message =
+      err instanceof Error ? err.message : 'Error verificando la conexión con la base de datos.';
+    return c.json({
+      authenticated: false,
+      user: null,
+      initialized: false,
+      dbError: message,
+      googleLoginEnabled,
+      googleLinked: false,
+      demoQuickLoginEnabled: false,
+      demoUsers: [],
+      storage,
+    });
   }
 });
+
+webApp.get('/api/auth/google/start', async (c) => {
+  const https = isHttpsRequest(c.req.raw, (n) => c.req.header(n));
+  let basePath = '/';
+  try {
+    basePath = resolveSafeAppBaseUrl(c.req.raw);
+  } catch {
+    basePath = '';
+  }
+  const redirectWithError = (msg: string) => {
+    const headers = new Headers();
+    headers.set('Location', `${basePath}/?authError=${encodeURIComponent(msg)}`);
+    return new Response(null, { status: 302, headers });
+  };
+
+  try {
+    if (!isGoogleOAuthConfigured()) {
+      return redirectWithError(
+        'Continuar con Google aún no está configurado en el servidor (faltan GOOGLE_CLIENT_ID y GOOGLE_CLIENT_SECRET en Cloudflare Secrets).'
+      );
+    }
+
+    const initStatus = await getDatabaseInitStatus();
+    if (!initStatus.initialized) {
+      return redirectWithError(
+        'La base de datos PostgreSQL aún no está inicializada. Ejecutá primero la inicialización controlada.'
+      );
+    }
+
+    const mode = c.req.query('mode') === 'link' ? 'link' : 'login';
+    let actorUserId: string | undefined;
+    if (mode === 'link') {
+      const uid = await resolveAuthenticatedUserFromCookieHeader(c.req.header('cookie'));
+      if (!uid) {
+        return redirectWithError('Iniciá sesión antes de vincular tu cuenta de Google.');
+      }
+      actorUserId = uid;
+    }
+
+    const { authorizationUrl, stateCookieHeader } = await createGoogleAuthorizationRequest({
+      request: c.req.raw,
+      isHttps: https,
+      mode,
+      actorUserId,
+    });
+
+    const headers = new Headers();
+    headers.set('Location', authorizationUrl);
+    headers.append('Set-Cookie', stateCookieHeader);
+    return new Response(null, { status: 302, headers });
+  } catch (err) {
+    const msg =
+      err instanceof Error ? err.message : 'No se pudo iniciar la autenticación con Google.';
+    return redirectWithError(msg);
+  }
+});
+
+async function handleGoogleOAuthCallback(c: {
+  req: {
+    raw: Request;
+    query: (name: string) => string | undefined;
+    header: (name: string) => string | undefined;
+  };
+}): Promise<Response> {
+  const https = isHttpsRequest(c.req.raw, (n) => c.req.header(n));
+  const clearOAuthCookie = buildClearGoogleOAuthCookieHeader(https);
+  let baseUrl = '';
+  try {
+    baseUrl = resolveSafeAppBaseUrl(c.req.raw);
+  } catch {
+    baseUrl = '';
+  }
+
+  const redirectWithError = (msg: string) => {
+    const headers = new Headers();
+    headers.set('Location', `${baseUrl}/?authError=${encodeURIComponent(msg)}`);
+    headers.append('Set-Cookie', clearOAuthCookie);
+    return new Response(null, { status: 302, headers });
+  };
+
+  try {
+    const oauthError = c.req.query('error');
+    if (oauthError) {
+      return redirectWithError(
+        oauthError === 'access_denied'
+          ? 'Autorización con Google cancelada por el usuario.'
+          : `Google rechazó la autorización (${oauthError}).`
+      );
+    }
+
+    const code = c.req.query('code');
+    const state = c.req.query('state');
+    if (!code || !state) {
+      return redirectWithError('Respuesta de Google incompleta (falta code o state).');
+    }
+
+    const initStatus = await getDatabaseInitStatus();
+    if (!initStatus.initialized) {
+      return redirectWithError(
+        'La base de datos PostgreSQL aún no está inicializada. Ejecutá primero la inicialización controlada.'
+      );
+    }
+
+    const verifiedIdentity = await completeGoogleOAuthCallback({
+      request: c.req.raw,
+      code,
+      state,
+      cookieHeader: c.req.header('cookie'),
+    });
+
+    const resolved = await withStoreTransaction((store) =>
+      resolveOrLinkGoogleUser(store, verifiedIdentity)
+    );
+
+    const sessionToken = await signSessionToken(resolved.user.id);
+    const sessionCookie = buildSetSessionCookieHeader(https, sessionToken);
+
+    const headers = new Headers();
+    headers.set('Location', `${baseUrl}/`);
+    headers.append('Set-Cookie', sessionCookie);
+    headers.append('Set-Cookie', clearOAuthCookie);
+    return new Response(null, { status: 302, headers });
+  } catch (err) {
+    const msg =
+      err instanceof Error ? err.message : 'No se pudo completar la verificación con Google.';
+    return redirectWithError(msg);
+  }
+}
+
+webApp.get('/api/auth/google/callback', (c) => handleGoogleOAuthCallback(c));
+webApp.get('/api/auth/google/callback/', (c) => handleGoogleOAuthCallback(c));
 
 webApp.post('/api/auth/login', async (c) => {
   try {

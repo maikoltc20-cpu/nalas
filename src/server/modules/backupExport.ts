@@ -149,7 +149,10 @@ export function buildCleanBackupExport(
       'GEMINI_API_KEY',
       'DATABASE_URL',
       'NALAS_SESSION_SECRET',
+      'GOOGLE_CLIENT_ID',
+      'GOOGLE_CLIENT_SECRET',
       'userCredentials (hashes de contraseña)',
+      'userIdentities (identificadores OAuth externos)',
       'nalas-meta-config.json',
     ],
     resumenConfiguracion: {

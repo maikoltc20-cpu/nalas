@@ -310,8 +310,8 @@ export function assertTenantScope<T extends { businessId: string }>(
 
 export async function createBackupSnapshot(label: string): Promise<{ id: string; label: string; createdAt: string }> {
   return withStoreTransaction((store) => {
-    // Strip credentials before storing internal backup snapshots
-    const cleanSnapshot = { ...store, backups: [], userCredentials: [] };
+    // Strip credentials and external OAuth identities before storing internal backup snapshots
+    const cleanSnapshot = { ...store, backups: [], userCredentials: [], userIdentities: [] };
     const id = `bkp_${Date.now()}`;
     const createdAt = new Date().toISOString();
     store.backups.unshift({
@@ -338,10 +338,14 @@ export async function restoreBackupSnapshot(backupId: string): Promise<{ restore
     const parsed = JSON.parse(found.snapshotJson) as NalasStore;
     const preservedBackups = store.backups;
     const preservedCredentials = store.userCredentials ?? [];
+    const preservedIdentities = store.userIdentities ?? [];
     Object.assign(store, parsed);
     store.backups = preservedBackups;
     if (!store.userCredentials || store.userCredentials.length === 0) {
       store.userCredentials = preservedCredentials;
+    }
+    if (!store.userIdentities || store.userIdentities.length === 0) {
+      store.userIdentities = preservedIdentities;
     }
     return {
       restoredAt: new Date().toISOString(),

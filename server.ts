@@ -50,9 +50,22 @@ app.use('/api', async (req, res, next) => {
     );
 
     res.status(webResponse.status);
+    const setCookies =
+      typeof webResponse.headers.getSetCookie === 'function'
+        ? webResponse.headers.getSetCookie()
+        : [];
     webResponse.headers.forEach((value, key) => {
+      if (key.toLowerCase() === 'set-cookie') return;
       res.setHeader(key, value);
     });
+    if (setCookies.length > 0) {
+      res.setHeader('Set-Cookie', setCookies);
+    } else {
+      const singleCookie = webResponse.headers.get('set-cookie');
+      if (singleCookie) {
+        res.setHeader('Set-Cookie', singleCookie);
+      }
+    }
     const respBuf = Buffer.from(await webResponse.arrayBuffer());
     res.send(respBuf);
   } catch (err) {

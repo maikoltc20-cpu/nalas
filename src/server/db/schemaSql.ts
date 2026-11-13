@@ -29,6 +29,17 @@ export const SCHEMA_STATEMENTS: string[] = [
     password_hash TEXT NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL
   )`,
+  `CREATE TABLE IF NOT EXISTS nalas_user_identities (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES nalas_users(id) ON DELETE CASCADE,
+    provider TEXT NOT NULL,
+    provider_subject TEXT NOT NULL,
+    email_at_link TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL,
+    last_login_at TIMESTAMPTZ NOT NULL,
+    UNIQUE (provider, provider_subject),
+    UNIQUE (user_id, provider)
+  )`,
   `CREATE TABLE IF NOT EXISTS nalas_memberships (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL REFERENCES nalas_users(id) ON DELETE CASCADE,

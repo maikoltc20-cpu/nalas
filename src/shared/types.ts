@@ -253,6 +253,16 @@ export interface UserCredential {
   updatedAt: string;
 }
 
+export interface UserExternalIdentity {
+  id: string;
+  userId: string;
+  provider: 'google';
+  providerSubject: string;
+  emailAtLink: string;
+  createdAt: string;
+  lastLoginAt: string;
+}
+
 export interface Membership {
   id: string;
   userId: string;
@@ -532,6 +542,7 @@ export interface NalasStore {
   businesses: Business[];
   users: User[];
   userCredentials?: UserCredential[];
+  userIdentities?: UserExternalIdentity[];
   memberships: Membership[];
   supportGrants: SupportGrant[];
   assistants: Assistant[];

@@ -32,6 +32,8 @@ META_OUTBOUND_ENABLED = "false"
 #   - NALAS_ADMIN_EMAIL         (obligatorio para login/inicialización controlada)
 #   - NALAS_ADMIN_PASSWORD      (obligatorio para login/inicialización controlada)
 #   - NALAS_INIT_SECRET         (opcional: token dedicado para POST /api/system/initialize)
+#   - GOOGLE_CLIENT_ID          (opcional: Client ID OAuth para "Continuar con Google")
+#   - GOOGLE_CLIENT_SECRET      (opcional: Client Secret OAuth para "Continuar con Google")
 #   - META_APP_SECRET           (obligatorio al validar firma de Meta Webhook)
 #   - APP_URL                   (opcional: https://<worker>.<subdominio>.workers.dev)
 #   - META_WHATSAPP_ACCESS_TOKEN / META_PHONE_NUMBER_ID (solo al habilitar envíos reales más adelante)
