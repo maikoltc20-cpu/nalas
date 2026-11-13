@@ -185,6 +185,39 @@ export async function setIntegrationSettingPg(key: string, value: string): Promi
   });
 }
 
+export async function ensureSessionSigningSecretPg(generatedSecret: string): Promise<string> {
+  return withPgClient(async (client) => {
+    const existingRes = await client.query<{ setting_value: string }>(
+      `SELECT setting_value
+       FROM nalas_integration_settings
+       WHERE setting_key = 'nalas_session_secret'`
+    );
+    const existing = existingRes.rows[0]?.setting_value?.trim() ?? '';
+    if (existing.length >= 24) {
+      return existing;
+    }
+
+    const upserted = await client.query<{ setting_value: string }>(
+      `INSERT INTO nalas_integration_settings (setting_key, setting_value, updated_at)
+       VALUES ('nalas_session_secret', $1, NOW())
+       ON CONFLICT (setting_key) DO UPDATE
+         SET setting_value = CASE
+           WHEN LENGTH(TRIM(nalas_integration_settings.setting_value)) >= 24
+             THEN nalas_integration_settings.setting_value
+           ELSE EXCLUDED.setting_value
+         END,
+         updated_at = CASE
+           WHEN LENGTH(TRIM(nalas_integration_settings.setting_value)) >= 24
+             THEN nalas_integration_settings.updated_at
+           ELSE NOW()
+         END
+       RETURNING setting_value`,
+      [generatedSecret]
+    );
+    return upserted.rows[0].setting_value.trim();
+  });
+}
+
 export async function claimInboundEventPg(
   client: PoolClient,
   dedupKey: string,

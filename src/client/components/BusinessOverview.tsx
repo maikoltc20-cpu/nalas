@@ -350,7 +350,7 @@ export function BusinessOverview({
 
           <div className="divide-y divide-slate-200 border-y border-slate-200 text-sm">
             <div className="py-3 flex justify-between gap-4">
-              <span className="text-slate-600">Licencia NALAS</span>
+              <span className="text-slate-600">Licencia Nala</span>
               <span className="font-mono tabular-nums text-slate-700">
                 {scoped.costSummary.licenseCostMinor !== null
                   ? formatMoney(scoped.costSummary.licenseCostMinor, business.currency)

@@ -279,7 +279,7 @@ export function AdminNalasWorkspace({
             <div className="flex flex-wrap items-center justify-between gap-4">
               <div>
                 <h3 className="text-lg font-semibold text-slate-900">
-                  Acceso temporal de Soporte NALAS (Auditado)
+                  Acceso temporal de Soporte Nala (Auditado)
                 </h3>
                 <p className="text-sm text-slate-600 mt-0.5">
                   El administrador de plataforma no puede leer datos de un negocio sin permiso explícito vigente.

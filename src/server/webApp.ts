@@ -19,8 +19,10 @@ import {
   authenticateUserCredentials,
   buildClearSessionCookieHeader,
   buildSetSessionCookieHeader,
+  diagnoseSessionSigningSecret,
   hashPassword,
   isDemoQuickLoginEnabled,
+  isProductionAccessMode,
   resolveAuthenticatedUserFromCookieHeader,
   signSessionToken,
 } from './modules/auth.ts';
@@ -47,9 +49,9 @@ import {
 } from './modules/dbInit.ts';
 import {
   buildClearGoogleOAuthCookieHeader,
+  checkGoogleOAuthReadiness,
   completeGoogleOAuthCallback,
   createGoogleAuthorizationRequest,
-  isGoogleOAuthConfigured,
   resolveOrLinkGoogleUser,
 } from './modules/googleOAuth.ts';
 import { resolveSafeAppBaseUrl } from './modules/urlHelper.ts';
@@ -125,7 +127,7 @@ function errorResponse(err: unknown): Response {
 function assertPlatformAdmin(store: Awaited<ReturnType<typeof readStore>>, userId: string) {
   const actor = store.users.find((u) => u.id === userId);
   if (!actor || !actor.isPlatformAdmin) {
-    const err = new Error('Acceso restringido a administración de plataforma NALAS.');
+    const err = new Error('Acceso restringido a administración de plataforma Nala.');
     (err as Error & { statusCode?: number }).statusCode = 403;
     throw err;
   }
@@ -220,7 +222,7 @@ webApp.post('/api/system/initialize', async (c) => {
 
 webApp.get('/api/auth/session', async (c) => {
   const storage = getStorageBackendInfo();
-  const googleLoginEnabled = isGoogleOAuthConfigured();
+  const productionMode = isProductionAccessMode();
   try {
     const initStatus = await getDatabaseInitStatus();
     if (!initStatus.initialized) {
@@ -228,8 +230,18 @@ webApp.get('/api/auth/session', async (c) => {
         authenticated: false,
         user: null,
         initialized: false,
+        productionMode,
         dbError: null,
-        googleLoginEnabled,
+        authIssue: {
+          code: 'DB_UNINITIALIZED',
+          title: 'Base de datos pendiente de preparación inicial',
+          message: productionMode
+            ? 'La base de datos PostgreSQL todavía no tiene sus tablas iniciales creadas. Completá la preparación inicial de la base antes de ingresar.'
+            : 'PostgreSQL respondió correctamente, pero las tablas iniciales de Nala todavía no fueron creadas.',
+          actionLabel: productionMode ? 'Reintentar' : 'Inicializar base de datos',
+        },
+        googleLoginEnabled: false,
+        googleIssue: null,
         googleLinked: false,
         demoQuickLoginEnabled: false,
         demoUsers: [],
@@ -237,19 +249,51 @@ webApp.get('/api/auth/session', async (c) => {
       });
     }
 
+    const secretDiag = await diagnoseSessionSigningSecret();
+    if (!secretDiag.ok) {
+      const isConnErr = secretDiag.code === 'DB_CONNECTION_ERROR';
+      return c.json({
+        authenticated: false,
+        user: null,
+        initialized: secretDiag.code !== 'DB_UNINITIALIZED',
+        productionMode,
+        dbError: isConnErr ? secretDiag.message : null,
+        authIssue: {
+          code: secretDiag.code,
+          title: isConnErr
+            ? 'Error de conexión con la base de datos PostgreSQL'
+            : secretDiag.code === 'DB_UNINITIALIZED'
+              ? 'Base de datos pendiente de preparación inicial'
+              : 'Acceso bloqueado por error al persistir la sesión segura',
+          message: secretDiag.message,
+          actionLabel: 'Reintentar',
+        },
+        googleLoginEnabled: false,
+        googleIssue: null,
+        googleLinked: false,
+        demoQuickLoginEnabled: false,
+        demoUsers: [],
+        storage,
+      });
+    }
+
+    const googleReadiness = checkGoogleOAuthReadiness(c.req.raw);
     const userId = await resolveAuthenticatedUserFromCookieHeader(c.req.header('cookie'));
     const store = await readStore();
     const user = userId ? store.users.find((u) => u.id === userId) ?? null : null;
     const googleLinked = Boolean(
       user && store.userIdentities?.some((i) => i.userId === user.id && i.provider === 'google')
     );
-    const demoQuickLoginEnabled = isDemoQuickLoginEnabled();
+    const demoQuickLoginEnabled = !productionMode && isDemoQuickLoginEnabled();
     return c.json({
       authenticated: Boolean(user),
       user,
       initialized: true,
+      productionMode,
       dbError: null,
-      googleLoginEnabled,
+      authIssue: null,
+      googleLoginEnabled: googleReadiness.ready,
+      googleIssue: googleReadiness.issue,
       googleLinked,
       demoQuickLoginEnabled,
       demoUsers: demoQuickLoginEnabled
@@ -269,8 +313,16 @@ webApp.get('/api/auth/session', async (c) => {
       authenticated: false,
       user: null,
       initialized: false,
+      productionMode,
       dbError: message,
-      googleLoginEnabled,
+      authIssue: {
+        code: 'DB_CONNECTION_ERROR',
+        title: 'Error de conexión con la base de datos PostgreSQL',
+        message,
+        actionLabel: 'Reintentar conexión',
+      },
+      googleLoginEnabled: false,
+      googleIssue: null,
       googleLinked: false,
       demoQuickLoginEnabled: false,
       demoUsers: [],
@@ -294,16 +346,23 @@ webApp.get('/api/auth/google/start', async (c) => {
   };
 
   try {
-    if (!isGoogleOAuthConfigured()) {
-      return redirectWithError(
-        'Continuar con Google aún no está configurado en el servidor (faltan GOOGLE_CLIENT_ID y GOOGLE_CLIENT_SECRET en Cloudflare Secrets).'
-      );
-    }
-
     const initStatus = await getDatabaseInitStatus();
     if (!initStatus.initialized) {
       return redirectWithError(
         'La base de datos PostgreSQL aún no está inicializada. Ejecutá primero la inicialización controlada.'
+      );
+    }
+
+    const secretDiag = await diagnoseSessionSigningSecret();
+    if (!secretDiag.ok) {
+      return redirectWithError(secretDiag.message);
+    }
+
+    const googleReadiness = checkGoogleOAuthReadiness(c.req.raw);
+    if (!googleReadiness.ready) {
+      return redirectWithError(
+        googleReadiness.issue ||
+          'Continuar con Google aún no está configurado en el servidor (faltan GOOGLE_CLIENT_ID y GOOGLE_CLIENT_SECRET en Cloudflare Secrets).'
       );
     }
 

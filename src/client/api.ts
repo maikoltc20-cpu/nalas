@@ -85,12 +85,22 @@ export interface BootstrapResponse {
   } | null;
 }
 
+export interface AuthIssue {
+  code: 'DB_CONNECTION_ERROR' | 'DB_UNINITIALIZED' | 'SESSION_STORAGE_ERROR';
+  title: string;
+  message: string;
+  actionLabel: string;
+}
+
 export interface AuthSessionResponse {
   authenticated: boolean;
   user: User | null;
   initialized: boolean;
+  productionMode?: boolean;
   dbError?: string | null;
+  authIssue?: AuthIssue | null;
   googleLoginEnabled: boolean;
+  googleIssue?: string | null;
   googleLinked?: boolean;
   demoQuickLoginEnabled: boolean;
   demoUsers: User[];

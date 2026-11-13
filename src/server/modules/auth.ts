@@ -1,6 +1,6 @@
 import type { NalasStore, User } from '../../shared/types.ts';
 import {
-  getIntegrationSettingPg,
+  ensureSessionSigningSecretPg,
   hashPasswordPg,
   isPostgresConfigured,
   verifyPasswordPg,
@@ -10,7 +10,7 @@ import { getEnv, isWorkerRuntime } from '../runtimeContext.ts';
 export const SESSION_COOKIE_NAME = 'nalas_session';
 const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 
-let cachedSigningSecret: string | null = null;
+let cachedDbSigningSecret: string | null = null;
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 
@@ -70,7 +70,16 @@ async function hmacSha256Base64Url(secret: string, message: string): Promise<str
 export function isDemoQuickLoginEnabled(): boolean {
   return (
     getEnv('NODE_ENV') !== 'production' &&
-    getEnv('NALAS_DISABLE_DEMO_LOGIN') !== 'true'
+    getEnv('NALAS_DISABLE_DEMO_LOGIN') !== 'true' &&
+    !isWorkerRuntime()
+  );
+}
+
+export function isProductionAccessMode(): boolean {
+  return (
+    getEnv('NODE_ENV') === 'production' ||
+    getEnv('NALAS_DISABLE_DEMO_LOGIN') === 'true' ||
+    isWorkerRuntime()
   );
 }
 
@@ -114,32 +123,84 @@ export async function verifyPassword(password: string, storedHash: string): Prom
   return nodeCrypto.timingSafeEqual(actualBuf, expectedBuf);
 }
 
-export async function getSessionSigningSecret(): Promise<string> {
-  const envSecret = getEnv('NALAS_SESSION_SECRET')?.trim();
-  if (envSecret && envSecret.length >= 24) {
-    return envSecret;
+function makeAuthConfigError(message: string, code: string, statusCode = 503): Error {
+  const err = new Error(message) as Error & { statusCode?: number; code?: string };
+  err.statusCode = statusCode;
+  err.code = code;
+  return err;
+}
+
+function getValidEnvSessionSecret(): string | null {
+  const raw = getEnv('NALAS_SESSION_SECRET')?.trim() ?? '';
+  if (!raw) return null;
+  if (
+    (raw.startsWith('"') && raw.endsWith('"')) ||
+    (raw.startsWith("'") && raw.endsWith("'")) ||
+    /[\s\r\n]/.test(raw) ||
+    raw.length < 24
+  ) {
+    return null;
   }
-  if (cachedSigningSecret) {
-    return cachedSigningSecret;
+  return raw;
+}
+
+export type SessionSecretDiagnosis =
+  | { ok: true; source: 'env' | 'database' | 'local_dev' }
+  | {
+      ok: false;
+      code: 'DB_UNINITIALIZED' | 'DB_CONNECTION_ERROR' | 'SESSION_STORAGE_ERROR';
+      message: string;
+    };
+
+export async function getSessionSigningSecret(): Promise<string> {
+  const validEnvSecret = getValidEnvSessionSecret();
+  if (validEnvSecret) {
+    return validEnvSecret;
   }
 
   if (isPostgresConfigured()) {
-    const existing = await getIntegrationSettingPg('nalas_session_secret');
-    if (existing && existing.length >= 32) {
-      cachedSigningSecret = existing;
-      return existing;
+    if (cachedDbSigningSecret && cachedDbSigningSecret.length >= 24) {
+      return cachedDbSigningSecret;
     }
-    const err = new Error(
-      'Base de datos o secreto de sesión no inicializado. Configurá NALAS_SESSION_SECRET o ejecutá la inicialización controlada.'
-    ) as Error & { statusCode?: number };
-    err.statusCode = 503;
-    throw err;
+    try {
+      const persisted = await ensureSessionSigningSecretPg(randomHex(32));
+      if (persisted.length >= 24) {
+        cachedDbSigningSecret = persisted;
+        return persisted;
+      }
+      throw makeAuthConfigError(
+        'No se pudo inicializar el secreto interno de sesión en PostgreSQL. El acceso queda bloqueado hasta restablecer la persistencia.',
+        'SESSION_STORAGE_ERROR'
+      );
+    } catch (err) {
+      const pgCode = (err as { code?: string })?.code;
+      if (pgCode === '42P01') {
+        throw makeAuthConfigError(
+          'La base de datos PostgreSQL aún no tiene sus tablas iniciales creadas.',
+          'DB_UNINITIALIZED'
+        );
+      }
+      if (err instanceof Error && 'statusCode' in err && 'code' in err) {
+        throw err;
+      }
+      throw makeAuthConfigError(
+        err instanceof Error
+          ? err.message
+          : 'No se pudo leer ni guardar el secreto interno de sesión en PostgreSQL. El acceso está bloqueado temporalmente por seguridad.',
+        'SESSION_STORAGE_ERROR'
+      );
+    }
   }
 
   if (isWorkerRuntime() || getEnv('NODE_ENV') === 'production') {
-    throw new Error(
-      'NALAS_SESSION_SECRET o DATABASE_URL es obligatorio en Cloudflare Workers y producción para firmar sesiones fuera del disco efímero.'
+    throw makeAuthConfigError(
+      'Falta configurar la base de datos PostgreSQL (DATABASE_URL) para persistir las sesiones de forma segura.',
+      'SESSION_STORAGE_ERROR'
     );
+  }
+
+  if (cachedDbSigningSecret && cachedDbSigningSecret.length >= 24) {
+    return cachedDbSigningSecret;
   }
 
   const fs = await import('node:fs/promises');
@@ -149,7 +210,7 @@ export async function getSessionSigningSecret(): Promise<string> {
   try {
     const raw = (await fs.readFile(devSecretFile, 'utf8')).trim();
     if (raw.length >= 32) {
-      cachedSigningSecret = raw;
+      cachedDbSigningSecret = raw;
       return raw;
     }
   } catch {
@@ -157,8 +218,31 @@ export async function getSessionSigningSecret(): Promise<string> {
   }
   const devSecret = randomHex(32);
   await fs.writeFile(devSecretFile, devSecret, { mode: 0o600 });
-  cachedSigningSecret = devSecret;
+  cachedDbSigningSecret = devSecret;
   return devSecret;
+}
+
+export async function diagnoseSessionSigningSecret(): Promise<SessionSecretDiagnosis> {
+  if (getValidEnvSessionSecret()) {
+    return { ok: true, source: 'env' };
+  }
+  try {
+    await getSessionSigningSecret();
+    return { ok: true, source: isPostgresConfigured() ? 'database' : 'local_dev' };
+  } catch (err) {
+    const code = (err as { code?: string })?.code;
+    const message =
+      err instanceof Error
+        ? err.message
+        : 'No se pudo preparar la sesión segura en PostgreSQL.';
+    if (code === 'DB_UNINITIALIZED') {
+      return { ok: false, code: 'DB_UNINITIALIZED', message };
+    }
+    if (code === 'MISSING_DATABASE_URL' || code === 'INVALID_DATABASE_URL') {
+      return { ok: false, code: 'DB_CONNECTION_ERROR', message };
+    }
+    return { ok: false, code: 'SESSION_STORAGE_ERROR', message };
+  }
 }
 
 interface SessionPayload {

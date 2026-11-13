@@ -154,12 +154,25 @@ export async function initializeDatabaseControlled(options?: {
         changed = true;
       }
 
-      // Garantizar secretos internos persistentes en DB una sola vez (si no hay override por env)
-      if (!getEnv('NALAS_SESSION_SECRET')?.trim()) {
+      // Garantizar secretos internos persistentes en DB una sola vez (si no hay un valor válido en env)
+      const envSessionSecret = getEnv('NALAS_SESSION_SECRET')?.trim() ?? '';
+      const envSessionSecretValid =
+        envSessionSecret.length >= 24 &&
+        !(
+          (envSessionSecret.startsWith('"') && envSessionSecret.endsWith('"')) ||
+          (envSessionSecret.startsWith("'") && envSessionSecret.endsWith("'"))
+        ) &&
+        !/[\s\r\n]/.test(envSessionSecret);
+      if (!envSessionSecretValid) {
         await client.query(
           `INSERT INTO nalas_integration_settings (setting_key, setting_value, updated_at)
            VALUES ('nalas_session_secret', $1, NOW())
-           ON CONFLICT (setting_key) DO NOTHING`,
+           ON CONFLICT (setting_key) DO UPDATE
+             SET setting_value = CASE
+               WHEN LENGTH(TRIM(nalas_integration_settings.setting_value)) >= 24
+                 THEN nalas_integration_settings.setting_value
+               ELSE EXCLUDED.setting_value
+             END`,
           [randomHex(32)]
         );
       }

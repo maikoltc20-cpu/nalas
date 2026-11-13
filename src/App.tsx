@@ -73,7 +73,7 @@ export default function App() {
         setAuthSession((prev) => (prev ? { ...prev, authenticated: false, user: null } : prev));
         setData(null);
       } else {
-        setErrorMsg(err instanceof Error ? err.message : 'Error al conectar con el servidor NALAS.');
+        setErrorMsg(err instanceof Error ? err.message : 'Error al conectar con el servidor Nala.');
       }
     } finally {
       setLoading(false);
@@ -161,12 +161,15 @@ export default function App() {
   if (authLoading) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-[#F8FAFC] text-sm text-slate-600">
-        Verificando sesión en servidor NALAS...
+        Verificando sesión en Nala...
       </div>
     );
   }
 
   if (!authSession?.authenticated || !authSession.user) {
+    const isProduction = Boolean(authSession?.productionMode);
+    const showDevInitForm = !isProduction && authSession?.authIssue?.code === 'DB_UNINITIALIZED';
+
     return (
       <div className="min-h-screen flex items-center justify-center bg-[#F8FAFC] px-4 py-10">
         <div className="w-full max-w-md bg-white border border-slate-200 rounded-lg p-7 space-y-6">
@@ -177,11 +180,13 @@ export default function App() {
                 className="text-xl font-bold tracking-tight"
                 style={{ fontFamily: 'var(--font-display)' }}
               >
-                NALAS · Acceso al panel
+                Nala · Acceso al panel
               </h1>
             </div>
             <p className="text-sm text-slate-600">
-              Iniciá sesión con tus credenciales para administrar negocios, guiones y operaciones. El webhook público permanece aislado de este panel.
+              {isProduction
+                ? 'Ingresá con tu cuenta autorizada de Google para administrar negocios, guiones y operaciones.'
+                : 'Iniciá sesión con tus credenciales para administrar negocios, guiones y operaciones. El webhook público permanece aislado de este panel.'}
             </p>
           </div>
 
@@ -197,35 +202,36 @@ export default function App() {
             </div>
           )}
 
-          {authSession?.dbError ? (
+          {authSession?.authIssue && !showDevInitForm ? (
             <div className="space-y-4 text-sm">
               <div className="p-4 bg-red-50 border border-red-200 rounded-md space-y-2 text-red-900">
-                <div className="font-semibold">
-                  Error de configuración o conexión con PostgreSQL / URL del servidor
-                </div>
-                <p className="text-xs leading-relaxed text-red-800">{authSession.dbError}</p>
-                <p className="text-xs leading-relaxed text-red-800 pt-1 border-t border-red-200">
-                  Importante: iniciar sesión con Google no resuelve un problema de conexión o formato en{' '}
-                  <code className="font-mono">DATABASE_URL</code> ni en{' '}
-                  <code className="font-mono">APP_URL</code>. Verificá los Secrets del Worker en Cloudflare (sin comillas, sin el prefijo <code className="font-mono">psql</code> y sin saltos de línea).
+                <div className="font-semibold">{authSession.authIssue.title}</div>
+                <p className="text-xs leading-relaxed text-red-800">
+                  {authSession.authIssue.message}
                 </p>
               </div>
               <button
                 type="button"
                 disabled={loginBusy}
                 onClick={() => {
+                  setErrorMsg(null);
                   setAuthLoading(true);
                   loadSession();
                 }}
                 className="w-full py-2.5 px-4 text-sm font-medium text-white bg-slate-900 rounded-md hover:bg-slate-800 transition-colors disabled:opacity-50"
               >
-                Reintentar conexión
+                {authSession.authIssue.actionLabel}
               </button>
             </div>
-          ) : authSession && !authSession.initialized ? (
+          ) : showDevInitForm ? (
             <form onSubmit={handleControlledInitSubmit} className="space-y-4 text-sm">
-              <div className="p-3.5 bg-amber-50 border border-amber-200 rounded-md text-xs text-amber-950 leading-relaxed">
-                <strong>Base de datos Neon pendiente de inicialización controlada.</strong> Las tablas y credenciales iniciales no se crean automáticamente en cada petición. Ingresá las credenciales configuradas en Secrets del Worker (o el secreto de inicialización) para ejecutar la preparación única.
+              <div className="p-3.5 bg-amber-50 border border-amber-200 rounded-md text-xs text-amber-950 leading-relaxed space-y-1">
+                <div className="font-semibold">
+                  {authSession?.authIssue?.title ?? 'Base de datos PostgreSQL conectada, pendiente de inicialización'}
+                </div>
+                <p>
+                  Ingresá el correo (<code className="font-mono">NALAS_ADMIN_EMAIL</code>) y la contraseña (<code className="font-mono">NALAS_ADMIN_PASSWORD</code>) configurados en el servidor para inicializar una sola vez.
+                </p>
               </div>
               <div>
                 <label htmlFor="init-email" className="block font-medium text-slate-700 mb-1.5">
@@ -234,9 +240,10 @@ export default function App() {
                 <input
                   id="init-email"
                   type="email"
+                  required={!initSecret.trim()}
                   value={loginEmail}
                   onChange={(e) => setLoginEmail(e.target.value)}
-                  placeholder="michael@nexotechnologies.io"
+                  placeholder="admin@tu-dominio.com"
                   className="w-full border border-slate-300 rounded-md px-3.5 py-2.5 text-sm"
                 />
               </div>
@@ -247,6 +254,7 @@ export default function App() {
                 <input
                   id="init-password"
                   type="password"
+                  required={!initSecret.trim()}
                   value={loginPassword}
                   onChange={(e) => setLoginPassword(e.target.value)}
                   placeholder="••••••••••••"
@@ -255,14 +263,14 @@ export default function App() {
               </div>
               <div>
                 <label htmlFor="init-secret" className="block font-medium text-slate-700 mb-1.5">
-                  O secreto de inicialización (NALAS_INIT_SECRET, opcional)
+                  O secreto NALAS_INIT_SECRET (opcional)
                 </label>
                 <input
                   id="init-secret"
                   type="password"
                   value={initSecret}
                   onChange={(e) => setInitSecret(e.target.value)}
-                  placeholder="Opcional si ingresás credenciales admin"
+                  placeholder="Opcional"
                   className="w-full border border-slate-300 rounded-md px-3.5 py-2.5 text-sm"
                 />
               </div>
@@ -271,9 +279,65 @@ export default function App() {
                 disabled={loginBusy}
                 className="w-full py-2.5 px-4 text-sm font-medium text-white bg-slate-900 rounded-md hover:bg-slate-800 transition-colors disabled:opacity-50"
               >
-                {loginBusy ? 'Inicializando base de datos...' : 'Ejecutar inicialización controlada'}
+                {loginBusy ? 'Inicializando base de datos...' : 'Inicializar base de datos'}
               </button>
             </form>
+          ) : isProduction ? (
+            authSession?.googleLoginEnabled ? (
+              <div className="space-y-3 text-sm">
+                <button
+                  type="button"
+                  disabled={loginBusy}
+                  onClick={() => {
+                    setErrorMsg(null);
+                    window.location.assign('/api/auth/google/start');
+                  }}
+                  className="w-full py-3 px-4 text-sm font-medium text-slate-900 bg-white border border-slate-300 rounded-md hover:bg-slate-50 transition-colors disabled:opacity-60 flex items-center justify-center gap-2.5 shadow-xs"
+                >
+                  <svg className="w-4 h-4 shrink-0" viewBox="0 0 24 24" aria-hidden="true">
+                    <path
+                      fill="#4285F4"
+                      d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.82-2.4 3.68v3.05h3.88c2.27-2.09 3.665-5.17 3.665-9.17Z"
+                    />
+                    <path
+                      fill="#34A853"
+                      d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.05c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.11-6.72-4.96H1.29v3.14C3.26 21.3 7.31 24 12 24Z"
+                    />
+                    <path
+                      fill="#FBBC05"
+                      d="M5.28 14.24c-.24-.72-.38-1.49-.38-2.24s.14-1.52.38-2.24V6.62H1.29C.47 8.24 0 10.06 0 12s.47 3.76 1.29 5.38l3.99-3.14Z"
+                    />
+                    <path
+                      fill="#EA4335"
+                      d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.31 0 3.26 2.7 1.29 6.62l3.99 3.14c.95-2.85 3.6-4.96 6.72-4.96Z"
+                    />
+                  </svg>
+                  <span>Continuar con Google</span>
+                </button>
+              </div>
+            ) : (
+              <div className="space-y-4 text-sm">
+                <div className="p-4 bg-amber-50 border border-amber-200 rounded-md space-y-1.5 text-amber-950">
+                  <div className="font-semibold">Acceso con Google pendiente de configuración</div>
+                  <p className="text-xs leading-relaxed text-amber-900">
+                    {authSession?.googleIssue ??
+                      'Configurá GOOGLE_CLIENT_ID y GOOGLE_CLIENT_SECRET en Cloudflare Secrets para habilitar Continuar con Google.'}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  disabled={loginBusy}
+                  onClick={() => {
+                    setErrorMsg(null);
+                    setAuthLoading(true);
+                    loadSession();
+                  }}
+                  className="w-full py-2.5 px-4 text-sm font-medium text-white bg-slate-900 rounded-md hover:bg-slate-800 transition-colors disabled:opacity-50"
+                >
+                  Reintentar
+                </button>
+              </div>
+            )
           ) : (
             <form onSubmit={handleLoginSubmit} className="space-y-4 text-sm">
               <div>
@@ -312,52 +376,49 @@ export default function App() {
                 {loginBusy ? 'Validando...' : 'Iniciar sesión'}
               </button>
 
-              <div className="relative flex items-center py-1">
-                <div className="flex-grow border-t border-slate-200" />
-                <span className="shrink mx-3 text-xs text-slate-400">o</span>
-                <div className="flex-grow border-t border-slate-200" />
-              </div>
+              {authSession?.googleLoginEnabled && (
+                <>
+                  <div className="relative flex items-center py-1">
+                    <div className="flex-grow border-t border-slate-200" />
+                    <span className="shrink mx-3 text-xs text-slate-400">o</span>
+                    <div className="flex-grow border-t border-slate-200" />
+                  </div>
 
-              <button
-                type="button"
-                disabled={loginBusy || !authSession?.googleLoginEnabled}
-                onClick={() => {
-                  setErrorMsg(null);
-                  window.location.assign('/api/auth/google/start');
-                }}
-                className="w-full py-2.5 px-4 text-sm font-medium text-slate-800 bg-white border border-slate-300 rounded-md hover:bg-slate-50 transition-colors disabled:opacity-60 disabled:cursor-not-allowed flex items-center justify-center gap-2.5"
-              >
-                <svg className="w-4 h-4 shrink-0" viewBox="0 0 24 24" aria-hidden="true">
-                  <path
-                    fill="#4285F4"
-                    d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.82-2.4 3.68v3.05h3.88c2.27-2.09 3.665-5.17 3.665-9.17Z"
-                  />
-                  <path
-                    fill="#34A853"
-                    d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.05c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.11-6.72-4.96H1.29v3.14C3.26 21.3 7.31 24 12 24Z"
-                  />
-                  <path
-                    fill="#FBBC05"
-                    d="M5.28 14.24c-.24-.72-.38-1.49-.38-2.24s.14-1.52.38-2.24V6.62H1.29C.47 8.24 0 10.06 0 12s.47 3.76 1.29 5.38l3.99-3.14Z"
-                  />
-                  <path
-                    fill="#EA4335"
-                    d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.31 0 3.26 2.7 1.29 6.62l3.99 3.14c.95-2.85 3.6-4.96 6.72-4.96Z"
-                  />
-                </svg>
-                <span>Continuar con Google</span>
-              </button>
-
-              {!authSession?.googleLoginEnabled && (
-                <p className="text-xs text-slate-500 leading-relaxed">
-                  Google OAuth pendiente: configurá <code className="font-mono">GOOGLE_CLIENT_ID</code> y{' '}
-                  <code className="font-mono">GOOGLE_CLIENT_SECRET</code> en Cloudflare Secrets para habilitar este acceso.
-                </p>
+                  <button
+                    type="button"
+                    disabled={loginBusy}
+                    onClick={() => {
+                      setErrorMsg(null);
+                      window.location.assign('/api/auth/google/start');
+                    }}
+                    className="w-full py-2.5 px-4 text-sm font-medium text-slate-800 bg-white border border-slate-300 rounded-md hover:bg-slate-50 transition-colors disabled:opacity-60 flex items-center justify-center gap-2.5"
+                  >
+                    <svg className="w-4 h-4 shrink-0" viewBox="0 0 24 24" aria-hidden="true">
+                      <path
+                        fill="#4285F4"
+                        d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.82-2.4 3.68v3.05h3.88c2.27-2.09 3.665-5.17 3.665-9.17Z"
+                      />
+                      <path
+                        fill="#34A853"
+                        d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.05c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.11-6.72-4.96H1.29v3.14C3.26 21.3 7.31 24 12 24Z"
+                      />
+                      <path
+                        fill="#FBBC05"
+                        d="M5.28 14.24c-.24-.72-.38-1.49-.38-2.24s.14-1.52.38-2.24V6.62H1.29C.47 8.24 0 10.06 0 12s.47 3.76 1.29 5.38l3.99-3.14Z"
+                      />
+                      <path
+                        fill="#EA4335"
+                        d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.31 0 3.26 2.7 1.29 6.62l3.99 3.14c.95-2.85 3.6-4.96 6.72-4.96Z"
+                      />
+                    </svg>
+                    <span>Continuar con Google</span>
+                  </button>
+                </>
               )}
             </form>
           )}
 
-          {authSession?.demoQuickLoginEnabled && authSession.demoUsers.length > 0 && (
+          {!isProduction && authSession?.demoQuickLoginEnabled && authSession.demoUsers.length > 0 && (
             <div className="border-t border-slate-200 pt-4 space-y-2.5">
               <div className="text-xs font-medium text-slate-500">
                 Acceso rápido de entorno de prueba local (deshabilitado en producción)
@@ -399,7 +460,7 @@ export default function App() {
           className="text-xl font-bold tracking-tight text-slate-900 whitespace-nowrap shrink-0"
           style={{ fontFamily: 'var(--font-display)' }}
         >
-          NALAS
+          Nala
         </button>
 
         <nav className="flex items-center gap-6 overflow-x-auto text-sm font-medium text-slate-600">
@@ -409,7 +470,7 @@ export default function App() {
               ['diseno', 'Diseño'],
               ['simulador', 'Simulador'],
               ['operacion', 'Operación'],
-              ...(authSession.user.isPlatformAdmin ? [['admin', 'Admin NALAS']] : []),
+              ...(authSession.user.isPlatformAdmin ? [['admin', 'Admin Nala']] : []),
             ] as Array<[WorkspaceTab, string]>
           ).map(([id, label]) => (
             <button
@@ -517,7 +578,7 @@ export default function App() {
                       );
                       return (
                         <option key={u.id} value={u.id}>
-                          {u.name} ({mem ? mem.role : u.isPlatformAdmin ? 'Admin NALAS / sin membresía aquí' : 'sin acceso aquí'})
+                          {u.name} ({mem ? mem.role : u.isPlatformAdmin ? 'Admin Nala / sin membresía aquí' : 'sin acceso aquí'})
                         </option>
                       );
                     })}
@@ -605,7 +666,7 @@ export default function App() {
 
           {loading || !data ? (
             <div className="bg-white border border-slate-200 rounded-lg p-10 text-sm text-slate-500">
-              Cargando entorno operativo NALAS...
+              Cargando entorno operativo Nala...
             </div>
           ) : tab === 'admin' ? (
             <AdminNalasWorkspace
@@ -646,7 +707,7 @@ export default function App() {
                     onClick={() => setTab('admin')}
                     className="px-4 py-2 text-sm font-medium text-slate-700 bg-white border border-slate-300 rounded-md hover:bg-slate-50"
                   >
-                    Ir a Admin NALAS
+                    Ir a Admin Nala
                   </button>
                 )}
               </div>

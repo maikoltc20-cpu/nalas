@@ -107,6 +107,39 @@ export function isGoogleOAuthConfigured(): boolean {
   return Boolean(clientId && clientSecret);
 }
 
+export function checkGoogleOAuthReadiness(request: Request): {
+  configured: boolean;
+  ready: boolean;
+  issue: string | null;
+} {
+  const clientId = getEnv('GOOGLE_CLIENT_ID')?.trim() ?? '';
+  const clientSecret = getEnv('GOOGLE_CLIENT_SECRET')?.trim() ?? '';
+  if (!clientId && !clientSecret) {
+    return { configured: false, ready: false, issue: null };
+  }
+  if (!clientId || !clientSecret) {
+    return {
+      configured: false,
+      ready: false,
+      issue:
+        'Configuración incompleta de Google OAuth: falta GOOGLE_CLIENT_ID o GOOGLE_CLIENT_SECRET en Cloudflare Secrets.',
+    };
+  }
+  try {
+    resolveSafeAppBaseUrl(request);
+  } catch (err) {
+    return {
+      configured: true,
+      ready: false,
+      issue:
+        err instanceof Error
+          ? err.message
+          : 'APP_URL tiene formato inválido y no permite construir la URL de retorno de Google.',
+    };
+  }
+  return { configured: true, ready: true, issue: null };
+}
+
 export function getGoogleRedirectUri(request: Request): string {
   const baseUrl = resolveSafeAppBaseUrl(request);
   return `${baseUrl}/api/auth/google/callback`;
@@ -403,6 +436,8 @@ export function resolveOrLinkGoogleUser(
     store.userIdentities = [];
   }
   const now = new Date().toISOString();
+  const normalizedEmail = identity.email.trim().toLowerCase();
+  const configuredAdminEmail = getEnv('NALAS_ADMIN_EMAIL')?.trim().toLowerCase() ?? '';
 
   // 1. Identificación estable por Google `sub`
   const bySub = store.userIdentities.find(
@@ -411,7 +446,7 @@ export function resolveOrLinkGoogleUser(
   if (bySub) {
     if (identity.mode === 'link' && identity.actorUserId && bySub.userId !== identity.actorUserId) {
       const err = new Error(
-        'Esta cuenta de Google ya está vinculada a otro usuario distinto en NALAS.'
+        'Esta cuenta de Google ya está vinculada a otro usuario distinto en Nala.'
       ) as Error & { statusCode?: number };
       err.statusCode = 409;
       throw err;
@@ -419,7 +454,7 @@ export function resolveOrLinkGoogleUser(
     const user = store.users.find((u) => u.id === bySub.userId);
     if (!user) {
       const err = new Error(
-        'El usuario vinculado a esta cuenta de Google ya no existe en NALAS.'
+        'El usuario vinculado a esta cuenta de Google ya no existe en Nala.'
       ) as Error & { statusCode?: number };
       err.statusCode = 403;
       throw err;
@@ -438,13 +473,11 @@ export function resolveOrLinkGoogleUser(
   // 2. Primera vinculación: exigir correo verificado por Google
   if (!identity.emailVerified) {
     const err = new Error(
-      'Tu cuenta de Google no tiene el correo verificado. Verificalo en Google antes de vincularlo en NALAS.'
+      'Tu cuenta de Google no tiene el correo verificado. Verificalo en Google antes de ingresar a Nala.'
     ) as Error & { statusCode?: number };
     err.statusCode = 403;
     throw err;
   }
-
-  const normalizedEmail = identity.email.trim().toLowerCase();
 
   if (identity.mode === 'link') {
     const actor = store.users.find((u) => u.id === identity.actorUserId);
@@ -455,9 +488,11 @@ export function resolveOrLinkGoogleUser(
       err.statusCode = 401;
       throw err;
     }
-    if (actor.email.toLowerCase() !== normalizedEmail) {
+    const allowedAdminLink =
+      actor.isPlatformAdmin && configuredAdminEmail && normalizedEmail === configuredAdminEmail;
+    if (!allowedAdminLink && actor.email.toLowerCase() !== normalizedEmail) {
       const err = new Error(
-        'El correo verificado de Google no coincide exactamente con el correo de tu usuario en NALAS.'
+        'El correo verificado de Google no coincide exactamente con tu usuario autorizado en Nala.'
       ) as Error & { statusCode?: number };
       err.statusCode = 403;
       throw err;
@@ -467,10 +502,13 @@ export function resolveOrLinkGoogleUser(
     );
     if (existingForActor) {
       const err = new Error(
-        'Tu cuenta NALAS ya está vinculada a otro identificador de Google.'
+        'Tu cuenta de Nala ya está vinculada a otro identificador de Google.'
       ) as Error & { statusCode?: number };
       err.statusCode = 409;
       throw err;
+    }
+    if (allowedAdminLink && actor.email.toLowerCase() !== configuredAdminEmail) {
+      actor.email = configuredAdminEmail;
     }
 
     const created: UserExternalIdentity = {
@@ -493,11 +531,43 @@ export function resolveOrLinkGoogleUser(
     return { user: actor, linkedNow: true, externalIdentity: created };
   }
 
-  // Modo login: coincidencia exacta de correo verificado sobre usuario ya existente (nunca dominio ni auto-admin)
-  const matchedUser = store.users.find((u) => u.email.toLowerCase() === normalizedEmail);
+  // 3. Modo login:
+  //    - Si coincide exactamente con NALAS_ADMIN_EMAIL (verificado por Google), vincular al único administrador de plataforma existente.
+  //    - Nunca otorgar administración a otros correos ni hacer coincidencia por dominio.
+  let matchedUser: User | undefined;
+
+  if (configuredAdminEmail && normalizedEmail === configuredAdminEmail) {
+    const exactAdmin = store.users.find(
+      (u) => u.isPlatformAdmin && u.email.toLowerCase() === configuredAdminEmail
+    );
+    const nonAdminConflict = store.users.some(
+      (u) => !u.isPlatformAdmin && u.email.toLowerCase() === configuredAdminEmail
+    );
+    if (exactAdmin) {
+      matchedUser = exactAdmin;
+    } else if (!nonAdminConflict) {
+      const platformAdmin = store.users.find((u) => u.isPlatformAdmin);
+      if (platformAdmin) {
+        platformAdmin.email = configuredAdminEmail;
+        matchedUser = platformAdmin;
+      }
+    }
+  }
+
+  if (!matchedUser) {
+    matchedUser = store.users.find((u) => {
+      if (u.email.toLowerCase() !== normalizedEmail) return false;
+      // Si NALAS_ADMIN_EMAIL está configurado, ningún otro correo puede vincular al administrador de plataforma
+      if (u.isPlatformAdmin && configuredAdminEmail && normalizedEmail !== configuredAdminEmail) {
+        return false;
+      }
+      return true;
+    });
+  }
+
   if (!matchedUser) {
     const err = new Error(
-      'Tu cuenta de Google no está vinculada a ningún usuario autorizado en NALAS. Solicitá al administrador que registre tu correo antes de ingresar.'
+      'Tu cuenta de Google no está autorizada en Nala. Solicitá al administrador que registre tu correo antes de ingresar.'
     ) as Error & { statusCode?: number };
     err.statusCode = 403;
     throw err;
@@ -508,7 +578,7 @@ export function resolveOrLinkGoogleUser(
   );
   if (existingForUser) {
     const err = new Error(
-      'Este usuario de NALAS ya tiene otra cuenta de Google vinculada y no puede reemplazarse automáticamente.'
+      'Este usuario de Nala ya tiene otra cuenta de Google vinculada y no puede reemplazarse automáticamente.'
     ) as Error & { statusCode?: number };
     err.statusCode = 409;
     throw err;
