@@ -4,6 +4,7 @@ import type {
   Edition,
   Environment,
   FlowStep,
+  HumanHandoffConfig,
   Opportunity,
   OutOfScriptRule,
   ProPolicyVersion,
@@ -22,6 +23,7 @@ import {
   diagnoseSessionSigningSecret,
   hashPassword,
   isDemoQuickLoginEnabled,
+  isLocalDevPreviewBypassEnabled,
   isProductionAccessMode,
   resolveAuthenticatedUserFromCookieHeader,
   signSessionToken,
@@ -30,15 +32,20 @@ import { buildCleanBackupExport } from './modules/backupExport.ts';
 import { evaluateRuleset } from './modules/basicEngine.ts';
 import {
   buildDynamicLeadsCsv,
+  classifyOpportunityFromTask,
+  repairExistingAgentContacts,
+  updateContactDetails,
+  updateOpportunityFollowUp,
   updateOpportunityStatus,
 } from './modules/commercial.ts';
 import {
   publishFlowDraft,
+  publishRuleset,
   rollbackFlowVersion,
   saveFlowDraft,
+  saveRulesetDraft,
   updateProPolicy,
   validateFlowAndDependencies,
-  validateRulesetDependencies,
 } from './modules/config.ts';
 import { appendAudit, getCostSummary } from './modules/consumptionAndAudit.ts';
 import {
@@ -134,6 +141,15 @@ function assertPlatformAdmin(store: Awaited<ReturnType<typeof readStore>>, userI
   return actor;
 }
 
+function resolveLocalDevOwnerUser(store: Awaited<ReturnType<typeof readStore>>) {
+  return (
+    store.users.find((u) => u.id === 'user_michael') ??
+    store.users.find((u) => u.isPlatformAdmin) ??
+    store.users[0] ??
+    null
+  );
+}
+
 // ---------------------------------------------------------------------------
 // 0. Public Healthcheck & Authentication Endpoints
 // ---------------------------------------------------------------------------
@@ -223,6 +239,25 @@ webApp.post('/api/system/initialize', async (c) => {
 webApp.get('/api/auth/session', async (c) => {
   const storage = getStorageBackendInfo();
   const productionMode = isProductionAccessMode();
+  if (isLocalDevPreviewBypassEnabled()) {
+    const store = await readStore();
+    const devOwner = resolveLocalDevOwnerUser(store);
+    return c.json({
+      authenticated: Boolean(devOwner),
+      user: devOwner,
+      initialized: true,
+      productionMode: false,
+      devPreviewDirectAccess: true,
+      dbError: null,
+      authIssue: null,
+      googleLoginEnabled: false,
+      googleIssue: null,
+      googleLinked: false,
+      demoQuickLoginEnabled: false,
+      demoUsers: [],
+      storage,
+    });
+  }
   try {
     const initStatus = await getDatabaseInitStatus();
     if (!initStatus.initialized) {
@@ -344,6 +379,12 @@ webApp.get('/api/auth/google/start', async (c) => {
     headers.set('Location', `${basePath}/?authError=${encodeURIComponent(msg)}`);
     return new Response(null, { status: 302, headers });
   };
+
+  if (isLocalDevPreviewBypassEnabled()) {
+    const headers = new Headers();
+    headers.set('Location', `${basePath || ''}/`);
+    return new Response(null, { status: 302, headers });
+  }
 
   try {
     const initStatus = await getDatabaseInitStatus();
@@ -470,6 +511,12 @@ webApp.get('/api/auth/google/callback', (c) => handleGoogleOAuthCallback(c));
 webApp.get('/api/auth/google/callback/', (c) => handleGoogleOAuthCallback(c));
 
 webApp.post('/api/auth/login', async (c) => {
+  if (isLocalDevPreviewBypassEnabled()) {
+    return c.json(
+      { error: 'Inicio de sesión por contraseña deshabilitado en acceso directo de desarrollo.' },
+      { status: 403 }
+    );
+  }
   try {
     const body = (await c.req.json().catch(() => ({}))) as { email?: string; password?: string };
     const email = String(body.email || '');
@@ -535,6 +582,16 @@ webApp.use('/api/*', async (c, next) => {
     return;
   }
   try {
+    if (isLocalDevPreviewBypassEnabled()) {
+      const store = await readStore();
+      const devOwner = resolveLocalDevOwnerUser(store);
+      if (!devOwner) {
+        return c.json({ error: 'Usuario propietario de prueba no disponible.' }, { status: 500 });
+      }
+      c.set('authUserId', devOwner.id);
+      await next();
+      return;
+    }
     const uid = await resolveAuthenticatedUserFromCookieHeader(c.req.header('cookie'));
     if (!uid) {
       return c.json(
@@ -598,6 +655,7 @@ webApp.post('/api/auth/change-password', async (c) => {
 webApp.get('/api/bootstrap', async (c) => {
   try {
     const store = await readStore();
+    repairExistingAgentContacts(store);
     const { userId, businessId } = getActorContext(c);
     const environment = (c.req.query('environment') === 'produccion'
       ? 'produccion'
@@ -987,6 +1045,7 @@ webApp.post('/api/flows/draft', async (c) => {
       steps: FlowStep[];
       outOfScriptRules?: OutOfScriptRule[];
       name?: string;
+      humanHandoffConfig?: Partial<HumanHandoffConfig>;
     };
     const result = await withStoreTransaction((store) => {
       const ctx = resolveActorContext(store, userId, businessId);
@@ -997,7 +1056,8 @@ webApp.post('/api/flows/draft', async (c) => {
         userId,
         body.steps,
         body.outOfScriptRules ?? [],
-        body.name
+        body.name,
+        body.humanHandoffConfig
       );
       const biz = store.businesses.find((b) => b.id === businessId)!;
       const targetRuleset =
@@ -1041,6 +1101,21 @@ webApp.post('/api/flows/:flowVersionId/rollback', async (c) => {
   }
 });
 
+webApp.post('/api/rulesets/draft', async (c) => {
+  try {
+    const { userId, businessId } = getActorContext(c);
+    const body = (await c.req.json()) as Partial<RulesetVersion>;
+    const result = await withStoreTransaction((store) => {
+      const ctx = resolveActorContext(store, userId, businessId);
+      assertPermission(ctx, 'editFlows');
+      return saveRulesetDraft(store, businessId, userId, body);
+    });
+    return c.json(result);
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
 webApp.post('/api/rulesets/publish', async (c) => {
   try {
     const { userId, businessId } = getActorContext(c);
@@ -1048,46 +1123,7 @@ webApp.post('/api/rulesets/publish', async (c) => {
     const published = await withStoreTransaction((store) => {
       const ctx = resolveActorContext(store, userId, businessId);
       assertPermission(ctx, 'activateVersions');
-      const biz = store.businesses.find((b) => b.id === businessId)!;
-      const activeFlow = store.flowVersions.find((f) => f.id === biz.activeFlowVersionId)!;
-
-      const maxVer = Math.max(
-        0,
-        ...store.rulesetVersions.filter((r) => r.businessId === businessId).map((r) => r.versionNumber)
-      );
-      const nextRuleset: RulesetVersion = {
-        id: `rules_${businessId}_v${maxVer + 1}_${Date.now().toString(36)}`,
-        businessId,
-        versionNumber: maxVer + 1,
-        name: String(body.name || `Reglas ${biz.name} v${maxVer + 1}`),
-        status: 'publicada',
-        priorityStrategy: 'first_match',
-        tagStrategy: 'accumulate',
-        defaultPriority: body.defaultPriority || 'baja',
-        defaultReason: String(body.defaultReason || 'Sin coincidencia en reglas configuradas.'),
-        rules: body.rules || [],
-        createdAt: new Date().toISOString(),
-        publishedAt: new Date().toISOString(),
-      };
-
-      const issues = validateRulesetDependencies(nextRuleset, activeFlow);
-      if (issues.some((i) => i.severity === 'error')) {
-        const err = new Error(issues.map((i) => i.message).join(' | '));
-        (err as Error & { statusCode?: number; issues?: unknown }).statusCode = 400;
-        (err as Error & { issues?: unknown }).issues = issues;
-        throw err;
-      }
-
-      store.rulesetVersions.push(nextRuleset);
-      biz.activeRulesetVersionId = nextRuleset.id;
-      appendAudit(store, {
-        businessId,
-        actorUserId: userId,
-        module: 'configuracion',
-        action: 'publicar_reglas',
-        detail: `Publicado conjunto de reglas v${nextRuleset.versionNumber} (${nextRuleset.rules.length} reglas). No reclasifica históricos automáticamente.`,
-      });
-      return nextRuleset;
+      return publishRuleset(store, businessId, userId, body);
     });
     return c.json(published);
   } catch (err) {
@@ -1531,49 +1567,189 @@ webApp.get('/api/leads/export.csv', async (c) => {
 webApp.post('/api/opportunities', async (c) => {
   try {
     const { userId, businessId } = getActorContext(c);
-    const body = (await c.req.json()) as { leadId?: string; title?: string; amountMinor?: number };
+    const body = (await c.req.json()) as {
+      leadId?: string;
+      contactId?: string;
+      conversationId?: string;
+      title?: string;
+      amountMinor?: number;
+    };
+    let createdNew = false;
     const opp = await withStoreTransaction((store) => {
       const ctx = resolveActorContext(store, userId, businessId);
       assertPermission(ctx, 'handleHumanQueue');
       const biz = store.businesses.find((b) => b.id === businessId)!;
-      const lead = assertTenantScope(
-        store.leads.find((l) => l.id === body.leadId),
-        businessId,
-        'Lead'
-      );
-      const now = new Date().toISOString();
-      const newOpp: Opportunity = {
-        id: `opp_${Date.now()}`,
-        businessId,
-        environment: lead.environment,
-        contactId: lead.contactId,
-        leadId: lead.id,
-        leadCommercialReference: lead.commercialReference,
-        productId: lead.productId,
-        productName: lead.productName,
-        conversationId: lead.conversationId,
-        title: String(
-          body.title ||
-            `Oportunidad ${lead.productName ?? biz.name} · ${lead.commercialReference ?? lead.id.slice(-6)}`
-        ),
-        amountMinor: Math.max(0, Math.round(Number(body.amountMinor || 0))),
-        currency: biz.currency,
-        commercialStatus: 'nuevo',
-        createdAt: now,
-        updatedAt: now,
-      };
-      store.opportunities.unshift(newOpp);
-      appendAudit(store, {
-        businessId,
-        environment: lead.environment,
-        actorUserId: userId,
-        module: 'operacion_comercial',
-        action: 'crear_oportunidad',
-        detail: `Oportunidad "${newOpp.title}" (${newOpp.amountMinor} centavos ${newOpp.currency}) creada desde lead ${lead.id}.`,
-      });
-      return newOpp;
+
+      if (body.leadId) {
+        const lead = assertTenantScope(
+          store.leads.find((l) => l.id === body.leadId),
+          businessId,
+          'Lead'
+        );
+        const existing = store.opportunities.find(
+          (o) =>
+            o.businessId === businessId &&
+            o.environment === lead.environment &&
+            (o.leadId === lead.id ||
+              o.conversationId === lead.conversationId ||
+              o.contactId === lead.contactId)
+        );
+        if (existing) {
+          if (!existing.leadId) {
+            existing.leadId = lead.id;
+            existing.leadCommercialReference = lead.commercialReference;
+            existing.updatedAt = new Date().toISOString();
+          }
+          return existing;
+        }
+        createdNew = true;
+        const now = new Date().toISOString();
+        const newOpp: Opportunity = {
+          id: `opp_${Date.now()}`,
+          businessId,
+          environment: lead.environment,
+          contactId: lead.contactId,
+          leadId: lead.id,
+          leadCommercialReference: lead.commercialReference,
+          productId: lead.productId,
+          productName: lead.productName,
+          conversationId: lead.conversationId,
+          title: String(
+            body.title ||
+              `Oportunidad ${lead.productName ?? biz.name} · ${lead.commercialReference ?? lead.id.slice(-6)}`
+          ),
+          amountMinor: Math.max(0, Math.round(Number(body.amountMinor || 0))),
+          currency: biz.currency,
+          commercialStatus: 'nuevo',
+          origin: 'manual',
+          createdAt: now,
+          updatedAt: now,
+        };
+        store.opportunities.unshift(newOpp);
+        appendAudit(store, {
+          businessId,
+          environment: lead.environment,
+          actorUserId: userId,
+          module: 'operacion_comercial',
+          action: 'crear_oportunidad',
+          correlationId: newOpp.id,
+          detail: `Oportunidad "${newOpp.title}" (${newOpp.amountMinor} centavos ${newOpp.currency}) creada manualmente desde lead ${lead.id}.`,
+        });
+        return newOpp;
+      }
+
+      if (body.contactId) {
+        const contact = assertTenantScope(
+          store.contacts.find((ct) => ct.id === body.contactId),
+          businessId,
+          'Contacto'
+        );
+        const linkedConv =
+          (body.conversationId
+            ? store.conversations.find(
+                (cv) =>
+                  cv.id === body.conversationId &&
+                  cv.businessId === businessId &&
+                  cv.environment === contact.environment
+              )
+            : undefined) ??
+          store.conversations.find(
+            (cv) =>
+              cv.businessId === businessId &&
+              cv.environment === contact.environment &&
+              cv.contactId === contact.id
+          );
+        const linkedLead = store.leads.find(
+          (l) =>
+            l.businessId === businessId &&
+            l.environment === contact.environment &&
+            (l.contactId === contact.id ||
+              (linkedConv ? l.conversationId === linkedConv.id : false))
+        );
+
+        const existing = store.opportunities.find(
+          (o) =>
+            o.businessId === businessId &&
+            o.environment === contact.environment &&
+            (o.contactId === contact.id ||
+              (linkedConv ? o.conversationId === linkedConv.id : false) ||
+              (linkedLead ? o.leadId === linkedLead.id : false))
+        );
+        if (existing) {
+          return existing;
+        }
+
+        createdNew = true;
+        const now = new Date().toISOString();
+        const prodId = linkedLead?.productId ?? linkedConv?.productId;
+        const prodName = linkedLead?.productName ?? linkedConv?.productName;
+        const newOpp: Opportunity = {
+          id: `opp_${Date.now()}`,
+          businessId,
+          environment: contact.environment,
+          contactId: contact.id,
+          leadId: linkedLead?.id,
+          leadCommercialReference: linkedLead?.commercialReference,
+          productId: prodId,
+          productName: prodName,
+          conversationId: linkedConv?.id ?? '',
+          title: String(
+            body.title || `Oportunidad ${prodName ?? biz.name} · ${contact.id.slice(-6)}`
+          ),
+          amountMinor: Math.max(0, Math.round(Number(body.amountMinor || 0))),
+          currency: biz.currency,
+          commercialStatus: 'nuevo',
+          origin: 'manual',
+          createdAt: now,
+          updatedAt: now,
+        };
+        store.opportunities.unshift(newOpp);
+        appendAudit(store, {
+          businessId,
+          environment: contact.environment,
+          actorUserId: userId,
+          module: 'operacion_comercial',
+          action: 'crear_oportunidad',
+          correlationId: newOpp.id,
+          detail: `Oportunidad "${newOpp.title}" (${newOpp.amountMinor} centavos ${newOpp.currency}) creada manualmente desde contacto ${contact.id}.`,
+        });
+        return newOpp;
+      }
+
+      const err = new Error('Debés indicar un contacto o registro para crear la oportunidad.');
+      (err as Error & { statusCode?: number }).statusCode = 400;
+      throw err;
     });
-    return c.json(opp, { status: 201 });
+    return c.json(opp, { status: createdNew ? 201 : 200 });
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.patch('/api/contacts/:contactId', async (c) => {
+  try {
+    const { userId, businessId } = getActorContext(c);
+    const contactId = c.req.param('contactId');
+    const body = (await c.req.json()) as {
+      fullName?: string;
+      phone?: string;
+      email?: string;
+      company?: string;
+    };
+    const updated = await withStoreTransaction((store) => {
+      const ctx = resolveActorContext(store, userId, businessId);
+      assertPermission(ctx, 'handleHumanQueue');
+      return updateContactDetails(store, {
+        businessId,
+        contactId,
+        actorUserId: userId,
+        fullName: body.fullName,
+        phone: body.phone,
+        email: body.email,
+        company: body.company,
+      });
+    });
+    return c.json(updated);
   } catch (err) {
     return errorResponse(err);
   }
@@ -1599,6 +1775,56 @@ webApp.patch('/api/opportunities/:opportunityId/status', async (c) => {
       });
     });
     return c.json(opp);
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.patch('/api/opportunities/:opportunityId/follow-up', async (c) => {
+  try {
+    const { userId, businessId } = getActorContext(c);
+    const opportunityId = c.req.param('opportunityId');
+    const body = (await c.req.json()) as {
+      nextStep?: string;
+      dueDate?: string;
+    };
+    const opp = await withStoreTransaction((store) => {
+      const ctx = resolveActorContext(store, userId, businessId);
+      assertPermission(ctx, 'handleHumanQueue');
+      return updateOpportunityFollowUp(store, {
+        businessId,
+        opportunityId,
+        actorUserId: userId,
+        nextStep: body.nextStep ?? '',
+        dueDate: body.dueDate,
+      });
+    });
+    return c.json(opp);
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.post('/api/tasks/:taskId/classify', async (c) => {
+  try {
+    const { userId, businessId } = getActorContext(c);
+    const taskId = c.req.param('taskId');
+    const body = (await c.req.json()) as {
+      commercialStatus?: 'en_gestion' | 'ganado' | 'perdido';
+      closingEvidence?: Opportunity['closingEvidence'];
+    };
+    const result = await withStoreTransaction((store) => {
+      const ctx = resolveActorContext(store, userId, businessId);
+      assertPermission(ctx, 'handleHumanQueue');
+      return classifyOpportunityFromTask(store, {
+        businessId,
+        taskId,
+        actorUserId: userId,
+        commercialStatus: body.commercialStatus as 'en_gestion' | 'ganado' | 'perdido',
+        closingEvidence: body.closingEvidence,
+      });
+    });
+    return c.json(result);
   } catch (err) {
     return errorResponse(err);
   }

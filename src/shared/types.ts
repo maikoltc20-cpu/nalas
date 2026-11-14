@@ -97,6 +97,14 @@ export interface OutOfScriptRule {
   offerHumanHandoff: boolean;
 }
 
+export interface HumanHandoffConfig {
+  buttonLabel: string;
+  requestConfirmationMessage: string;
+  askNamePrompt: string;
+  askPhonePrompt: string;
+  finalConfirmationMessage: string;
+}
+
 export interface FlowVersion {
   id: string;
   businessId: string;
@@ -114,6 +122,7 @@ export interface FlowVersion {
   handoffNoContactMessage?: string;
   outOfScriptPrompt?: string;
   hideInternalCategorizationInClosure?: boolean;
+  humanHandoffConfig?: HumanHandoffConfig;
   createdAt: string;
   publishedAt?: string;
 }
@@ -315,6 +324,7 @@ export interface Contact {
   fullName?: string;
   phone?: string;
   email?: string;
+  company?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -402,6 +412,9 @@ export interface Session {
   correctionQueue?: string[];
   correctionReturnToStepId?: string | null;
   awaitingOutOfScriptChoice?: boolean;
+  awaitingHumanContactName?: boolean;
+  awaitingHumanContactPhone?: boolean;
+  awaitingHumanTaskId?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -435,6 +448,13 @@ export interface Lead {
   createdAt: string;
 }
 
+export interface OpportunityFollowUp {
+  nextStep: string;
+  dueDate?: string;
+  updatedAt: string;
+  updatedByUserId?: string;
+}
+
 export interface Opportunity {
   id: string;
   businessId: string;
@@ -449,6 +469,8 @@ export interface Opportunity {
   amountMinor: number;
   currency: string;
   commercialStatus: CommercialStatus;
+  origin?: 'automatico' | 'manual';
+  nextFollowUp?: OpportunityFollowUp;
   closingEvidence?: {
     type: 'pedido_aceptado' | 'contrato_confirmado' | 'pago_validado';
     reference: string;

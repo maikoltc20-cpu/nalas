@@ -7,6 +7,7 @@ import {
   withPgClient,
 } from '../db/pgStore.ts';
 import { getEnv, isWorkerRuntime } from '../runtimeContext.ts';
+import { repairExistingAgentContacts } from './commercial.ts';
 import { createInitialStore } from './seed.ts';
 
 export const PG_ADVISORY_LOCK_ID = 78412031;
@@ -67,6 +68,7 @@ export function upgradeOptingDraftIfStale(store: NalasStore): boolean {
         ...structuredClone(canonicalDraftFlow),
         id: existing?.id ?? canonicalDraftFlow.id,
         versionNumber: preservedVer,
+        humanHandoffConfig: existing?.humanHandoffConfig ?? canonicalDraftFlow.humanHandoffConfig,
       };
       if (existingIdx >= 0) {
         store.flowVersions[existingIdx] = replacement;
@@ -202,7 +204,9 @@ async function ensureFileStoreLoaded(): Promise<NalasStore> {
   try {
     const raw = await fs.readFile(storePath, 'utf8');
     memoryStore = JSON.parse(raw) as NalasStore;
-    if (upgradeOptingDraftIfStale(memoryStore)) {
+    const upgraded = upgradeOptingDraftIfStale(memoryStore);
+    const repaired = repairExistingAgentContacts(memoryStore);
+    if (upgraded || repaired) {
       await persistFileAtomically(memoryStore);
     }
   } catch {

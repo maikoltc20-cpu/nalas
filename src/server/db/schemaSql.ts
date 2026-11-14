@@ -124,6 +124,7 @@ export const SCHEMA_STATEMENTS: string[] = [
     full_name TEXT,
     phone TEXT,
     email TEXT,
+    company TEXT,
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL
   )`,
@@ -222,6 +223,8 @@ export const SCHEMA_STATEMENTS: string[] = [
     amount_minor BIGINT NOT NULL,
     currency TEXT NOT NULL,
     commercial_status TEXT NOT NULL,
+    origin TEXT,
+    next_follow_up JSONB,
     closing_evidence JSONB,
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL
@@ -278,6 +281,9 @@ export const SCHEMA_STATEMENTS: string[] = [
   )`,
   `ALTER TABLE nalas_outbox_events ADD COLUMN IF NOT EXISTS max_attempts INTEGER NOT NULL DEFAULT 3`,
   `ALTER TABLE nalas_outbox_events ADD COLUMN IF NOT EXISTS next_retry_at TIMESTAMPTZ`,
+  `ALTER TABLE nalas_opportunities ADD COLUMN IF NOT EXISTS origin TEXT`,
+  `ALTER TABLE nalas_opportunities ADD COLUMN IF NOT EXISTS next_follow_up JSONB`,
+  `ALTER TABLE nalas_contacts ADD COLUMN IF NOT EXISTS company TEXT`,
   `CREATE TABLE IF NOT EXISTS nalas_audit_events (
     id TEXT PRIMARY KEY,
     business_id TEXT NOT NULL,

@@ -1,7 +1,14 @@
+import {
+  hasValidContactName,
+  isValidEmailAddress,
+  normalizeInternationalPhone,
+  resolveHumanHandoffConfig,
+} from '../../shared/humanHandoff.ts';
 import type {
   Contact,
   Conversation,
   Environment,
+  HumanHandoffConfig,
   Message,
   NalasStore,
   Session,
@@ -11,6 +18,142 @@ import { runBasicEngine } from './basicEngine.ts';
 import { appendAudit } from './consumptionAndAudit.ts';
 import { normalizeAndQueueOutgoingMessage } from './integrations.ts';
 import { runProEngine } from './proEngine.ts';
+
+export { normalizeInternationalPhone };
+
+function looksLikePhoneAttempt(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed || /[\p{L}]/u.test(trimmed)) return false;
+  const digitsCount = (trimmed.match(/\d/g) ?? []).length;
+  return digitsCount >= 4;
+}
+
+const NON_NAME_PHRASES = new Set([
+  'hola',
+  'buenos dias',
+  'buenos días',
+  'buenas tardes',
+  'buenas noches',
+  'buen dia',
+  'buen día',
+  'saludos',
+  'humano',
+  'asesor',
+  'agente',
+  'ayuda',
+  'hay alguien',
+  'alguien',
+  'estan ahi',
+  'están ahí',
+  'hola hay alguien',
+  'ok',
+  'vale',
+  'listo',
+  'gracias',
+  'muchas gracias',
+  'si',
+  'sí',
+]);
+
+const REFUSAL_OR_SKIP_PATTERNS = [
+  'no quiero',
+  'prefiero no',
+  'no gracias',
+  'omitir',
+  'saltar',
+  'sin dar',
+  'sin nombre',
+  'sin telefono',
+  'sin teléfono',
+  'no tengo',
+  'despues',
+  'después',
+  'luego',
+  'no lo quiero dar',
+  'prefiero no decir',
+  'prefiero omitir',
+];
+
+function normalizeForMatch(text: string): string {
+  return text
+    .trim()
+    .toLowerCase()
+    .replace(/[!¡.,?¿]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function isRefusalOrSkip(text: string): boolean {
+  const norm = normalizeForMatch(text);
+  if (!norm || norm === 'no') return true;
+  return REFUSAL_OR_SKIP_PATTERNS.some((p) => norm === p || norm.includes(p));
+}
+
+function extractValidContactName(text: string): string | null {
+  let trimmed = text.trim();
+  if (!trimmed || trimmed.includes('?') || trimmed.includes('¿')) return null;
+  if (trimmed.includes('@') || /https?:\/\//i.test(trimmed)) return null;
+  if (normalizeInternationalPhone(trimmed) || looksLikePhoneAttempt(trimmed)) return null;
+
+  const digitsCount = (trimmed.match(/\d/g) ?? []).length;
+  if (digitsCount >= 4) return null;
+
+  if (isRefusalOrSkip(trimmed)) return null;
+
+  // Strip common polite prefixes ("Me llamo Ana", "Mi nombre es Carlos", "Soy Laura")
+  trimmed = trimmed
+    .replace(/^(hola[\s,!.]*)?(me llamo|mi nombre es|soy)\s+/i, '')
+    .replace(/[.!]+$/g, '')
+    .trim();
+
+  if (trimmed.length < 2 || trimmed.length > 80) return null;
+  const norm = normalizeForMatch(trimmed);
+  if (!norm || NON_NAME_PHRASES.has(norm)) return null;
+  if (!hasValidContactName(trimmed)) return null;
+
+  return trimmed;
+}
+
+function getConversationHandoffConfig(
+  store: NalasStore,
+  businessId: string,
+  session?: Session
+): HumanHandoffConfig {
+  const pinnedFlow = session?.pinnedFlowVersionId
+    ? store.flowVersions.find((f) => f.id === session.pinnedFlowVersionId)
+    : undefined;
+  if (pinnedFlow?.humanHandoffConfig) {
+    return resolveHumanHandoffConfig(pinnedFlow.humanHandoffConfig);
+  }
+  const biz = store.businesses.find((b) => b.id === businessId);
+  const activeFlow = biz
+    ? store.flowVersions.find((f) => f.id === biz.activeFlowVersionId)
+    : undefined;
+  return resolveHumanHandoffConfig(activeFlow?.humanHandoffConfig);
+}
+
+function syncLinkedHumanTask(task: Task, contact: Contact, now: string): void {
+  const productSuffix = task.productName ? ` (${task.productName})` : '';
+  const displayName = hasValidContactName(contact.fullName)
+    ? contact.fullName!.trim()
+    : 'Visitante sin nombre';
+  task.title = `Derivación humana${productSuffix} — ${displayName}`;
+
+  const validPhone = normalizeInternationalPhone(contact.phone);
+  const validEmail = isValidEmailAddress(contact.email) ? contact.email!.trim() : null;
+  task.hasUsableContact = Boolean(validPhone || validEmail);
+  task.contactWarning = task.hasUsableContact
+    ? undefined
+    : 'Sin teléfono ni correo utilizable: no se ha enviado notificación externa ni se promete localizar al contacto.';
+
+  if (hasValidContactName(contact.fullName) && !task.contextSummary.includes(contact.fullName!.trim())) {
+    task.contextSummary = `${task.contextSummary} | Nombre: ${contact.fullName!.trim()}`;
+  }
+  if (validPhone && !task.contextSummary.includes(validPhone)) {
+    task.contextSummary = `${task.contextSummary} | Teléfono: ${validPhone}`;
+  }
+  task.updatedAt = now;
+}
 
 // In-isolate serialization queue (complemented across Worker isolates by PostgreSQL pg_advisory_xact_lock)
 const conversationLocks = new Map<string, Promise<unknown>>();
@@ -233,8 +376,7 @@ export function createHumanHandoffTask(
   conversation.updatedAt = now;
 
   const hasUsableContact = Boolean(
-    (contact.phone && contact.phone.trim().length >= 7) ||
-      (contact.email && contact.email.includes('@'))
+    normalizeInternationalPhone(contact.phone) || isValidEmailAddress(contact.email)
   );
 
   const answersSummary = session
@@ -246,6 +388,10 @@ export function createHumanHandoffTask(
   const productId = conversation.productId ?? session?.productId;
   const productName = conversation.productName ?? session?.productName;
 
+  const displayName = hasValidContactName(contact.fullName)
+    ? contact.fullName!.trim()
+    : 'Visitante sin nombre';
+
   const task: Task = {
     id: `task_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
     businessId: conversation.businessId,
@@ -254,7 +400,7 @@ export function createHumanHandoffTask(
     contactId: contact.id,
     productId,
     productName,
-    title: `Derivación humana${productName ? ` (${productName})` : ''} — ${contact.fullName || 'Visitante sin nombre'}`,
+    title: `Derivación humana${productName ? ` (${productName})` : ''} — ${displayName}`,
     contextSummary: `${reason}${answersSummary ? ` | Datos: ${answersSummary}` : ''}`,
     hasUsableContact,
     contactWarning: hasUsableContact
@@ -353,22 +499,215 @@ export async function processInboundMessage(
   store.messages.push(inboundMsg);
   conv.updatedAt = now;
 
-  // 2. If human control is active or waiting for human, DO NOT generate automatic bot replies (Section 10 & Criterion 7)
+  const convConn = store.channelConnections.find((c) => c.id === conv.connectionId);
+  const convContact = store.contacts.find((c) => c.id === conv.contactId);
+  const convSession = store.sessions.find((s) => s.conversationId === conv.id);
+
+  // 2. If human control is active or waiting for human, keep commercial script paused,
+  //    but allow progressive capture of missing name and/or phone for the pending human-attention request.
   if (conv.control !== 'bot') {
+    if (
+      conv.control === 'esperando_humano' &&
+      convContact &&
+      convSession &&
+      (convSession.awaitingHumanContactName || convSession.awaitingHumanContactPhone)
+    ) {
+      const cfg = getConversationHandoffConfig(store, conv.businessId, convSession);
+      const linkedTask =
+        (convSession.awaitingHumanTaskId
+          ? store.tasks.find(
+              (t) => t.id === convSession.awaitingHumanTaskId && t.businessId === conv.businessId
+            )
+          : undefined) ??
+        store.tasks.find(
+          (t) =>
+            t.businessId === conv.businessId &&
+            t.environment === conv.environment &&
+            t.conversationId === conv.id &&
+            t.status !== 'resuelta'
+        );
+
+      const sendHandoffBotReply = (replyText: string) => {
+        const botMsg: Message = {
+          id: `msg_${Date.now()}_hum_${Math.random().toString(36).slice(2, 5)}`,
+          businessId: conv.businessId,
+          environment: conv.environment,
+          conversationId: conv.id,
+          sender: 'bot_basica',
+          text: replyText,
+          deliveryStatus: 'pendiente',
+          createdAt: new Date().toISOString(),
+        };
+        store.messages.push(botMsg);
+        if (convConn) {
+          normalizeAndQueueOutgoingMessage({
+            store,
+            connection: convConn,
+            message: botMsg,
+            simulateOutboxFailure: params.simulateOutboxFailure,
+            deferRemoteDispatch: params.deferRemoteDispatch,
+          });
+        }
+        return botMsg;
+      };
+
+      const validPhone = normalizeInternationalPhone(params.text);
+      if (validPhone) {
+        convContact.phone = validPhone;
+        convContact.updatedAt = now;
+        convSession.awaitingHumanContactPhone = false;
+        convSession.updatedAt = now;
+
+        if (linkedTask) {
+          syncLinkedHumanTask(linkedTask, convContact, now);
+        }
+
+        appendAudit(store, {
+          businessId: conv.businessId,
+          environment: conv.environment,
+          actorUserId: 'sistema',
+          module: 'conversaciones',
+          action: 'actualizar_contacto_solicitud',
+          detail: `Teléfono registrado para la solicitud ${linkedTask?.id ?? conv.id}.`,
+          correlationId: conv.id,
+        });
+
+        const stillNeedsName =
+          Boolean(convSession.awaitingHumanContactName) &&
+          !hasValidContactName(convContact.fullName);
+        if (stillNeedsName) {
+          const botMsg = sendHandoffBotReply(cfg.askNamePrompt);
+          return {
+            deduplicated: false,
+            botReplied: true,
+            aiCalled: false,
+            outgoingMessage: botMsg,
+            handoffTask: linkedTask,
+          };
+        }
+
+        convSession.awaitingHumanContactName = false;
+        convSession.updatedAt = now;
+        const botMsg = sendHandoffBotReply(cfg.finalConfirmationMessage);
+        return {
+          deduplicated: false,
+          botReplied: true,
+          aiCalled: false,
+          outgoingMessage: botMsg,
+          handoffTask: linkedTask,
+        };
+      }
+
+      if (convSession.awaitingHumanContactName) {
+        if (looksLikePhoneAttempt(params.text)) {
+          const botMsg = sendHandoffBotReply(
+            '¿Podés revisar el número e incluir el código de país? Por ejemplo: +506 8995 1361.'
+          );
+          return {
+            deduplicated: false,
+            botReplied: true,
+            aiCalled: false,
+            outgoingMessage: botMsg,
+          };
+        }
+
+        if (isRefusalOrSkip(params.text)) {
+          convSession.awaitingHumanContactName = false;
+          convSession.awaitingHumanContactPhone = false;
+          convSession.updatedAt = now;
+          return {
+            deduplicated: false,
+            botReplied: false,
+            aiCalled: false,
+            reason: 'Solicitud mantenida; tu mensaje quedó registrado para el equipo de atención.',
+          };
+        }
+
+        const validName = extractValidContactName(params.text);
+        if (validName) {
+          convContact.fullName = validName;
+          convContact.updatedAt = now;
+          convSession.awaitingHumanContactName = false;
+
+          if (linkedTask) {
+            syncLinkedHumanTask(linkedTask, convContact, now);
+          }
+
+          appendAudit(store, {
+            businessId: conv.businessId,
+            environment: conv.environment,
+            actorUserId: 'sistema',
+            module: 'conversaciones',
+            action: 'actualizar_contacto_solicitud',
+            detail: `Nombre registrado para la solicitud ${linkedTask?.id ?? conv.id}.`,
+            correlationId: conv.id,
+          });
+
+          const stillMissingPhone = !normalizeInternationalPhone(convContact.phone);
+          if (stillMissingPhone) {
+            convSession.awaitingHumanContactPhone = true;
+            convSession.updatedAt = now;
+            const botMsg = sendHandoffBotReply(cfg.askPhonePrompt);
+            return {
+              deduplicated: false,
+              botReplied: true,
+              aiCalled: false,
+              outgoingMessage: botMsg,
+              handoffTask: linkedTask,
+            };
+          }
+
+          convSession.awaitingHumanContactPhone = false;
+          convSession.updatedAt = now;
+          const botMsg = sendHandoffBotReply(cfg.finalConfirmationMessage);
+          return {
+            deduplicated: false,
+            botReplied: true,
+            aiCalled: false,
+            outgoingMessage: botMsg,
+            handoffTask: linkedTask,
+          };
+        }
+      } else if (convSession.awaitingHumanContactPhone) {
+        if (looksLikePhoneAttempt(params.text)) {
+          const botMsg = sendHandoffBotReply(
+            '¿Podés revisar el número e incluir el código de país? Por ejemplo: +506 8995 1361.'
+          );
+          return {
+            deduplicated: false,
+            botReplied: true,
+            aiCalled: false,
+            outgoingMessage: botMsg,
+          };
+        }
+
+        if (isRefusalOrSkip(params.text)) {
+          convSession.awaitingHumanContactPhone = false;
+          convSession.updatedAt = now;
+          return {
+            deduplicated: false,
+            botReplied: false,
+            aiCalled: false,
+            reason: 'Solicitud mantenida; tu mensaje quedó registrado para el equipo de atención.',
+          };
+        }
+      }
+    }
+
     return {
       deduplicated: false,
       botReplied: false,
       aiCalled: false,
-      reason: `Respuestas automáticas pausadas porque la conversación está en control "${conv.control}".`,
+      reason: 'Tu mensaje quedó registrado para el equipo de atención.',
     };
   }
 
   const biz = store.businesses.find((b) => b.id === conv.businessId)!;
-  const contact = store.contacts.find((c) => c.id === conv.contactId)!;
-  const session = store.sessions.find((s) => s.conversationId === conv.id)!;
+  const contact = convContact!;
+  const session = convSession!;
 
   // 3. Route to Motor BÁSICA or Motor PRO according to conversation engine
-  if (conv.activeEngine === 'PRO' && biz.subscription.enabledEditions.includes('PRO') && biz.subscription.proApproved) {
+  if (conv.activeEngine === 'PRO' && biz.subscription.proApproved && biz.subscription.enabledEditions.includes('PRO')) {
     const policy = store.proPolicyVersions.find((p) => p.id === conv.pinnedProPolicyVersionId) ??
       store.proPolicyVersions.find((p) => p.id === biz.activeProPolicyVersionId)!;
     const history = store.messages.filter((m) => m.conversationId === conv.id);
@@ -383,6 +722,7 @@ export async function processInboundMessage(
     });
 
     let handoffTask: Task | undefined;
+    let replyText = proOut.replyText;
     if (proOut.quotaBlocked && proOut.fallbackAction === 'derivacion_humana') {
       handoffTask = createHumanHandoffTask(
         store,
@@ -391,6 +731,18 @@ export async function processInboundMessage(
         session,
         'Cuota o presupuesto PRO agotado: derivación automática según política.'
       );
+      const cfg = getConversationHandoffConfig(store, conv.businessId, session);
+      const hasName = hasValidContactName(contact.fullName);
+      const hasValidPhone = Boolean(normalizeInternationalPhone(contact.phone));
+      session.awaitingHumanContactName = !hasName;
+      session.awaitingHumanContactPhone = !hasValidPhone;
+      session.awaitingHumanTaskId = handoffTask.id;
+      session.updatedAt = new Date().toISOString();
+      replyText = !hasName
+        ? `${cfg.requestConfirmationMessage}\n\n${cfg.askNamePrompt}`
+        : !hasValidPhone
+          ? `${cfg.requestConfirmationMessage}\n\n${cfg.askPhonePrompt}`
+          : cfg.requestConfirmationMessage;
     } else if (proOut.quotaBlocked && proOut.fallbackAction === 'flujo_basica') {
       conv.activeEngine = 'BASICA';
     }
@@ -401,7 +753,7 @@ export async function processInboundMessage(
       environment: conv.environment,
       conversationId: conv.id,
       sender: 'bot_pro',
-      text: proOut.replyText,
+      text: replyText,
       options: proOut.options,
       deliveryStatus: 'pendiente',
       createdAt: new Date().toISOString(),
@@ -439,6 +791,7 @@ export async function processInboundMessage(
   });
 
   let handoffTask: Task | undefined;
+  let finalReplyText = basicOut.replyText;
   if (basicOut.requestHumanHandoff) {
     handoffTask = createHumanHandoffTask(
       store,
@@ -447,6 +800,18 @@ export async function processInboundMessage(
       session,
       basicOut.handoffReason ?? 'Derivación desde Motor BÁSICA'
     );
+    const cfg = getConversationHandoffConfig(store, conv.businessId, session);
+    const hasName = hasValidContactName(contact.fullName);
+    const hasValidPhone = Boolean(normalizeInternationalPhone(contact.phone));
+    session.awaitingHumanContactName = !hasName;
+    session.awaitingHumanContactPhone = !hasValidPhone;
+    session.awaitingHumanTaskId = handoffTask.id;
+    session.updatedAt = new Date().toISOString();
+    finalReplyText = !hasName
+      ? `${cfg.requestConfirmationMessage}\n\n${cfg.askNamePrompt}`
+      : !hasValidPhone
+        ? `${cfg.requestConfirmationMessage}\n\n${cfg.askPhonePrompt}`
+        : cfg.requestConfirmationMessage;
   }
 
   const botMsg: Message = {
@@ -455,7 +820,7 @@ export async function processInboundMessage(
     environment: conv.environment,
     conversationId: conv.id,
     sender: 'bot_basica',
-    text: basicOut.replyText,
+    text: finalReplyText,
     options: basicOut.options,
     deliveryStatus: 'pendiente',
     createdAt: new Date().toISOString(),

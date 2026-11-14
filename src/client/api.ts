@@ -12,6 +12,7 @@ import type {
   Environment,
   FlowStep,
   FlowVersion,
+  HumanHandoffConfig,
   Lead,
   Membership,
   Message,
@@ -97,6 +98,7 @@ export interface AuthSessionResponse {
   user: User | null;
   initialized: boolean;
   productionMode?: boolean;
+  devPreviewDirectAccess?: boolean;
   dbError?: string | null;
   authIssue?: AuthIssue | null;
   googleLoginEnabled: boolean;
@@ -256,7 +258,12 @@ export const nalasApi = {
   },
   saveFlowDraft(
     ctx: ApiContext,
-    payload: { steps: FlowStep[]; outOfScriptRules: OutOfScriptRule[]; name?: string }
+    payload: {
+      steps: FlowStep[];
+      outOfScriptRules: OutOfScriptRule[];
+      humanHandoffConfig?: HumanHandoffConfig;
+      name?: string;
+    }
   ) {
     return apiFetch<{ draft: FlowVersion; issues: Array<{ severity: string; message: string }> }>(
       '/api/flows/draft',
@@ -274,6 +281,18 @@ export const nalasApi = {
     return apiFetch(`/api/flows/${flowVersionId}/rollback`, ctx, {
       method: 'POST',
       body: JSON.stringify({}),
+    });
+  },
+  saveRulesetDraft(
+    ctx: ApiContext,
+    payload: Pick<RulesetVersion, 'name' | 'defaultPriority' | 'defaultReason' | 'rules'>
+  ) {
+    return apiFetch<{
+      draft: RulesetVersion;
+      issues: Array<{ severity: string; message: string }>;
+    }>('/api/rulesets/draft', ctx, {
+      method: 'POST',
+      body: JSON.stringify(payload),
     });
   },
   publishRuleset(
@@ -444,10 +463,26 @@ export const nalasApi = {
   },
   createOpportunity(
     ctx: ApiContext,
-    payload: { leadId: string; title: string; amountMinor: number }
+    payload: {
+      leadId?: string;
+      contactId?: string;
+      conversationId?: string;
+      title?: string;
+      amountMinor?: number;
+    }
   ) {
-    return apiFetch('/api/opportunities', ctx, {
+    return apiFetch<Opportunity>('/api/opportunities', ctx, {
       method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+  updateContact(
+    ctx: ApiContext,
+    contactId: string,
+    payload: { fullName?: string; phone?: string; email?: string; company?: string }
+  ) {
+    return apiFetch<Contact>(`/api/contacts/${encodeURIComponent(contactId)}`, ctx, {
+      method: 'PATCH',
       body: JSON.stringify(payload),
     });
   },
@@ -459,10 +494,37 @@ export const nalasApi = {
       closingEvidence?: Opportunity['closingEvidence'];
     }
   ) {
-    return apiFetch(`/api/opportunities/${opportunityId}/status`, ctx, {
+    return apiFetch<Opportunity>(`/api/opportunities/${opportunityId}/status`, ctx, {
       method: 'PATCH',
       body: JSON.stringify(payload),
     });
+  },
+  updateOpportunityFollowUp(
+    ctx: ApiContext,
+    opportunityId: string,
+    payload: { nextStep: string; dueDate?: string }
+  ) {
+    return apiFetch<Opportunity>(`/api/opportunities/${opportunityId}/follow-up`, ctx, {
+      method: 'PATCH',
+      body: JSON.stringify(payload),
+    });
+  },
+  classifyTask(
+    ctx: ApiContext,
+    taskId: string,
+    payload: {
+      commercialStatus: 'en_gestion' | 'ganado' | 'perdido';
+      closingEvidence?: Opportunity['closingEvidence'];
+    }
+  ) {
+    return apiFetch<{ opportunity: Opportunity; resolvedTaskIds: string[] }>(
+      `/api/tasks/${taskId}/classify`,
+      ctx,
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      }
+    );
   },
   resolveTask(ctx: ApiContext, taskId: string) {
     return apiFetch(`/api/tasks/${taskId}/resolve`, ctx, {

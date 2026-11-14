@@ -1,7 +1,9 @@
+import { resolveHumanHandoffConfig } from '../../shared/humanHandoff.ts';
 import type {
   Business,
   FlowStep,
   FlowVersion,
+  HumanHandoffConfig,
   NalasStore,
   OutOfScriptRule,
   ProPolicyVersion,
@@ -145,6 +147,23 @@ export function validateFlowAndDependencies(
   if (activeRuleset) {
     const stepById = new Map(flow.steps.map((s) => [s.id, s]));
     for (const rule of activeRuleset.rules) {
+      if (!rule.name || !rule.name.trim()) {
+        issues.push({
+          code: 'EMPTY_RULE_NAME',
+          severity: 'error',
+          ruleId: rule.id,
+          message: 'Todos los criterios de clasificación necesitan un nombre.',
+        });
+      }
+      if (!rule.conditions || rule.conditions.length === 0) {
+        issues.push({
+          code: 'EMPTY_RULE_CONDITIONS',
+          severity: 'error',
+          ruleId: rule.id,
+          message: `El criterio "${rule.name || 'sin nombre'}" necesita al menos una condición.`,
+        });
+        continue;
+      }
       for (const cond of rule.conditions) {
         const refStep = stepById.get(cond.stepId);
         if (!refStep) {
@@ -157,30 +176,53 @@ export function validateFlowAndDependencies(
           });
           continue;
         }
-        if (
-          (cond.operator === 'eq' || cond.operator === 'neq' || cond.operator === 'contains_option') &&
-          refStep.options &&
-          cond.value !== undefined
-        ) {
-          const validOption = refStep.options.some((o) => o.id === String(cond.value));
-          if (!validOption) {
+        if (cond.operator === 'eq' || cond.operator === 'neq' || cond.operator === 'contains_option') {
+          const strVal =
+            cond.value === undefined || cond.value === null ? '' : String(cond.value).trim();
+          if (!strVal) {
             issues.push({
-              code: 'BROKEN_RULE_OPTION_REF',
+              code: 'MISSING_RULE_VALUE',
               severity: 'error',
               ruleId: rule.id,
               stepId: cond.stepId,
-              message: `La regla "${rule.name}" referencia la opción "${cond.value}" en "${cond.stepId}", que ya no existe.`,
+              message: `El criterio "${rule.name}" necesita una respuesta o valor para comparar en "${refStep.title || refStep.id}".`,
             });
+          } else if (refStep.options && refStep.options.length > 0) {
+            const validOption = refStep.options.some((o) => o.id === String(cond.value));
+            if (!validOption) {
+              issues.push({
+                code: 'BROKEN_RULE_OPTION_REF',
+                severity: 'error',
+                ruleId: rule.id,
+                stepId: cond.stepId,
+                message: `La regla "${rule.name}" referencia la opción "${cond.value}" en "${refStep.title || refStep.id}", que ya no existe.`,
+              });
+            }
           }
         }
-        if ((cond.operator === 'gt' || cond.operator === 'lt') && refStep.type !== 'numero') {
-          issues.push({
-            code: 'INCOMPATIBLE_FIELD_TYPE',
-            severity: 'error',
-            ruleId: rule.id,
-            stepId: cond.stepId,
-            message: `La regla "${rule.name}" usa operador numérico (${cond.operator}) sobre "${cond.stepId}" que es de tipo "${refStep.type}".`,
-          });
+        if (cond.operator === 'gt' || cond.operator === 'lt') {
+          if (refStep.type !== 'numero') {
+            issues.push({
+              code: 'INCOMPATIBLE_FIELD_TYPE',
+              severity: 'error',
+              ruleId: rule.id,
+              stepId: cond.stepId,
+              message: `La regla "${rule.name}" usa operador numérico (${cond.operator}) sobre "${refStep.title || refStep.id}" que es de tipo "${refStep.type}".`,
+            });
+          } else if (
+            cond.value === undefined ||
+            cond.value === null ||
+            String(cond.value).trim() === '' ||
+            Number.isNaN(Number(cond.value))
+          ) {
+            issues.push({
+              code: 'MISSING_NUMERIC_VALUE',
+              severity: 'error',
+              ruleId: rule.id,
+              stepId: cond.stepId,
+              message: `El criterio "${rule.name}" necesita un valor numérico válido.`,
+            });
+          }
         }
       }
     }
@@ -202,13 +244,23 @@ export function saveFlowDraft(
   actorUserId: string,
   steps: FlowStep[],
   outOfScriptRules: OutOfScriptRule[],
-  name?: string
+  name?: string,
+  humanHandoffConfig?: Partial<HumanHandoffConfig> | null
 ): FlowVersion {
   let draft = store.flowVersions.find(
     (f) => f.businessId === businessId && f.status === 'borrador'
   );
   const now = new Date().toISOString();
+  const normalizedHandoff =
+    humanHandoffConfig !== undefined
+      ? resolveHumanHandoffConfig(humanHandoffConfig)
+      : undefined;
+
   if (!draft) {
+    const biz = store.businesses.find((b) => b.id === businessId);
+    const activeFlow = biz
+      ? store.flowVersions.find((f) => f.id === biz.activeFlowVersionId && f.businessId === businessId)
+      : undefined;
     const maxVer = Math.max(
       0,
       ...store.flowVersions.filter((f) => f.businessId === businessId).map((f) => f.versionNumber)
@@ -221,6 +273,20 @@ export function saveFlowDraft(
       status: 'borrador',
       steps,
       outOfScriptRules,
+      summaryTemplate: activeFlow?.summaryTemplate,
+      closureTemplate: activeFlow?.closureTemplate,
+      referenceTemplate: activeFlow?.referenceTemplate,
+      alreadyRegisteredTemplate: activeFlow?.alreadyRegisteredTemplate,
+      cancelMessage: activeFlow?.cancelMessage,
+      handoffMessage: activeFlow?.handoffMessage,
+      handoffNoContactMessage: activeFlow?.handoffNoContactMessage,
+      outOfScriptPrompt: activeFlow?.outOfScriptPrompt,
+      hideInternalCategorizationInClosure: activeFlow?.hideInternalCategorizationInClosure,
+      humanHandoffConfig:
+        normalizedHandoff ??
+        (activeFlow?.humanHandoffConfig
+          ? resolveHumanHandoffConfig(activeFlow.humanHandoffConfig)
+          : undefined),
       createdAt: now,
     };
     store.flowVersions.push(draft);
@@ -228,6 +294,9 @@ export function saveFlowDraft(
     draft.steps = steps;
     draft.outOfScriptRules = outOfScriptRules;
     if (name) draft.name = name;
+    if (normalizedHandoff !== undefined) {
+      draft.humanHandoffConfig = normalizedHandoff;
+    }
   }
 
   appendAudit(store, {
@@ -295,21 +364,30 @@ export function publishFlowDraft(
   store.flowVersions.push(published);
   biz.activeFlowVersionId = published.id;
 
-  if (draftRuleset) {
+  const rulesetDraftDiffers =
+    draftRuleset &&
+    (!activeRuleset ||
+      draftRuleset.defaultPriority !== activeRuleset.defaultPriority ||
+      draftRuleset.defaultReason !== activeRuleset.defaultReason ||
+      JSON.stringify(draftRuleset.rules) !== JSON.stringify(activeRuleset.rules));
+
+  if (draftRuleset && rulesetDraftDiffers) {
     const maxRulesVer = Math.max(
       0,
       ...store.rulesetVersions.filter((r) => r.businessId === businessId).map((r) => r.versionNumber)
     );
+    const nextRulesVer = maxRulesVer + 1;
     const pubRuleset: RulesetVersion = {
       ...structuredClone(draftRuleset),
-      id: `rules_${businessId}_v${maxRulesVer + 1}_${Date.now().toString(36)}`,
-      versionNumber: maxRulesVer + 1,
-      name: draftRuleset.name.replace(/\s*\(Borrador.*\)/i, '') + ` v${maxRulesVer + 1}`,
+      id: `rules_${businessId}_v${nextRulesVer}_${Date.now().toString(36)}`,
+      versionNumber: nextRulesVer,
+      name: draftRuleset.name.replace(/\s*\(Borrador.*\)/i, '') + ` v${nextRulesVer}`,
       status: 'publicada',
       publishedAt: now,
     };
     store.rulesetVersions.push(pubRuleset);
     biz.activeRulesetVersionId = pubRuleset.id;
+    draftRuleset.versionNumber = nextRulesVer + 1;
   }
 
   // Refresh draft version number to stay ahead
@@ -324,6 +402,168 @@ export function publishFlowDraft(
   });
 
   return { published, nextDraft: draft };
+}
+
+function normalizeRulesInput(rules: RulesetVersion['rules'] | undefined): RulesetVersion['rules'] {
+  return (rules ?? []).map((r, idx) => ({
+    ...structuredClone(r),
+    name: String(r.name ?? '').trim(),
+    order: idx + 1,
+    reason: String(r.reason ?? '').trim(),
+    tags: Array.isArray(r.tags) ? r.tags.map((t) => String(t).trim()).filter(Boolean) : [],
+    conditions: (r.conditions ?? []).map((c) => ({
+      ...c,
+      value: c.operator === 'present' ? undefined : c.value,
+    })),
+  }));
+}
+
+export function saveRulesetDraft(
+  store: NalasStore,
+  businessId: string,
+  actorUserId: string,
+  payload: Partial<Pick<RulesetVersion, 'name' | 'defaultPriority' | 'defaultReason' | 'rules'>>
+): { draft: RulesetVersion; issues: ValidationIssue[] } {
+  const biz = store.businesses.find((b) => b.id === businessId);
+  if (!biz) throw new Error('Negocio no encontrado.');
+
+  const draftFlow = store.flowVersions.find(
+    (f) => f.businessId === businessId && f.status === 'borrador'
+  );
+  const activeFlow = store.flowVersions.find((f) => f.id === biz.activeFlowVersionId);
+  const validationFlow = draftFlow ?? activeFlow;
+  if (!validationFlow) throw new Error('Flujo del negocio no encontrado.');
+
+  const normalizedRules = normalizeRulesInput(payload.rules);
+  const maxVer = Math.max(
+    0,
+    ...store.rulesetVersions.filter((r) => r.businessId === businessId).map((r) => r.versionNumber)
+  );
+  let draft = store.rulesetVersions.find(
+    (r) => r.businessId === businessId && r.status === 'borrador'
+  );
+
+  const candidate: RulesetVersion = {
+    id: draft?.id ?? `rules_${businessId}_draft_${Date.now().toString(36)}`,
+    businessId,
+    versionNumber: draft ? Math.max(draft.versionNumber, maxVer + 1) : maxVer + 1,
+    name: String(payload.name || draft?.name || `Criterios ${biz.name} (Borrador)`),
+    status: 'borrador',
+    priorityStrategy: 'first_match',
+    tagStrategy: 'accumulate',
+    defaultPriority: payload.defaultPriority || 'baja',
+    defaultReason: String(payload.defaultReason ?? 'Sin coincidencia en criterios configurados.'),
+    rules: normalizedRules,
+    createdAt: draft?.createdAt ?? new Date().toISOString(),
+  };
+
+  const issues = validateRulesetDependencies(candidate, validationFlow);
+  const errors = issues.filter((i) => i.severity === 'error');
+  if (errors.length > 0) {
+    const err = new Error(errors.map((e) => e.message).join(' | '));
+    (err as Error & { statusCode?: number; issues?: ValidationIssue[] }).statusCode = 400;
+    (err as Error & { issues?: ValidationIssue[] }).issues = issues;
+    throw err;
+  }
+
+  if (!draft) {
+    store.rulesetVersions.push(candidate);
+    draft = candidate;
+  } else {
+    draft.versionNumber = candidate.versionNumber;
+    draft.name = candidate.name;
+    draft.defaultPriority = candidate.defaultPriority;
+    draft.defaultReason = candidate.defaultReason;
+    draft.rules = candidate.rules;
+  }
+
+  appendAudit(store, {
+    businessId,
+    actorUserId,
+    module: 'configuracion',
+    action: 'guardar_borrador_reglas',
+    detail: `Borrador de criterios guardado (${draft.rules.length} criterios). Pendiente de publicar para nuevas conversaciones.`,
+  });
+
+  return { draft, issues };
+}
+
+export function publishRuleset(
+  store: NalasStore,
+  businessId: string,
+  actorUserId: string,
+  payload: Partial<Pick<RulesetVersion, 'name' | 'defaultPriority' | 'defaultReason' | 'rules'>>
+): RulesetVersion {
+  const biz = store.businesses.find((b) => b.id === businessId);
+  if (!biz) throw new Error('Negocio no encontrado.');
+  const activeFlow = store.flowVersions.find((f) => f.id === biz.activeFlowVersionId);
+  if (!activeFlow) throw new Error('No hay conversación publicada en este negocio.');
+  const draftFlow = store.flowVersions.find(
+    (f) => f.businessId === businessId && f.status === 'borrador'
+  );
+
+  const normalizedRules = normalizeRulesInput(payload.rules);
+  const maxVer = Math.max(
+    0,
+    ...store.rulesetVersions.filter((r) => r.businessId === businessId).map((r) => r.versionNumber)
+  );
+  const nextVer = maxVer + 1;
+  const now = new Date().toISOString();
+
+  const nextRuleset: RulesetVersion = {
+    id: `rules_${businessId}_v${nextVer}_${Date.now().toString(36)}`,
+    businessId,
+    versionNumber: nextVer,
+    name: String(payload.name || `Reglas ${biz.name} v${nextVer}`),
+    status: 'publicada',
+    priorityStrategy: 'first_match',
+    tagStrategy: 'accumulate',
+    defaultPriority: payload.defaultPriority || 'baja',
+    defaultReason: String(payload.defaultReason || 'Sin coincidencia en reglas configuradas.'),
+    rules: normalizedRules,
+    createdAt: now,
+    publishedAt: now,
+  };
+
+  const issues = validateRulesetDependencies(nextRuleset, activeFlow);
+  if (issues.some((i) => i.severity === 'error')) {
+    const draftIssues = draftFlow ? validateRulesetDependencies(nextRuleset, draftFlow) : issues;
+    if (draftFlow && !draftIssues.some((i) => i.severity === 'error')) {
+      const err = new Error(
+        'Alguno de estos criterios usa una pregunta o respuesta del borrador de conversación que todavía no está publicada. Guardá los criterios como borrador o publicá primero la conversación.'
+      );
+      (err as Error & { statusCode?: number; issues?: ValidationIssue[] }).statusCode = 400;
+      (err as Error & { issues?: ValidationIssue[] }).issues = issues;
+      throw err;
+    }
+    const err = new Error(issues.map((i) => i.message).join(' | '));
+    (err as Error & { statusCode?: number; issues?: ValidationIssue[] }).statusCode = 400;
+    (err as Error & { issues?: ValidationIssue[] }).issues = issues;
+    throw err;
+  }
+
+  store.rulesetVersions.push(nextRuleset);
+  biz.activeRulesetVersionId = nextRuleset.id;
+
+  // Keep any existing ruleset draft synced with the published version so no stale draft lingers
+  const existingDraft = store.rulesetVersions.find(
+    (r) => r.businessId === businessId && r.status === 'borrador'
+  );
+  if (existingDraft) {
+    existingDraft.rules = structuredClone(nextRuleset.rules);
+    existingDraft.defaultPriority = nextRuleset.defaultPriority;
+    existingDraft.defaultReason = nextRuleset.defaultReason;
+    existingDraft.versionNumber = nextVer + 1;
+  }
+
+  appendAudit(store, {
+    businessId,
+    actorUserId,
+    module: 'configuracion',
+    action: 'publicar_reglas',
+    detail: `Publicado conjunto de reglas v${nextRuleset.versionNumber} (${nextRuleset.rules.length} reglas). No reclasifica históricos automáticamente.`,
+  });
+  return nextRuleset;
 }
 
 export function rollbackFlowVersion(

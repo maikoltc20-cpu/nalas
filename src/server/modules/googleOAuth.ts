@@ -428,6 +428,17 @@ export async function completeGoogleOAuthCallback(params: {
  *    y coincidencia exacta con un usuario ya registrado en NALAS (sin coincidencias por dominio
  *    ni concesión automática de permisos o administración).
  */
+function getNormalizedAdminEmail(): string {
+  let raw = getEnv('NALAS_ADMIN_EMAIL')?.trim() ?? '';
+  if (
+    (raw.startsWith('"') && raw.endsWith('"')) ||
+    (raw.startsWith("'") && raw.endsWith("'"))
+  ) {
+    raw = raw.slice(1, -1).trim();
+  }
+  return raw.toLowerCase();
+}
+
 export function resolveOrLinkGoogleUser(
   store: NalasStore,
   identity: VerifiedGoogleIdentity
@@ -437,7 +448,7 @@ export function resolveOrLinkGoogleUser(
   }
   const now = new Date().toISOString();
   const normalizedEmail = identity.email.trim().toLowerCase();
-  const configuredAdminEmail = getEnv('NALAS_ADMIN_EMAIL')?.trim().toLowerCase() ?? '';
+  const configuredAdminEmail = getNormalizedAdminEmail();
 
   // 1. Identificación estable por Google `sub`
   const bySub = store.userIdentities.find(
@@ -489,10 +500,13 @@ export function resolveOrLinkGoogleUser(
       throw err;
     }
     const allowedAdminLink =
-      actor.isPlatformAdmin && configuredAdminEmail && normalizedEmail === configuredAdminEmail;
+      actor.isPlatformAdmin &&
+      actor.id !== 'user_soporte' &&
+      configuredAdminEmail &&
+      normalizedEmail === configuredAdminEmail;
     if (!allowedAdminLink && actor.email.toLowerCase() !== normalizedEmail) {
       const err = new Error(
-        'El correo verificado de Google no coincide exactamente con tu usuario autorizado en Nala.'
+        `El correo verificado de Google (${normalizedEmail}) no coincide exactamente con tu usuario autorizado en Nala.`
       ) as Error & { statusCode?: number };
       err.statusCode = 403;
       throw err;
@@ -532,24 +546,34 @@ export function resolveOrLinkGoogleUser(
   }
 
   // 3. Modo login:
-  //    - Si coincide exactamente con NALAS_ADMIN_EMAIL (verificado por Google), vincular al único administrador de plataforma existente.
+  //    - Si coincide exactamente con NALAS_ADMIN_EMAIL (verificado por Google), vincular al propietario de plataforma (user_michael).
   //    - Nunca otorgar administración a otros correos ni hacer coincidencia por dominio.
   let matchedUser: User | undefined;
 
   if (configuredAdminEmail && normalizedEmail === configuredAdminEmail) {
-    const exactAdmin = store.users.find(
-      (u) => u.isPlatformAdmin && u.email.toLowerCase() === configuredAdminEmail
-    );
+    const exactAdmin =
+      store.users.find(
+        (u) =>
+          u.isPlatformAdmin &&
+          u.id !== 'user_soporte' &&
+          u.email.toLowerCase() === configuredAdminEmail
+      ) ??
+      store.users.find(
+        (u) => u.isPlatformAdmin && u.email.toLowerCase() === configuredAdminEmail
+      );
     const nonAdminConflict = store.users.some(
       (u) => !u.isPlatformAdmin && u.email.toLowerCase() === configuredAdminEmail
     );
     if (exactAdmin) {
       matchedUser = exactAdmin;
     } else if (!nonAdminConflict) {
-      const platformAdmin = store.users.find((u) => u.isPlatformAdmin);
-      if (platformAdmin) {
-        platformAdmin.email = configuredAdminEmail;
-        matchedUser = platformAdmin;
+      const ownerAdmin =
+        store.users.find((u) => u.id === 'user_michael') ??
+        store.users.find((u) => u.isPlatformAdmin && u.id !== 'user_soporte') ??
+        store.users.find((u) => u.isPlatformAdmin);
+      if (ownerAdmin) {
+        ownerAdmin.email = configuredAdminEmail;
+        matchedUser = ownerAdmin;
       }
     }
   }
@@ -567,7 +591,7 @@ export function resolveOrLinkGoogleUser(
 
   if (!matchedUser) {
     const err = new Error(
-      'Tu cuenta de Google no está autorizada en Nala. Solicitá al administrador que registre tu correo antes de ingresar.'
+      `Tu cuenta de Google (${normalizedEmail}) no está autorizada en Nala. Verificá qué cuenta Google elegiste o si coincide con NALAS_ADMIN_EMAIL en Cloudflare.`
     ) as Error & { statusCode?: number };
     err.statusCode = 403;
     throw err;

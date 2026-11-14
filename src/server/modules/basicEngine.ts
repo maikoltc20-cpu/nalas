@@ -1,3 +1,4 @@
+import { hasValidContactName, normalizeInternationalPhone } from '../../shared/humanHandoff.ts';
 import type {
   AnswerRecord,
   Business,
@@ -656,9 +657,40 @@ function validateAndParseStepAnswer(
     return { ok: false, errorText: 'Por favor escribe una respuesta un poco más detallada.' };
   }
   let contactUpdate: Partial<Contact> | undefined;
-  if (step.targetField === 'nombre') {
+  const tfLower = step.targetField?.toLowerCase();
+  if (tfLower === 'nombre') {
+    if (!hasValidContactName(trimmed)) {
+      return {
+        ok: false,
+        errorText: 'Por favor escribí tu nombre (sin incluir únicamente números o un teléfono).',
+      };
+    }
     contactUpdate = { fullName: trimmed };
-  } else if (step.targetField === 'dato_contacto') {
+  } else if (tfLower === 'empresa' || tfLower === 'negocio') {
+    contactUpdate = { company: trimmed };
+  } else if (tfLower === 'telefono') {
+    const normalizedPhone = normalizeInternationalPhone(trimmed);
+    if (!normalizedPhone) {
+      return {
+        ok: false,
+        errorText:
+          step.validation?.invalidMessage ??
+          'Ingresá un teléfono válido con código de país (por ejemplo: +506 8303 6864).',
+      };
+    }
+    contactUpdate = { phone: normalizedPhone };
+  } else if (tfLower === 'correo' || tfLower === 'email') {
+    const validEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed);
+    if (!validEmail) {
+      return {
+        ok: false,
+        errorText:
+          step.validation?.invalidMessage ??
+          'El correo no tiene un formato válido (ej: nombre@empresa.com).',
+      };
+    }
+    contactUpdate = { email: trimmed.toLowerCase() };
+  } else if (tfLower === 'dato_contacto') {
     const parsed = parseContactInput(trimmed);
     if (!parsed.phone && !parsed.email) {
       return {
@@ -784,6 +816,7 @@ export function runBasicEngine(params: {
   const conversation = store.conversations.find((c) => c.id === session.conversationId);
 
   // Explicit commands supported by BÁSICA (Section 5)
+  const customButtonNorm = flow.humanHandoffConfig?.buttonLabel?.trim().toLowerCase();
   if (
     normalized === 'humano' ||
     normalized === 'asesor' ||
@@ -791,6 +824,9 @@ export function runBasicEngine(params: {
     normalized === 'atención humana' ||
     normalized === 'solicitar atención humana' ||
     normalized === 'solicitar atención humana.' ||
+    normalized === 'quiero que me contacte una persona' ||
+    normalized === 'quiero que me contacte una persona.' ||
+    (customButtonNorm ? normalized === customButtonNorm || normalized === `${customButtonNorm}.` : false) ||
     selectedOptionId === 'cmd_humano'
   ) {
     session.awaitingOutOfScriptChoice = false;
@@ -1441,6 +1477,7 @@ export function runBasicEngine(params: {
     if (validation.contactUpdate.fullName) contact.fullName = validation.contactUpdate.fullName;
     if (validation.contactUpdate.phone) contact.phone = validation.contactUpdate.phone;
     if (validation.contactUpdate.email) contact.email = validation.contactUpdate.email;
+    if (validation.contactUpdate.company) contact.company = validation.contactUpdate.company;
     contact.updatedAt = new Date().toISOString();
   }
 

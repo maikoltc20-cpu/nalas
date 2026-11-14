@@ -34,6 +34,14 @@ import { SCHEMA_STATEMENTS } from './schemaSql.ts';
 let nodePool: Pool | null = null;
 
 export function isPostgresConfigured(): boolean {
+  if (
+    !isWorkerRuntime() &&
+    getEnv('NODE_ENV') !== 'production' &&
+    getEnv('NALAS_ALLOW_PG_IN_DEV') !== 'true' &&
+    getEnv('NALAS_CLI_INIT') !== 'true'
+  ) {
+    return false;
+  }
   return Boolean(getEnv('DATABASE_URL')?.trim());
 }
 
@@ -480,6 +488,7 @@ export async function loadStoreFromPg(client: PoolClient): Promise<NalasStore | 
     fullName: r.full_name ?? undefined,
     phone: r.phone ?? undefined,
     email: r.email ?? undefined,
+    company: r.company ?? undefined,
     createdAt: toIso(r.created_at)!,
     updatedAt: toIso(r.updated_at)!,
   }));
@@ -584,6 +593,8 @@ export async function loadStoreFromPg(client: PoolClient): Promise<NalasStore | 
     amountMinor: Number(r.amount_minor),
     currency: r.currency,
     commercialStatus: r.commercial_status,
+    origin: r.origin ?? undefined,
+    nextFollowUp: r.next_follow_up ?? undefined,
     closingEvidence: r.closing_evidence ?? undefined,
     createdAt: toIso(r.created_at)!,
     updatedAt: toIso(r.updated_at)!,
@@ -779,8 +790,8 @@ export async function saveStoreToPg(client: PoolClient, store: NalasStore): Prom
   }
 
   for (const ui of store.userIdentities ?? []) {
-    try {
-      await client.query(
+    const insertIdentity = () =>
+      client.query(
         `INSERT INTO nalas_user_identities (id, user_id, provider, provider_subject, email_at_link, created_at, last_login_at)
          VALUES ($1,$2,$3,$4,$5,$6,$7)
          ON CONFLICT (provider, provider_subject) DO UPDATE SET
@@ -788,15 +799,27 @@ export async function saveStoreToPg(client: PoolClient, store: NalasStore): Prom
            last_login_at = EXCLUDED.last_login_at`,
         [ui.id, ui.userId, ui.provider, ui.providerSubject, ui.emailAtLink, ui.createdAt, ui.lastLoginAt]
       );
+    try {
+      await insertIdentity();
     } catch (err) {
       if (isPgUndefinedTableError(err)) {
-        const schemaErr = new Error(
-          'Falta la tabla nalas_user_identities en PostgreSQL. Ejecutá la sincronización de esquema en inicialización controlada.'
-        ) as Error & { statusCode?: number };
-        schemaErr.statusCode = 503;
-        throw schemaErr;
+        await client.query(`
+          CREATE TABLE IF NOT EXISTS nalas_user_identities (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL REFERENCES nalas_users(id) ON DELETE CASCADE,
+            provider TEXT NOT NULL,
+            provider_subject TEXT NOT NULL,
+            email_at_link TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL,
+            last_login_at TIMESTAMPTZ NOT NULL,
+            UNIQUE (provider, provider_subject),
+            UNIQUE (user_id, provider)
+          )
+        `);
+        await insertIdentity();
+      } else {
+        throw err;
       }
-      throw err;
     }
   }
 
@@ -874,6 +897,7 @@ export async function saveStoreToPg(client: PoolClient, store: NalasStore): Prom
       handoffNoContactMessage: f.handoffNoContactMessage,
       outOfScriptPrompt: f.outOfScriptPrompt,
       hideInternalCategorizationInClosure: f.hideInternalCategorizationInClosure,
+      humanHandoffConfig: f.humanHandoffConfig,
     };
     await client.query(
       `INSERT INTO nalas_flow_versions (
@@ -954,16 +978,38 @@ export async function saveStoreToPg(client: PoolClient, store: NalasStore): Prom
   }
 
   for (const ct of store.contacts) {
-    await client.query(
-      `INSERT INTO nalas_contacts (id, business_id, environment, full_name, phone, email, created_at, updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-       ON CONFLICT (id) DO UPDATE SET
-         full_name = EXCLUDED.full_name,
-         phone = EXCLUDED.phone,
-         email = EXCLUDED.email,
-         updated_at = EXCLUDED.updated_at`,
-      [ct.id, ct.businessId, ct.environment, ct.fullName ?? null, ct.phone ?? null, ct.email ?? null, ct.createdAt, ct.updatedAt]
-    );
+    const upsertContact = () =>
+      client.query(
+        `INSERT INTO nalas_contacts (id, business_id, environment, full_name, phone, email, company, created_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+         ON CONFLICT (id) DO UPDATE SET
+           full_name = EXCLUDED.full_name,
+           phone = EXCLUDED.phone,
+           email = EXCLUDED.email,
+           company = EXCLUDED.company,
+           updated_at = EXCLUDED.updated_at`,
+        [
+          ct.id,
+          ct.businessId,
+          ct.environment,
+          ct.fullName ?? null,
+          ct.phone ?? null,
+          ct.email ?? null,
+          ct.company ?? null,
+          ct.createdAt,
+          ct.updatedAt,
+        ]
+      );
+    try {
+      await upsertContact();
+    } catch (err) {
+      if (err && typeof err === 'object' && (err as { code?: string }).code === '42703') {
+        await client.query(`ALTER TABLE nalas_contacts ADD COLUMN IF NOT EXISTS company TEXT`);
+        await upsertContact();
+      } else {
+        throw err;
+      }
+    }
   }
 
   for (const ci of store.channelIdentities) {
@@ -1051,6 +1097,9 @@ export async function saveStoreToPg(client: PoolClient, store: NalasStore): Prom
       correctionQueue: s.correctionQueue,
       correctionReturnToStepId: s.correctionReturnToStepId,
       awaitingOutOfScriptChoice: s.awaitingOutOfScriptChoice,
+      awaitingHumanContactName: s.awaitingHumanContactName,
+      awaitingHumanContactPhone: s.awaitingHumanContactPhone,
+      awaitingHumanTaskId: s.awaitingHumanTaskId,
     };
     await client.query(
       `INSERT INTO nalas_sessions (
@@ -1123,35 +1172,53 @@ export async function saveStoreToPg(client: PoolClient, store: NalasStore): Prom
   }
 
   for (const o of store.opportunities) {
-    await client.query(
-      `INSERT INTO nalas_opportunities (
-         id, business_id, environment, contact_id, lead_id, lead_commercial_reference,
-         product_id, product_name, conversation_id, title, amount_minor, currency,
-         commercial_status, closing_evidence, created_at, updated_at
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
-       ON CONFLICT (id) DO UPDATE SET
-         commercial_status = EXCLUDED.commercial_status,
-         closing_evidence = EXCLUDED.closing_evidence,
-         updated_at = EXCLUDED.updated_at`,
-      [
-        o.id,
-        o.businessId,
-        o.environment,
-        o.contactId,
-        o.leadId ?? null,
-        o.leadCommercialReference ?? null,
-        o.productId ?? null,
-        o.productName ?? null,
-        o.conversationId,
-        o.title,
-        o.amountMinor,
-        o.currency,
-        o.commercialStatus,
-        o.closingEvidence ? JSON.stringify(o.closingEvidence) : null,
-        o.createdAt,
-        o.updatedAt,
-      ]
-    );
+    const upsertOpportunity = () =>
+      client.query(
+        `INSERT INTO nalas_opportunities (
+           id, business_id, environment, contact_id, lead_id, lead_commercial_reference,
+           product_id, product_name, conversation_id, title, amount_minor, currency,
+           commercial_status, origin, next_follow_up, closing_evidence, created_at, updated_at
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+         ON CONFLICT (id) DO UPDATE SET
+           commercial_status = EXCLUDED.commercial_status,
+           origin = COALESCE(nalas_opportunities.origin, EXCLUDED.origin),
+           next_follow_up = EXCLUDED.next_follow_up,
+           closing_evidence = EXCLUDED.closing_evidence,
+           updated_at = EXCLUDED.updated_at`,
+        [
+          o.id,
+          o.businessId,
+          o.environment,
+          o.contactId,
+          o.leadId ?? null,
+          o.leadCommercialReference ?? null,
+          o.productId ?? null,
+          o.productName ?? null,
+          o.conversationId,
+          o.title,
+          o.amountMinor,
+          o.currency,
+          o.commercialStatus,
+          o.origin ?? null,
+          o.nextFollowUp ? JSON.stringify(o.nextFollowUp) : null,
+          o.closingEvidence ? JSON.stringify(o.closingEvidence) : null,
+          o.createdAt,
+          o.updatedAt,
+        ]
+      );
+    try {
+      await upsertOpportunity();
+    } catch (err) {
+      if (err && typeof err === 'object' && (err as { code?: string }).code === '42703') {
+        await client.query(`ALTER TABLE nalas_opportunities ADD COLUMN IF NOT EXISTS origin TEXT`);
+        await client.query(
+          `ALTER TABLE nalas_opportunities ADD COLUMN IF NOT EXISTS next_follow_up JSONB`
+        );
+        await upsertOpportunity();
+      } else {
+        throw err;
+      }
+    }
   }
 
   for (const t of store.tasks) {
@@ -1161,6 +1228,9 @@ export async function saveStoreToPg(client: PoolClient, store: NalasStore): Prom
          title, context_summary, has_usable_contact, contact_warning, assigned_user_id, status, created_at, updated_at
        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
        ON CONFLICT (id) DO UPDATE SET
+         context_summary = EXCLUDED.context_summary,
+         has_usable_contact = EXCLUDED.has_usable_contact,
+         contact_warning = EXCLUDED.contact_warning,
          assigned_user_id = EXCLUDED.assigned_user_id,
          status = EXCLUDED.status,
          updated_at = EXCLUDED.updated_at`,

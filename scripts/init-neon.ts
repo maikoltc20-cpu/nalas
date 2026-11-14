@@ -5,7 +5,7 @@ import { runWithRuntimeContext } from '../src/server/runtimeContext.ts';
 
 async function main() {
   const result = await runWithRuntimeContext(
-    { env: process.env, isWorker: false },
+    { env: { ...process.env, NALAS_CLI_INIT: 'true' }, isWorker: false },
     () => initializeDatabaseControlled({ actorUserId: 'cli_db_init', forceSchemaSync: true })
   );
   console.log(JSON.stringify(result, null, 2));

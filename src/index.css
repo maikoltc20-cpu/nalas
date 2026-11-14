@@ -2,20 +2,45 @@
 
 @layer base {
   :root {
-    --font-display: 'Plus Jakarta Sans', system-ui, sans-serif;
-    --font-sans: 'DM Sans', system-ui, sans-serif;
+    --font-display: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+    --font-sans: 'DM Sans', system-ui, -apple-system, sans-serif;
     --font-mono: 'IBM Plex Mono', ui-monospace, monospace;
+    --nala-bg: #F7F8FA;
+    --nala-surface: #FFFFFF;
+    --nala-text: #25364A;
+    --nala-muted: #5A6877;
+    --nala-primary: #167D83;
+    --nala-primary-hover: #116B70;
+    --nala-mint: #EAF5F2;
+    --nala-mint-text: #116B70;
+    --nala-peach: #FFF0E3;
+    --nala-peach-text: #8C542C;
+    --nala-lavender: #F0ECF9;
+    --nala-lavender-text: #5D4886;
+    --nala-border: #E2E7EB;
   }
 
   body {
     font-family: var(--font-sans);
-    background-color: #F8FAFC;
-    color: #0F172A;
+    font-size: 15px;
+    line-height: 1.5;
+    background-color: var(--nala-bg);
+    color: var(--nala-text);
   }
 
   h1, h2, h3, h4 {
     font-family: var(--font-display);
     text-wrap: balance;
+    color: var(--nala-text);
+  }
+
+  button:focus-visible,
+  a:focus-visible,
+  input:focus-visible,
+  select:focus-visible,
+  textarea:focus-visible {
+    outline: 2px solid var(--nala-primary);
+    outline-offset: 2px;
   }
 
   .font-mono,

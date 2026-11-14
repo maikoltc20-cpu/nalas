@@ -67,8 +67,19 @@ async function hmacSha256Base64Url(secret: string, message: string): Promise<str
   return bytesToBase64Url(new Uint8Array(sigBuf));
 }
 
+export function isLocalDevPreviewBypassEnabled(): boolean {
+  return (
+    !isWorkerRuntime() &&
+    getEnv('NODE_ENV') !== 'production' &&
+    getEnv('NALAS_DISABLE_DEMO_LOGIN') !== 'true' &&
+    getEnv('NALAS_REQUIRE_PROD_AUTH') !== 'true' &&
+    getEnv('NALAS_CLI_INIT') !== 'true'
+  );
+}
+
 export function isDemoQuickLoginEnabled(): boolean {
   return (
+    !isLocalDevPreviewBypassEnabled() &&
     getEnv('NODE_ENV') !== 'production' &&
     getEnv('NALAS_DISABLE_DEMO_LOGIN') !== 'true' &&
     !isWorkerRuntime()

@@ -1,17 +1,33 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Lock, LogOut, ShieldAlert, X } from 'lucide-react';
+import { Lock, LogOut, Menu, ShieldAlert, X } from 'lucide-react';
 import type { Environment } from './shared/types';
 import { type AuthSessionResponse, type BootstrapResponse, nalasApi } from './client/api';
 import { AdminNalasWorkspace } from './client/components/AdminNalasWorkspace';
 import { BusinessOverview } from './client/components/BusinessOverview';
 import { FlowAndRulesDesigner } from './client/components/FlowAndRulesDesigner';
+import { NalaHome } from './client/components/NalaHome';
 import { OperationsWorkspace } from './client/components/OperationsWorkspace';
 import { SimulatorWorkspace } from './client/components/SimulatorWorkspace';
 
-type WorkspaceTab = 'negocio' | 'diseno' | 'simulador' | 'operacion' | 'admin';
+type WorkspaceTab =
+  | 'nala'
+  | 'asistente'
+  | 'prueba'
+  | 'atencion'
+  | 'gestion'
+  | 'negocio'
+  | 'admin';
+
+function getInitials(name: string): string {
+  const parts = name.trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return 'NL';
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+  return `${parts[0][0]}${parts[1][0]}`.toUpperCase();
+}
 
 export default function App() {
-  const [tab, setTab] = useState<WorkspaceTab>('negocio');
+  const [tab, setTab] = useState<WorkspaceTab>('nala');
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [authSession, setAuthSession] = useState<AuthSessionResponse | null>(null);
   const [authLoading, setAuthLoading] = useState<boolean>(true);
   const [loginEmail, setLoginEmail] = useState('');
@@ -22,6 +38,7 @@ export default function App() {
   const [businessId, setBusinessId] = useState<string>('biz_nexo');
   const [environment, setEnvironment] = useState<Environment>('prueba');
   const [draftSimConvId, setDraftSimConvId] = useState<string | null>(null);
+  const [attentionConvId, setAttentionConvId] = useState<string | null>(null);
 
   const [data, setData] = useState<BootstrapResponse | null>(null);
   const [loading, setLoading] = useState<boolean>(false);
@@ -155,12 +172,17 @@ export default function App() {
     setEnvironment('prueba');
     setDraftSimConvId(started.conversation.id);
     await loadBootstrap();
-    setTab('simulador');
+    setTab('prueba');
+  }
+
+  function navigateTo(nextTab: WorkspaceTab) {
+    setTab(nextTab);
+    setMobileMenuOpen(false);
   }
 
   if (authLoading) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-[#F8FAFC] text-sm text-slate-600">
+      <div className="min-h-screen flex items-center justify-center bg-[#F7F8FA] text-sm text-[#5A6877]">
         Verificando sesión en Nala...
       </div>
     );
@@ -171,11 +193,11 @@ export default function App() {
     const showDevInitForm = !isProduction && authSession?.authIssue?.code === 'DB_UNINITIALIZED';
 
     return (
-      <div className="min-h-screen flex items-center justify-center bg-[#F8FAFC] px-4 py-10">
-        <div className="w-full max-w-md bg-white border border-slate-200 rounded-lg p-7 space-y-6">
+      <div className="min-h-screen flex items-center justify-center bg-[#F7F8FA] px-4 py-10">
+        <div className="w-full max-w-md bg-white border border-[#E2E7EB] rounded-[13px] p-7 space-y-6">
           <div className="space-y-1.5">
-            <div className="flex items-center gap-2 text-slate-900">
-              <Lock className="w-5 h-5 text-[#1D4ED8]" />
+            <div className="flex items-center gap-2 text-[#25364A]">
+              <Lock className="w-5 h-5 text-[#167D83]" />
               <h1
                 className="text-xl font-bold tracking-tight"
                 style={{ fontFamily: 'var(--font-display)' }}
@@ -183,7 +205,7 @@ export default function App() {
                 Nala · Acceso al panel
               </h1>
             </div>
-            <p className="text-sm text-slate-600">
+            <p className="text-sm text-[#5A6877]">
               {isProduction
                 ? 'Ingresá con tu cuenta autorizada de Google para administrar negocios, guiones y operaciones.'
                 : 'Iniciá sesión con tus credenciales para administrar negocios, guiones y operaciones. El webhook público permanece aislado de este panel.'}
@@ -445,322 +467,358 @@ export default function App() {
   }
 
   const activeBusiness = data?.businesses.find((b) => b.id === businessId);
-  const activeAssistant = data?.scoped?.assistants[0];
-  const activeFlow = data?.scoped?.flowVersions.find(
-    (f) => f.id === activeBusiness?.activeFlowVersionId
+
+  const clientNavItems: Array<{ id: WorkspaceTab; label: string }> = [
+    { id: 'nala', label: 'Nala' },
+    { id: 'asistente', label: 'Mi asistente' },
+    { id: 'atencion', label: 'Atención' },
+    { id: 'gestion', label: 'Gestión' },
+    { id: 'negocio', label: 'Mi negocio' },
+  ];
+
+  const isNavActive = (itemId: WorkspaceTab) =>
+    tab === itemId || (itemId === 'asistente' && tab === 'prueba');
+
+  const sidebarContent = (
+    <div className="flex flex-col h-full justify-between px-4 py-7">
+      <div className="space-y-7">
+        <button
+          type="button"
+          onClick={() => navigateTo('nala')}
+          className="block text-left px-3"
+        >
+          <span
+            className="text-[30px] font-bold tracking-tight text-[#167D83] leading-none"
+            style={{ fontFamily: 'var(--font-display)' }}
+          >
+            nala<span className="text-[#E5B386]">.</span>
+          </span>
+          <span className="block text-xs text-[#5A6877] mt-1">
+            Tu negocio, bien acompañado.
+          </span>
+        </button>
+
+        <nav aria-label="Navegación principal" className="space-y-1.5">
+          {clientNavItems.map((item) => {
+            const active = isNavActive(item.id);
+            return (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => navigateTo(item.id)}
+                className={`w-full text-left min-h-[44px] px-4 py-2.5 rounded-[9px] text-[15px] transition-colors ${
+                  active
+                    ? 'bg-[#EAF5F2] text-[#116B70] font-semibold'
+                    : 'text-[#5A6877] hover:bg-[#F7F8FA] hover:text-[#25364A]'
+                }`}
+              >
+                {item.label}
+              </button>
+            );
+          })}
+
+          {authSession.user.isPlatformAdmin && (
+            <div className="mt-6 pt-4 border-t border-[#E5E9ED]">
+              <button
+                type="button"
+                onClick={() => navigateTo('admin')}
+                className={`w-full text-left min-h-[44px] px-4 py-2.5 rounded-[9px] text-[15px] transition-colors ${
+                  tab === 'admin'
+                    ? 'bg-[#F0ECF9] text-[#5D4886] font-semibold'
+                    : 'text-[#5A6877] hover:bg-[#F7F8FA] hover:text-[#25364A]'
+                }`}
+              >
+                Administración Nala
+              </button>
+            </div>
+          )}
+        </nav>
+      </div>
+
+      <div className="px-3 pt-4 border-t border-[#E5E9ED] text-xs text-[#5A6877] space-y-1">
+        <div className="font-medium text-[#25364A]">{authSession.user.name}</div>
+        <div>
+          {environment === 'prueba' ? 'Espacio de prueba' : 'Espacio en producción'}
+        </div>
+      </div>
+    </div>
   );
 
   return (
-    <div className="min-h-screen flex flex-col bg-[#F8FAFC] text-[#0F172A]">
-      {/* Strict 3-Zone Top Bar Contract */}
-      <header className="bg-white border-b border-slate-200 px-6 lg:px-10 h-16 flex items-center justify-between gap-8">
-        <button
-          type="button"
-          onClick={() => setTab('negocio')}
-          className="text-xl font-bold tracking-tight text-slate-900 whitespace-nowrap shrink-0"
-          style={{ fontFamily: 'var(--font-display)' }}
-        >
-          Nala
-        </button>
+    <div className="min-h-screen bg-[#F7F8FA] text-[#25364A]">
+      {/* Desktop Sidebar */}
+      <aside className="hidden lg:block fixed inset-y-0 left-0 w-[224px] bg-white border-r border-[#E5E9ED] z-20">
+        {sidebarContent}
+      </aside>
 
-        <nav className="flex items-center gap-6 overflow-x-auto text-sm font-medium text-slate-600">
-          {(
-            [
-              ['negocio', 'Negocio'],
-              ['diseno', 'Diseño'],
-              ['simulador', 'Simulador'],
-              ['operacion', 'Operación'],
-              ...(authSession.user.isPlatformAdmin ? [['admin', 'Admin Nala']] : []),
-            ] as Array<[WorkspaceTab, string]>
-          ).map(([id, label]) => (
-            <button
-              key={id}
-              type="button"
-              onClick={() => setTab(id)}
-              className={`py-5 border-b-2 transition-colors whitespace-nowrap shrink-0 ${
-                tab === id
-                  ? 'border-[#1D4ED8] text-slate-900 font-semibold'
-                  : 'border-transparent hover:text-slate-900'
-              }`}
-            >
-              {label}
-            </button>
-          ))}
-        </nav>
-
-        <div className="shrink-0 flex items-center gap-3">
-          <button
-            type="button"
-            onClick={() => setTab('simulador')}
-            className="px-4 py-2 text-sm font-medium text-white bg-[#1D4ED8] rounded-md hover:bg-blue-800 transition-colors whitespace-nowrap shrink-0"
-          >
-            Probar flujo
-          </button>
-          <button
-            type="button"
-            onClick={handleLogout}
-            title="Cerrar sesión"
-            className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-md hover:bg-slate-50 whitespace-nowrap shrink-0"
-          >
-            <LogOut className="w-3.5 h-3.5" />
-            <span>Salir</span>
-          </button>
-        </div>
-      </header>
-
-      {/* Effective Context Bar */}
-      {data && (
-        <div className="bg-white border-b border-slate-200 px-6 lg:px-10 py-3.5">
-          <div className="max-w-[1360px] mx-auto flex flex-wrap items-center justify-between gap-4">
-            <div className="flex flex-wrap items-center gap-4 text-sm">
-              <div className="flex items-center gap-2">
-                <label htmlFor="biz-select" className="text-slate-500 font-medium">
-                  Negocio
-                </label>
-                <select
-                  id="biz-select"
-                  value={businessId}
-                  onChange={(e) => {
-                    setBusinessId(e.target.value);
-                    setDraftSimConvId(null);
-                    setErrorMsg(null);
-                  }}
-                  className="text-sm font-semibold text-slate-900 border border-slate-300 rounded-md px-3 py-2 bg-white"
-                >
-                  {data.businesses.map((b) => (
-                    <option key={b.id} value={b.id}>
-                      {b.name} ({b.currency})
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div className="flex items-center gap-1 p-1 bg-slate-100 border border-slate-200 rounded-md">
-                <button
-                  type="button"
-                  onClick={() => setEnvironment('prueba')}
-                  className={`px-3 py-1.5 text-sm font-medium rounded transition-colors whitespace-nowrap ${
-                    environment === 'prueba'
-                      ? 'bg-white text-amber-800 shadow-xs'
-                      : 'text-slate-600 hover:text-slate-900'
-                  }`}
-                >
-                  Entorno Prueba
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setEnvironment('produccion')}
-                  className={`px-3 py-1.5 text-sm font-medium rounded transition-colors whitespace-nowrap ${
-                    environment === 'produccion'
-                      ? 'bg-white text-emerald-800 shadow-xs'
-                      : 'text-slate-600 hover:text-slate-900'
-                  }`}
-                >
-                  Producción
-                </button>
-              </div>
-
-              {authSession.demoQuickLoginEnabled ? (
-                <div className="flex items-center gap-2">
-                  <label htmlFor="user-select" className="text-slate-500 font-medium">
-                    Sesión (Prueba)
-                  </label>
-                  <select
-                    id="user-select"
-                    value={activeUserId}
-                    disabled={loginBusy}
-                    onChange={(e) => handleDemoUserSwitch(e.target.value)}
-                    className="text-sm text-slate-800 border border-slate-300 rounded-md px-3 py-2 bg-white"
-                  >
-                    {data.users.map((u) => {
-                      const mem = data.memberships.find(
-                        (m) => m.userId === u.id && m.businessId === businessId
-                      );
-                      return (
-                        <option key={u.id} value={u.id}>
-                          {u.name} ({mem ? mem.role : u.isPlatformAdmin ? 'Admin Nala / sin membresía aquí' : 'sin acceso aquí'})
-                        </option>
-                      );
-                    })}
-                  </select>
-                </div>
-              ) : (
-                <div className="flex items-center gap-2 text-xs text-slate-600 font-medium">
-                  <span>
-                    Sesión: <span className="text-slate-900">{authSession.user.name}</span> ({authSession.user.email})
-                  </span>
-                  {authSession.googleLoginEnabled && (
-                    authSession.googleLinked ? (
-                      <span className="text-emerald-700">· Google vinculado</span>
-                    ) : (
-                      <button
-                        type="button"
-                        onClick={() => window.location.assign('/api/auth/google/start?mode=link')}
-                        className="text-[#1D4ED8] hover:underline"
-                      >
-                        · Vincular Google
-                      </button>
-                    )
-                  )}
-                </div>
-              )}
+      {/* Mobile Drawer */}
+      {mobileMenuOpen && (
+        <div className="fixed inset-0 z-40 lg:hidden flex">
+          <div
+            className="fixed inset-0 bg-[#25364A]/35"
+            onClick={() => setMobileMenuOpen(false)}
+          />
+          <aside className="relative w-72 max-w-[82vw] bg-white h-full border-r border-[#E5E9ED] z-50 flex flex-col">
+            <div className="flex justify-end px-4 pt-4">
+              <button
+                type="button"
+                aria-label="Cerrar menú"
+                onClick={() => setMobileMenuOpen(false)}
+                className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center rounded-[9px] text-[#5A6877] hover:bg-[#F7F8FA]"
+              >
+                <X className="w-5 h-5" />
+              </button>
             </div>
-
-            <div className="flex flex-wrap items-center gap-2 text-xs text-slate-600">
-              <span>{activeBusiness?.name ?? businessId}</span>
-              <span aria-hidden="true">·</span>
-              <span>{environment === 'prueba' ? 'Prueba aislada' : 'Producción'}</span>
-              {activeAssistant && (
-                <>
-                  <span aria-hidden="true">·</span>
-                  <span className="text-slate-900 font-medium">Edición {activeAssistant.activeMode}</span>
-                </>
-              )}
-              {activeFlow && (
-                <>
-                  <span aria-hidden="true">·</span>
-                  <span>Versión activa v{activeFlow.versionNumber}</span>
-                </>
-              )}
-              {data.actor.effectiveRole && (
-                <>
-                  <span aria-hidden="true">·</span>
-                  <span>Rol: {data.actor.effectiveRole}</span>
-                </>
-              )}
-            </div>
-          </div>
+            <div className="flex-1 overflow-y-auto -mt-4">{sidebarContent}</div>
+          </aside>
         </div>
       )}
 
-      {/* Main Content Container */}
-      <main className="flex-1 px-6 lg:px-10 py-8">
-        <div className="max-w-[1360px] mx-auto space-y-6">
-          {errorMsg && (
-            <div className="flex items-center justify-between gap-4 p-4 bg-red-50 border border-red-200 rounded-lg text-sm text-red-800">
-              <span>{errorMsg}</span>
+      {/* Main Column */}
+      <div className="lg:pl-[224px] min-h-screen flex flex-col">
+        {/* Top Bar */}
+        <header className="min-h-[72px] bg-white border-b border-[#E5E9ED] px-4 sm:px-6 lg:px-9 py-2.5 flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-3 min-w-0">
+            <button
+              type="button"
+              aria-label="Abrir menú"
+              onClick={() => setMobileMenuOpen(true)}
+              className="lg:hidden min-h-[44px] min-w-[44px] inline-flex items-center justify-center border border-[#DCE3E8] rounded-[9px] text-[#25364A] bg-white"
+            >
+              <Menu className="w-5 h-5" />
+            </button>
+
+            {data && data.businesses.length > 0 ? (
+              <select
+                id="biz-select"
+                aria-label="Negocio activo"
+                value={businessId}
+                onChange={(e) => {
+                  setBusinessId(e.target.value);
+                  setDraftSimConvId(null);
+                  setAttentionConvId(null);
+                  setErrorMsg(null);
+                }}
+                className="text-sm sm:text-base font-semibold text-[#25364A] border border-[#DCE3E8] rounded-[9px] px-3 py-2 min-h-[44px] bg-white max-w-[240px] sm:max-w-xs"
+              >
+                {data.businesses.map((b) => (
+                  <option key={b.id} value={b.id}>
+                    {b.name}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <span className="font-semibold text-[#25364A]">Nala</span>
+            )}
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2.5">
+            <div
+              className="inline-flex items-center p-1 bg-[#EDF1F3] rounded-[9px]"
+              role="group"
+              aria-label="Entorno de trabajo"
+            >
               <button
                 type="button"
-                aria-label="Cerrar alerta"
-                onClick={() => setErrorMsg(null)}
-                className="text-red-700 hover:text-red-900"
+                onClick={() => setEnvironment('prueba')}
+                className={`min-h-[36px] px-3 py-1 text-xs sm:text-sm font-medium rounded-[7px] transition-colors whitespace-nowrap ${
+                  environment === 'prueba'
+                    ? 'bg-[#FFF0E3] text-[#8C542C] shadow-xs'
+                    : 'text-[#5A6877] hover:text-[#25364A]'
+                }`}
               >
-                <X className="w-4 h-4" />
+                Espacio de prueba
               </button>
-            </div>
-          )}
-
-          {noticeMsg && (
-            <div className="flex items-center justify-between gap-4 p-4 bg-blue-50 border border-blue-200 rounded-lg text-sm text-blue-900">
-              <span>{noticeMsg}</span>
               <button
                 type="button"
-                aria-label="Cerrar aviso"
-                onClick={() => setNoticeMsg(null)}
-                className="text-blue-700 hover:text-blue-900"
+                onClick={() => setEnvironment('produccion')}
+                className={`min-h-[36px] px-3 py-1 text-xs sm:text-sm font-medium rounded-[7px] transition-colors whitespace-nowrap ${
+                  environment === 'produccion'
+                    ? 'bg-[#EAF5F2] text-[#116B70] shadow-xs'
+                    : 'text-[#5A6877] hover:text-[#25364A]'
+                }`}
               >
-                <X className="w-4 h-4" />
+                Producción
               </button>
             </div>
-          )}
 
-          {loading || !data ? (
-            <div className="bg-white border border-slate-200 rounded-lg p-10 text-sm text-slate-500">
-              Cargando entorno operativo Nala...
+            {authSession.googleLoginEnabled && !authSession.devPreviewDirectAccess && !authSession.googleLinked && (
+              <button
+                type="button"
+                onClick={() => window.location.assign('/api/auth/google/start?mode=link')}
+                className="min-h-[40px] px-3 text-xs font-medium text-[#167D83] hover:underline"
+              >
+                Vincular Google
+              </button>
+            )}
+
+            <div
+              title={`${authSession.user.name} (${authSession.user.email})`}
+              className="w-10 h-10 rounded-full bg-[#F2EDE6] text-[#66574C] text-xs font-semibold flex items-center justify-center shrink-0"
+            >
+              {getInitials(authSession.user.name)}
             </div>
-          ) : tab === 'admin' ? (
-            <AdminNalasWorkspace
-              data={data}
-              ctx={ctx}
-              onRefresh={loadBootstrap}
-              onSelectBusiness={(id) => {
-                setBusinessId(id);
-                setTab('negocio');
-              }}
-              onError={setErrorMsg}
-              onNotice={setNoticeMsg}
-            />
-          ) : data.actor.accessError || !data.scoped || !activeBusiness ? (
-            <section className="bg-white border border-slate-200 rounded-lg p-8 space-y-4 max-w-2xl">
-              <div className="flex items-center gap-3 text-red-700">
-                <ShieldAlert className="w-5 h-5 shrink-0" />
-                <h1 className="text-lg font-semibold">
-                  Acceso restringido por aislamiento de cuenta
-                </h1>
+
+            {!authSession.devPreviewDirectAccess && (
+              <button
+                type="button"
+                onClick={handleLogout}
+                title="Cerrar sesión"
+                className="inline-flex items-center gap-1.5 min-h-[40px] px-3 py-1.5 text-xs font-medium text-[#25364A] bg-white border border-[#DCE3E8] rounded-[9px] hover:bg-[#F7F8FA] whitespace-nowrap"
+              >
+                <LogOut className="w-3.5 h-3.5" />
+                <span>Salir</span>
+              </button>
+            )}
+          </div>
+        </header>
+
+        {/* Main Content Container */}
+        <main className="flex-1 px-4 sm:px-6 lg:px-9 py-7">
+          <div className="max-w-[1380px] mx-auto space-y-6">
+            {errorMsg && (
+              <div className="flex items-center justify-between gap-4 p-4 bg-red-50 border border-red-200 rounded-[10px] text-sm text-red-800">
+                <span>{errorMsg}</span>
+                <button
+                  type="button"
+                  aria-label="Cerrar alerta"
+                  onClick={() => setErrorMsg(null)}
+                  className="text-red-700 hover:text-red-900 min-h-[36px] min-w-[36px] inline-flex items-center justify-center"
+                >
+                  <X className="w-4 h-4" />
+                </button>
               </div>
-              <p className="text-sm text-slate-700 leading-relaxed">
-                {data.actor.accessError}
-              </p>
-              <div className="flex flex-wrap gap-3 pt-2">
-                {authSession.demoQuickLoginEnabled && (
-                  <button
-                    type="button"
-                    onClick={() => handleDemoUserSwitch('user_michael')}
-                    className="px-4 py-2 text-sm font-medium text-white bg-slate-900 rounded-md hover:bg-slate-800"
-                  >
-                    Cambiar a Michael (Propietario)
-                  </button>
-                )}
+            )}
+
+            {noticeMsg && (
+              <div className="flex items-center justify-between gap-4 p-4 bg-[#EAF5F2] border border-[#D4EAE4] rounded-[10px] text-sm text-[#116B70]">
+                <span>{noticeMsg}</span>
+                <button
+                  type="button"
+                  aria-label="Cerrar aviso"
+                  onClick={() => setNoticeMsg(null)}
+                  className="text-[#116B70] hover:text-[#25364A] min-h-[36px] min-w-[36px] inline-flex items-center justify-center"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            )}
+
+            {loading || !data ? (
+              <div className="bg-white border border-[#E2E7EB] rounded-[13px] p-10 text-sm text-[#5A6877]">
+                Cargando espacio de Nala...
+              </div>
+            ) : tab === 'admin' ? (
+              <AdminNalasWorkspace
+                data={data}
+                business={activeBusiness}
+                ctx={ctx}
+                onRefresh={loadBootstrap}
+                onSelectBusiness={(id) => {
+                  setBusinessId(id);
+                  setTab('nala');
+                }}
+                onError={setErrorMsg}
+                onNotice={setNoticeMsg}
+              />
+            ) : data.actor.accessError || !data.scoped || !activeBusiness ? (
+              <section className="bg-white border border-[#E2E7EB] rounded-[13px] p-8 space-y-4 max-w-2xl">
+                <div className="flex items-center gap-3 text-red-700">
+                  <ShieldAlert className="w-5 h-5 shrink-0" />
+                  <h1 className="text-lg font-semibold">
+                    Acceso restringido por aislamiento de cuenta
+                  </h1>
+                </div>
+                <p className="text-sm text-[#5A6877] leading-relaxed">
+                  {data.actor.accessError}
+                </p>
                 {authSession.user.isPlatformAdmin && (
                   <button
                     type="button"
                     onClick={() => setTab('admin')}
-                    className="px-4 py-2 text-sm font-medium text-slate-700 bg-white border border-slate-300 rounded-md hover:bg-slate-50"
+                    className="min-h-[44px] px-4 py-2 text-sm font-medium text-[#25364A] bg-white border border-[#DCE3E8] rounded-[9px] hover:bg-[#F7F8FA]"
                   >
-                    Ir a Admin Nala
+                    Ir a Administración Nala
                   </button>
                 )}
-              </div>
-            </section>
-          ) : (
-            <>
-              {tab === 'negocio' && (
-                <BusinessOverview
-                  data={data}
-                  business={activeBusiness}
-                  ctx={ctx}
-                  onRefresh={loadBootstrap}
-                  onError={setErrorMsg}
-                  onNotice={setNoticeMsg}
-                  onGoToSimulator={() => setTab('simulador')}
-                />
-              )}
-              {tab === 'diseno' && (
-                <FlowAndRulesDesigner
-                  data={data}
-                  business={activeBusiness}
-                  ctx={ctx}
-                  onRefresh={loadBootstrap}
-                  onError={setErrorMsg}
-                  onNotice={setNoticeMsg}
-                  onOpenDraftInSimulator={handleOpenDraftInSimulator}
-                />
-              )}
-              {tab === 'simulador' && (
-                <SimulatorWorkspace
-                  data={data}
-                  business={activeBusiness}
-                  ctx={ctx}
-                  initialConversationId={draftSimConvId}
-                  onRefresh={loadBootstrap}
-                  onError={setErrorMsg}
-                  onNotice={setNoticeMsg}
-                />
-              )}
-              {tab === 'operacion' && (
-                <OperationsWorkspace
-                  data={data}
-                  business={activeBusiness}
-                  ctx={ctx}
-                  onRefresh={loadBootstrap}
-                  onError={setErrorMsg}
-                  onNotice={setNoticeMsg}
-                />
-              )}
-            </>
-          )}
-        </div>
-      </main>
+              </section>
+            ) : (
+              <>
+                {tab === 'nala' && (
+                  <NalaHome
+                    businessName={activeBusiness.name}
+                    onGoToAssistant={() => setTab('asistente')}
+                    onGoToAttention={() => setTab('atencion')}
+                    onGoToManagement={() => setTab('gestion')}
+                  />
+                )}
+                {tab === 'asistente' && (
+                  <FlowAndRulesDesigner
+                    data={data}
+                    business={activeBusiness}
+                    ctx={ctx}
+                    onRefresh={loadBootstrap}
+                    onError={setErrorMsg}
+                    onNotice={setNoticeMsg}
+                    onOpenDraftInSimulator={handleOpenDraftInSimulator}
+                  />
+                )}
+                {tab === 'prueba' && (
+                  <SimulatorWorkspace
+                    data={data}
+                    business={activeBusiness}
+                    ctx={ctx}
+                    initialConversationId={draftSimConvId}
+                    onRefresh={loadBootstrap}
+                    onError={setErrorMsg}
+                    onNotice={setNoticeMsg}
+                    onBackToAssistant={() => setTab('asistente')}
+                  />
+                )}
+                {tab === 'atencion' && (
+                  <OperationsWorkspace
+                    view="atencion"
+                    data={data}
+                    business={activeBusiness}
+                    ctx={ctx}
+                    initialConversationId={attentionConvId}
+                    onRefresh={loadBootstrap}
+                    onError={setErrorMsg}
+                    onNotice={setNoticeMsg}
+                    onOpenGestion={() => setTab('gestion')}
+                  />
+                )}
+                {tab === 'gestion' && (
+                  <OperationsWorkspace
+                    view="gestion"
+                    data={data}
+                    business={activeBusiness}
+                    ctx={ctx}
+                    onRefresh={loadBootstrap}
+                    onError={setErrorMsg}
+                    onNotice={setNoticeMsg}
+                    onOpenAtencion={(convId) => {
+                      setAttentionConvId(convId ?? null);
+                      setTab('atencion');
+                    }}
+                  />
+                )}
+                {tab === 'negocio' && (
+                  <BusinessOverview
+                    data={data}
+                    business={activeBusiness}
+                    ctx={ctx}
+                    onRefresh={loadBootstrap}
+                    onError={setErrorMsg}
+                    onNotice={setNoticeMsg}
+                    onGoToSimulator={() => setTab('prueba')}
+                  />
+                )}
+              </>
+            )}
+          </div>
+        </main>
+      </div>
     </div>
   );
 }
