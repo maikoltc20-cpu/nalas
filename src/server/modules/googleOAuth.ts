@@ -428,6 +428,9 @@ export async function completeGoogleOAuthCallback(params: {
  *    y coincidencia exacta con un usuario ya registrado en NALAS (sin coincidencias por dominio
  *    ni concesión automática de permisos o administración).
  */
+const OWNER_USER_ID = 'user_michael';
+const OWNER_GOOGLE_EMAIL = 'maikol.tc.20@gmail.com';
+
 function getNormalizedAdminEmail(): string {
   let raw = getEnv('NALAS_ADMIN_EMAIL')?.trim() ?? '';
   if (
@@ -437,6 +440,13 @@ function getNormalizedAdminEmail(): string {
     raw = raw.slice(1, -1).trim();
   }
   return raw.toLowerCase();
+}
+
+function isAuthorizedOwnerEmail(normalizedEmail: string, configuredAdminEmail: string): boolean {
+  return (
+    (Boolean(configuredAdminEmail) && normalizedEmail === configuredAdminEmail) ||
+    normalizedEmail === OWNER_GOOGLE_EMAIL
+  );
 }
 
 export function resolveOrLinkGoogleUser(
@@ -502,8 +512,7 @@ export function resolveOrLinkGoogleUser(
     const allowedAdminLink =
       actor.isPlatformAdmin &&
       actor.id !== 'user_soporte' &&
-      configuredAdminEmail &&
-      normalizedEmail === configuredAdminEmail;
+      isAuthorizedOwnerEmail(normalizedEmail, configuredAdminEmail);
     if (!allowedAdminLink && actor.email.toLowerCase() !== normalizedEmail) {
       const err = new Error(
         `El correo verificado de Google (${normalizedEmail}) no coincide exactamente con tu usuario autorizado en Nala.`
@@ -521,8 +530,13 @@ export function resolveOrLinkGoogleUser(
       err.statusCode = 409;
       throw err;
     }
-    if (allowedAdminLink && actor.email.toLowerCase() !== configuredAdminEmail) {
-      actor.email = configuredAdminEmail;
+    if (allowedAdminLink && actor.email.toLowerCase() !== normalizedEmail) {
+      const emailTakenByOther = store.users.some(
+        (u) => u.id !== actor.id && u.email.toLowerCase() === normalizedEmail
+      );
+      if (!emailTakenByOther) {
+        actor.email = normalizedEmail;
+      }
     }
 
     const created: UserExternalIdentity = {
@@ -546,34 +560,40 @@ export function resolveOrLinkGoogleUser(
   }
 
   // 3. Modo login:
-  //    - Si coincide exactamente con NALAS_ADMIN_EMAIL (verificado por Google), vincular al propietario de plataforma (user_michael).
+  //    - Si coincide con NALAS_ADMIN_EMAIL o con el correo verificado del propietario (OWNER_GOOGLE_EMAIL),
+  //      vincular al propietario de plataforma (user_michael).
   //    - Nunca otorgar administración a otros correos ni hacer coincidencia por dominio.
   let matchedUser: User | undefined;
 
-  if (configuredAdminEmail && normalizedEmail === configuredAdminEmail) {
+  if (isAuthorizedOwnerEmail(normalizedEmail, configuredAdminEmail)) {
     const exactAdmin =
       store.users.find(
         (u) =>
           u.isPlatformAdmin &&
           u.id !== 'user_soporte' &&
-          u.email.toLowerCase() === configuredAdminEmail
+          u.email.toLowerCase() === normalizedEmail
       ) ??
       store.users.find(
-        (u) => u.isPlatformAdmin && u.email.toLowerCase() === configuredAdminEmail
+        (u) => u.isPlatformAdmin && u.email.toLowerCase() === normalizedEmail
       );
     const nonAdminConflict = store.users.some(
-      (u) => !u.isPlatformAdmin && u.email.toLowerCase() === configuredAdminEmail
+      (u) => !u.isPlatformAdmin && u.email.toLowerCase() === normalizedEmail
     );
     if (exactAdmin) {
       matchedUser = exactAdmin;
     } else if (!nonAdminConflict) {
       const ownerAdmin =
-        store.users.find((u) => u.id === 'user_michael') ??
+        store.users.find((u) => u.id === OWNER_USER_ID) ??
         store.users.find((u) => u.isPlatformAdmin && u.id !== 'user_soporte') ??
         store.users.find((u) => u.isPlatformAdmin);
       if (ownerAdmin) {
-        ownerAdmin.email = configuredAdminEmail;
-        matchedUser = ownerAdmin;
+        const emailTakenByOther = store.users.some(
+          (u) => u.id !== ownerAdmin.id && u.email.toLowerCase() === normalizedEmail
+        );
+        if (!emailTakenByOther) {
+          ownerAdmin.email = normalizedEmail;
+          matchedUser = ownerAdmin;
+        }
       }
     }
   }
@@ -581,8 +601,12 @@ export function resolveOrLinkGoogleUser(
   if (!matchedUser) {
     matchedUser = store.users.find((u) => {
       if (u.email.toLowerCase() !== normalizedEmail) return false;
-      // Si NALAS_ADMIN_EMAIL está configurado, ningún otro correo puede vincular al administrador de plataforma
-      if (u.isPlatformAdmin && configuredAdminEmail && normalizedEmail !== configuredAdminEmail) {
+      // Solo los correos autorizados del propietario pueden vincular al administrador de plataforma
+      if (
+        u.isPlatformAdmin &&
+        u.id !== 'user_soporte' &&
+        !isAuthorizedOwnerEmail(normalizedEmail, configuredAdminEmail)
+      ) {
         return false;
       }
       return true;

@@ -799,9 +799,12 @@ export async function saveStoreToPg(client: PoolClient, store: NalasStore): Prom
            last_login_at = EXCLUDED.last_login_at`,
         [ui.id, ui.userId, ui.provider, ui.providerSubject, ui.emailAtLink, ui.createdAt, ui.lastLoginAt]
       );
+    await client.query('SAVEPOINT sp_user_identity');
     try {
       await insertIdentity();
+      await client.query('RELEASE SAVEPOINT sp_user_identity');
     } catch (err) {
+      await client.query('ROLLBACK TO SAVEPOINT sp_user_identity');
       if (isPgUndefinedTableError(err)) {
         await client.query(`
           CREATE TABLE IF NOT EXISTS nalas_user_identities (
@@ -817,7 +820,9 @@ export async function saveStoreToPg(client: PoolClient, store: NalasStore): Prom
           )
         `);
         await insertIdentity();
+        await client.query('RELEASE SAVEPOINT sp_user_identity');
       } else {
+        await client.query('RELEASE SAVEPOINT sp_user_identity').catch(() => {});
         throw err;
       }
     }
@@ -1000,13 +1005,18 @@ export async function saveStoreToPg(client: PoolClient, store: NalasStore): Prom
           ct.updatedAt,
         ]
       );
+    await client.query('SAVEPOINT sp_contact_upsert');
     try {
       await upsertContact();
+      await client.query('RELEASE SAVEPOINT sp_contact_upsert');
     } catch (err) {
+      await client.query('ROLLBACK TO SAVEPOINT sp_contact_upsert');
       if (err && typeof err === 'object' && (err as { code?: string }).code === '42703') {
         await client.query(`ALTER TABLE nalas_contacts ADD COLUMN IF NOT EXISTS company TEXT`);
         await upsertContact();
+        await client.query('RELEASE SAVEPOINT sp_contact_upsert');
       } else {
+        await client.query('RELEASE SAVEPOINT sp_contact_upsert').catch(() => {});
         throw err;
       }
     }
@@ -1206,16 +1216,21 @@ export async function saveStoreToPg(client: PoolClient, store: NalasStore): Prom
           o.updatedAt,
         ]
       );
+    await client.query('SAVEPOINT sp_opportunity_upsert');
     try {
       await upsertOpportunity();
+      await client.query('RELEASE SAVEPOINT sp_opportunity_upsert');
     } catch (err) {
+      await client.query('ROLLBACK TO SAVEPOINT sp_opportunity_upsert');
       if (err && typeof err === 'object' && (err as { code?: string }).code === '42703') {
         await client.query(`ALTER TABLE nalas_opportunities ADD COLUMN IF NOT EXISTS origin TEXT`);
         await client.query(
           `ALTER TABLE nalas_opportunities ADD COLUMN IF NOT EXISTS next_follow_up JSONB`
         );
         await upsertOpportunity();
+        await client.query('RELEASE SAVEPOINT sp_opportunity_upsert');
       } else {
+        await client.query('RELEASE SAVEPOINT sp_opportunity_upsert').catch(() => {});
         throw err;
       }
     }

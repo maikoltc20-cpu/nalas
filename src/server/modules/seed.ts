@@ -130,7 +130,7 @@ export function createInitialStore(): NalasStore {
       {
         id: 'user_michael',
         name: 'Michael',
-        email: 'michael@nexotechnologies.io',
+        email: 'maikol.tc.20@gmail.com',
         isPlatformAdmin: true,
       },
       {

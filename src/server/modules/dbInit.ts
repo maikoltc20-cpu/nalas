@@ -83,7 +83,7 @@ export function isAuthorizedForInitialSetup(params: {
 }): boolean {
   const configuredInitSecret = getEnv('NALAS_INIT_SECRET')?.trim();
   const configuredAdminEmail = (
-    getEnv('NALAS_ADMIN_EMAIL')?.trim() || 'michael@nexotechnologies.io'
+    getEnv('NALAS_ADMIN_EMAIL')?.trim() || 'maikol.tc.20@gmail.com'
   ).toLowerCase();
   const configuredAdminPassword = getEnv('NALAS_ADMIN_PASSWORD');
 
@@ -190,20 +190,19 @@ export async function initializeDatabaseControlled(options?: {
       const configuredAdminEmail = getEnv('NALAS_ADMIN_EMAIL')?.trim().toLowerCase();
       const configuredAdminPassword = getEnv('NALAS_ADMIN_PASSWORD');
 
-      if (configuredAdminEmail) {
-        const defaultAdmin = store.users.find((u) => u.id === 'user_michael');
-        const emailAlreadyUsed = store.users.some(
-          (u) => u.id !== 'user_michael' && u.email.toLowerCase() === configuredAdminEmail
-        );
-        if (
-          defaultAdmin &&
-          defaultAdmin.email.toLowerCase() === 'michael@nexotechnologies.io' &&
-          !emailAlreadyUsed &&
-          defaultAdmin.email.toLowerCase() !== configuredAdminEmail
-        ) {
-          defaultAdmin.email = configuredAdminEmail;
-          changed = true;
-        }
+      const targetOwnerEmail = configuredAdminEmail || 'maikol.tc.20@gmail.com';
+      const defaultAdmin = store.users.find((u) => u.id === 'user_michael');
+      const emailAlreadyUsed = store.users.some(
+        (u) => u.id !== 'user_michael' && u.email.toLowerCase() === targetOwnerEmail
+      );
+      if (
+        defaultAdmin &&
+        defaultAdmin.email.toLowerCase() === 'michael@nexotechnologies.io' &&
+        !emailAlreadyUsed &&
+        defaultAdmin.email.toLowerCase() !== targetOwnerEmail
+      ) {
+        defaultAdmin.email = targetOwnerEmail;
+        changed = true;
       }
 
       if (configuredAdminPassword) {
