@@ -76,9 +76,28 @@ export default function App() {
     if (typeof window !== 'undefined') {
       const params = new URLSearchParams(window.location.search);
       const authError = params.get('authError');
+      const metaSignupStatus = params.get('metaSignupStatus');
+      const metaSignupMessage = params.get('metaSignupMessage');
+      let mutated = false;
       if (authError) {
         setErrorMsg(authError);
         params.delete('authError');
+        mutated = true;
+      }
+      if (metaSignupStatus || metaSignupMessage) {
+        if (metaSignupStatus === 'error') {
+          setErrorMsg(metaSignupMessage || 'No se pudo completar el registro con Meta.');
+        } else {
+          setNoticeMsg(
+            metaSignupMessage || 'Estado de registro alojado de Meta actualizado.'
+          );
+        }
+        setTab('admin');
+        params.delete('metaSignupStatus');
+        params.delete('metaSignupMessage');
+        mutated = true;
+      }
+      if (mutated) {
         const nextSearch = params.toString();
         const nextUrl = `${window.location.pathname}${nextSearch ? `?${nextSearch}` : ''}${window.location.hash}`;
         window.history.replaceState({}, '', nextUrl);

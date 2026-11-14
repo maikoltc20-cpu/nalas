@@ -340,6 +340,31 @@ export const nalasApi = {
       verifyToken: string;
       verifyTokenSource: 'env' | 'database' | 'server_file';
       outboundEnabled: boolean;
+      embeddedSignup: {
+        redirectUri: string;
+        startPath: string;
+        appIdConfigured: boolean;
+        appSecretConfigured: boolean;
+        configIdConfigured: boolean;
+        launchReady: boolean;
+        exchangeReady: boolean;
+        connectionState: {
+          status: 'pendiente' | 'conectado' | 'error';
+          businessId: string;
+          connectionId: string;
+          wabaId?: string;
+          phoneNumberId?: string;
+          displayPhoneNumber?: string;
+          verifiedName?: string;
+          platformType?: string;
+          coexistenceMode: true;
+          subscribedToWaba: boolean;
+          tokenExchanged: boolean;
+          statusReason: string;
+          lastError?: string;
+          updatedAt?: string;
+        };
+      };
       envStatus: {
         appSecretConfigured: boolean;
         verifyTokenOverriddenByEnv: boolean;

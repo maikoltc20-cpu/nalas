@@ -74,6 +74,16 @@ import {
   swapConnectionAdapter,
 } from './modules/integrations.ts';
 import {
+  buildClearMetaSignupCookieHeader,
+  completeMetaEmbeddedSignupExchange,
+  createMetaConfirmToken,
+  createMetaEmbeddedSignupRequest,
+  getMetaTargetBusinessId,
+  saveMetaEmbeddedSignupState,
+  verifyMetaConfirmToken,
+  verifyMetaSignupCallbackState,
+} from './modules/metaEmbeddedSignup.ts';
+import {
   getMetaIntegrationConfig,
   isMetaOutboundEnabled,
   processDueOutboxRetries,
@@ -594,6 +604,15 @@ webApp.use('/api/*', async (c, next) => {
     }
     const uid = await resolveAuthenticatedUserFromCookieHeader(c.req.header('cookie'));
     if (!uid) {
+      if (
+        pathname.startsWith('/api/integrations/meta/embedded-signup/') &&
+        (c.req.header('accept') || '').includes('text/html')
+      ) {
+        return new Response(
+          `<!doctype html><html lang="es"><head><meta charset="utf-8"><title>Sesión requerida · Nala</title></head><body style="font-family:system-ui,sans-serif;background:#F7F8FA;color:#25364A;padding:40px;"><div style="max-width:520px;margin:0 auto;background:#fff;border:1px solid #E2E7EB;border-radius:13px;padding:24px;"><h1 style="font-size:18px;margin:0 0 10px;">Iniciá sesión en Nala para completar la conexión</h1><p style="font-size:14px;color:#5A6877;line-height:1.5;">Tu sesión de administrador no está activa en este navegador. Iniciá sesión en Nala y luego volvé a ejecutar el enlace de Meta.</p><a href="/" style="display:inline-block;margin-top:12px;background:#167D83;color:#fff;text-decoration:none;padding:10px 16px;border-radius:9px;font-size:14px;font-weight:600;">Ir a Nala</a></div></body></html>`,
+          { status: 401, headers: { 'Content-Type': 'text/html; charset=utf-8' } }
+        );
+      }
       return c.json(
         { error: 'Sesión no autenticada. Iniciá sesión para acceder al panel.' },
         { status: 401 }
@@ -1264,6 +1283,275 @@ webApp.post('/api/integrations/meta/verify-token/regenerate', async (c) => {
     });
     const rotated = await regenerateServerVerifyToken();
     return c.json({ verifyToken: rotated.token, verifyTokenSource: rotated.source });
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+function escapeHtml(raw: string): string {
+  return raw
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function buildMetaSignupRedirect(
+  request: Request,
+  status: 'conectado' | 'pendiente' | 'error',
+  message: string,
+  clearCookieHeader?: string
+): Response {
+  let baseUrl = '';
+  try {
+    baseUrl = resolveSafeAppBaseUrl(request);
+  } catch {
+    baseUrl = '';
+  }
+  const headers = new Headers();
+  headers.set(
+    'Location',
+    `${baseUrl}/?metaSignupStatus=${encodeURIComponent(status)}&metaSignupMessage=${encodeURIComponent(message)}`
+  );
+  if (clearCookieHeader) {
+    headers.append('Set-Cookie', clearCookieHeader);
+  }
+  return new Response(null, { status: 302, headers });
+}
+
+webApp.get('/api/integrations/meta/embedded-signup/start', async (c) => {
+  const https = isHttpsRequest(c.req.raw, (n) => c.req.header(n));
+  const wantsJson = (c.req.header('accept') || '').includes('application/json') &&
+    !(c.req.header('accept') || '').includes('text/html');
+  try {
+    const userId = c.get('authUserId');
+    if (!userId) {
+      return c.json({ error: 'Sesión no autenticada.' }, { status: 401 });
+    }
+    const targetBusinessId =
+      String(c.req.query('businessId') || '').trim() || getMetaTargetBusinessId();
+    const store = await readStore();
+    const ctx = resolveActorContext(store, userId, targetBusinessId);
+    assertPermission(ctx, 'manageIntegrations');
+
+    const { authorizationUrl, stateCookieHeader } = await createMetaEmbeddedSignupRequest({
+      request: c.req.raw,
+      isHttps: https,
+      actorUserId: userId,
+      businessId: targetBusinessId,
+    });
+
+    if (wantsJson) {
+      const headers = new Headers({ 'Content-Type': 'application/json; charset=utf-8' });
+      headers.append('Set-Cookie', stateCookieHeader);
+      return new Response(JSON.stringify({ authorizationUrl }), { status: 200, headers });
+    }
+
+    const headers = new Headers();
+    headers.set('Location', authorizationUrl);
+    headers.append('Set-Cookie', stateCookieHeader);
+    return new Response(null, { status: 302, headers });
+  } catch (err) {
+    const statusCode = (err as { statusCode?: number })?.statusCode ?? 500;
+    const msg =
+      err instanceof Error
+        ? err.message
+        : 'No se pudo iniciar el registro alojado de Meta.';
+    if (wantsJson || statusCode === 403 || statusCode === 401) {
+      return c.json({ error: msg }, { status: statusCode as 401 | 403 | 500 | 503 });
+    }
+    return buildMetaSignupRedirect(c.req.raw, 'error', msg);
+  }
+});
+
+async function handleMetaEmbeddedSignupCallback(c: {
+  get: (key: 'authUserId') => string | undefined;
+  req: {
+    raw: Request;
+    query: (name: string) => string | undefined;
+    header: (name: string) => string | undefined;
+  };
+}): Promise<Response> {
+  const https = isHttpsRequest(c.req.raw, (n) => c.req.header(n));
+  const clearCookie = buildClearMetaSignupCookieHeader(https);
+
+  try {
+    const userId = c.get('authUserId');
+    if (!userId) {
+      return new Response(JSON.stringify({ error: 'Sesión no autenticada.' }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json; charset=utf-8' },
+      });
+    }
+    const targetBusinessId = getMetaTargetBusinessId();
+    const store = await readStore();
+    const ctx = resolveActorContext(store, userId, targetBusinessId);
+    assertPermission(ctx, 'manageIntegrations');
+
+    const oauthError = c.req.query('error');
+    const oauthErrorDescription =
+      c.req.query('error_description') || c.req.query('error_reason') || oauthError;
+    if (oauthError) {
+      const msg =
+        oauthError === 'access_denied'
+          ? 'Registro de WhatsApp cancelado o no autorizado en Meta.'
+          : `Meta devolvió un error de autorización: ${oauthErrorDescription}`;
+      await saveMetaEmbeddedSignupState({
+        status: oauthError === 'access_denied' ? 'pendiente' : 'error',
+        businessId: targetBusinessId,
+        connectionId: 'conn_nexo_wa_prod',
+        coexistenceMode: true,
+        subscribedToWaba: false,
+        tokenExchanged: false,
+        statusReason: msg,
+        lastError: oauthError === 'access_denied' ? undefined : msg,
+      });
+      return buildMetaSignupRedirect(
+        c.req.raw,
+        oauthError === 'access_denied' ? 'pendiente' : 'error',
+        msg,
+        clearCookie
+      );
+    }
+
+    const code = c.req.query('code')?.trim();
+    const stateParam = c.req.query('state')?.trim();
+    const wabaIdHint = c.req.query('waba_id')?.trim();
+    const phoneNumberIdHint = c.req.query('phone_number_id')?.trim();
+
+    if (!code) {
+      const msg = 'Meta no devolvió un código de autorización (code).';
+      await saveMetaEmbeddedSignupState({
+        status: 'error',
+        businessId: targetBusinessId,
+        connectionId: 'conn_nexo_wa_prod',
+        coexistenceMode: true,
+        subscribedToWaba: false,
+        tokenExchanged: false,
+        statusReason: msg,
+        lastError: msg,
+      });
+      return buildMetaSignupRedirect(c.req.raw, 'error', msg, clearCookie);
+    }
+
+    const stateCheck = await verifyMetaSignupCallbackState({
+      cookieHeader: c.req.header('cookie'),
+      stateParam,
+      actorUserId: userId,
+    });
+
+    if (stateCheck.mode === 'invalid') {
+      await saveMetaEmbeddedSignupState({
+        status: 'error',
+        businessId: targetBusinessId,
+        connectionId: 'conn_nexo_wa_prod',
+        coexistenceMode: true,
+        subscribedToWaba: false,
+        tokenExchanged: false,
+        statusReason: stateCheck.reason,
+        lastError: stateCheck.reason,
+      });
+      return buildMetaSignupRedirect(c.req.raw, 'error', stateCheck.reason, clearCookie);
+    }
+
+    if (stateCheck.mode === 'no_cookie') {
+      const confirmToken = await createMetaConfirmToken({
+        actorUserId: userId,
+        code,
+        businessId: targetBusinessId,
+        wabaIdHint,
+        phoneNumberIdHint,
+      });
+      const detailsHtml = [
+        wabaIdHint ? `<li>WABA detectado en retorno: <code>${escapeHtml(wabaIdHint)}</code></li>` : '',
+        phoneNumberIdHint
+          ? `<li>Phone Number ID detectado en retorno: <code>${escapeHtml(phoneNumberIdHint)}</code></li>`
+          : '',
+      ]
+        .filter(Boolean)
+        .join('');
+
+      return new Response(
+        `<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Confirmar conexión WhatsApp · Nala</title></head><body style="font-family:system-ui,sans-serif;background:#F7F8FA;color:#25364A;padding:32px 16px;"><div style="max-width:540px;margin:0 auto;background:#fff;border:1px solid #E2E7EB;border-radius:13px;padding:28px;"><h1 style="font-size:20px;margin:0 0 10px;">Confirmar vinculación con Meta (Coexistencia)</h1><p style="font-size:14px;color:#5A6877;line-height:1.5;margin:0 0 16px;">Recibimos el retorno OAuth de Meta para el negocio <strong>${escapeHtml(targetBusinessId)}</strong>. Confirmá la vinculación para intercambiar el código en el servidor, consultar tus identificadores y suscribir la aplicación al WABA sin desconectar tu iPhone.</p>${detailsHtml ? `<ul style="font-size:13px;color:#25364A;margin:0 0 18px;padding-left:18px;">${detailsHtml}</ul>` : ''}<form method="POST" action="/api/integrations/meta/embedded-signup/complete" style="display:flex;gap:12px;flex-wrap:wrap;"><input type="hidden" name="confirmToken" value="${escapeHtml(confirmToken)}"><button type="submit" style="background:#167D83;color:#fff;border:0;border-radius:9px;padding:11px 18px;font-size:14px;font-weight:600;cursor:pointer;">Confirmar vinculación en NEXO</button><a href="/" style="display:inline-flex;align-items:center;padding:11px 16px;border:1px solid #DCE3E8;border-radius:9px;color:#25364A;text-decoration:none;font-size:14px;">Cancelar</a></form></div></body></html>`,
+        { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } }
+      );
+    }
+
+    const result = await completeMetaEmbeddedSignupExchange({
+      request: c.req.raw,
+      code,
+      businessId: stateCheck.businessId,
+      actorUserId: userId,
+      redirectUriOverride: stateCheck.redirectUri,
+      allowEmptyRedirectUriFallback: false,
+      wabaIdHint,
+      phoneNumberIdHint,
+    });
+
+    return buildMetaSignupRedirect(c.req.raw, result.status, result.statusReason, clearCookie);
+  } catch (err) {
+    const statusCode = (err as { statusCode?: number })?.statusCode;
+    if (statusCode === 401 || statusCode === 403) {
+      return errorResponse(err);
+    }
+    const msg =
+      err instanceof Error ? err.message : 'Error procesando el retorno OAuth de Meta.';
+    return buildMetaSignupRedirect(c.req.raw, 'error', msg, clearCookie);
+  }
+}
+
+webApp.get('/api/integrations/meta/embedded-signup/callback', (c) =>
+  handleMetaEmbeddedSignupCallback(c)
+);
+webApp.get('/api/integrations/meta/embedded-signup/callback/', (c) =>
+  handleMetaEmbeddedSignupCallback(c)
+);
+
+webApp.post('/api/integrations/meta/embedded-signup/complete', async (c) => {
+  try {
+    const userId = c.get('authUserId');
+    if (!userId) {
+      return c.json({ error: 'Sesión no autenticada.' }, { status: 401 });
+    }
+    const targetBusinessId = getMetaTargetBusinessId();
+    const store = await readStore();
+    const ctx = resolveActorContext(store, userId, targetBusinessId);
+    assertPermission(ctx, 'manageIntegrations');
+
+    let confirmToken = '';
+    const contentType = c.req.header('content-type') || '';
+    if (contentType.includes('application/json')) {
+      const body = (await c.req.json().catch(() => ({}))) as { confirmToken?: string };
+      confirmToken = String(body.confirmToken || '').trim();
+    } else {
+      const formBody = await c.req.parseBody().catch(() => ({}));
+      confirmToken = String((formBody as Record<string, unknown>).confirmToken || '').trim();
+    }
+
+    const verified = await verifyMetaConfirmToken(confirmToken, userId);
+    if (!verified) {
+      const msg = 'La confirmación temporal expiró o no corresponde a tu sesión.';
+      if (contentType.includes('application/json')) {
+        return c.json({ error: msg }, { status: 400 });
+      }
+      return buildMetaSignupRedirect(c.req.raw, 'error', msg);
+    }
+
+    const result = await completeMetaEmbeddedSignupExchange({
+      request: c.req.raw,
+      code: verified.code,
+      businessId: verified.businessId,
+      actorUserId: userId,
+      allowEmptyRedirectUriFallback: true,
+      wabaIdHint: verified.wabaIdHint,
+      phoneNumberIdHint: verified.phoneNumberIdHint,
+    });
+
+    if (contentType.includes('application/json')) {
+      return c.json(result);
+    }
+    return buildMetaSignupRedirect(c.req.raw, result.status, result.statusReason);
   } catch (err) {
     return errorResponse(err);
   }

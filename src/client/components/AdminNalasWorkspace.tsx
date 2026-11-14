@@ -754,11 +754,23 @@ export function AdminNalasWorkspace({
                     </div>
                   </div>
 
-                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 text-xs">
+                    <div className="p-3 bg-[#F7F8FA] border border-[#E2E7EB] rounded-[9px] flex items-center justify-between gap-2">
+                      <span className="font-mono text-[#25364A]">META_APP_ID</span>
+                      <span className={metaConfig.embeddedSignup.appIdConfigured ? 'text-[#116B70] font-semibold' : 'text-[#8C542C] font-semibold'}>
+                        {metaConfig.embeddedSignup.appIdConfigured ? 'Configurada' : 'Pendiente'}
+                      </span>
+                    </div>
                     <div className="p-3 bg-[#F7F8FA] border border-[#E2E7EB] rounded-[9px] flex items-center justify-between gap-2">
                       <span className="font-mono text-[#25364A]">META_APP_SECRET</span>
                       <span className={metaConfig.envStatus.appSecretConfigured ? 'text-[#116B70] font-semibold' : 'text-[#8C542C] font-semibold'}>
                         {metaConfig.envStatus.appSecretConfigured ? 'Configurada' : 'Pendiente'}
+                      </span>
+                    </div>
+                    <div className="p-3 bg-[#F7F8FA] border border-[#E2E7EB] rounded-[9px] flex items-center justify-between gap-2">
+                      <span className="font-mono text-[#25364A]">META_EMBEDDED_SIGNUP_CONFIG_ID</span>
+                      <span className={metaConfig.embeddedSignup.configIdConfigured ? 'text-[#116B70] font-semibold' : 'text-[#8C542C] font-semibold'}>
+                        {metaConfig.embeddedSignup.configIdConfigured ? 'Configurada' : 'Pendiente'}
                       </span>
                     </div>
                     <div className="p-3 bg-[#F7F8FA] border border-[#E2E7EB] rounded-[9px] flex items-center justify-between gap-2">
@@ -778,6 +790,109 @@ export function AdminNalasWorkspace({
                       <span className={metaConfig.envStatus.outboundEnabled ? 'text-[#116B70] font-semibold' : 'text-[#5A6877] font-semibold'}>
                         {metaConfig.envStatus.outboundEnabled ? 'Activo' : 'Pausado'}
                       </span>
+                    </div>
+                  </div>
+
+                  <div className="p-4 border border-[#E2E7EB] rounded-[10px] space-y-3 bg-[#F7F8FA]">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <h3 className="text-sm font-semibold text-[#25364A]">
+                          Registro insertado alojado por Meta (Coexistencia iPhone)
+                        </h3>
+                        <p className="text-xs text-[#5A6877] mt-0.5">
+                          Conecta el número existente sin re-registrarlo ni desconectar la app WhatsApp Business del iPhone.
+                        </p>
+                      </div>
+                      <span
+                        className={`text-xs font-semibold px-2.5 py-1 rounded border ${
+                          metaConfig.embeddedSignup.connectionState.status === 'conectado'
+                            ? 'bg-[#EAF5F2] text-[#116B70] border-[#C6E5DF]'
+                            : metaConfig.embeddedSignup.connectionState.status === 'error'
+                              ? 'bg-red-50 text-red-700 border-red-200'
+                              : 'bg-[#FFF0E3] text-[#8C542C] border-[#F2D7BF]'
+                        }`}
+                      >
+                        {metaConfig.embeddedSignup.connectionState.status === 'conectado'
+                          ? 'Conectado'
+                          : metaConfig.embeddedSignup.connectionState.status === 'error'
+                            ? 'Error'
+                            : 'Pendiente'}
+                      </span>
+                    </div>
+
+                    <div className="space-y-1.5">
+                      <div className="text-xs font-medium text-[#5A6877]">
+                        URI de redireccionamiento OAuth (pegar en Meta → Generar enlace)
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <code className="flex-1 text-xs font-mono bg-white border border-[#E2E7EB] rounded px-3 py-2 text-[#25364A] break-all">
+                          {metaConfig.embeddedSignup.redirectUri}
+                        </code>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            handleCopyText('oauth_redirect', metaConfig.embeddedSignup.redirectUri)
+                          }
+                          className="inline-flex items-center gap-1.5 min-h-[40px] px-3 py-2 text-xs font-medium text-[#25364A] bg-white border border-[#DCE3E8] rounded-[8px] hover:bg-[#F7F8FA] shrink-0"
+                        >
+                          {copiedField === 'oauth_redirect' ? (
+                            <Check className="w-3.5 h-3.5 text-[#167D83]" />
+                          ) : (
+                            <Copy className="w-3.5 h-3.5" />
+                          )}
+                          <span>{copiedField === 'oauth_redirect' ? 'Copiada' : 'Copiar'}</span>
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="text-xs text-[#25364A] leading-relaxed">
+                      {metaConfig.embeddedSignup.connectionState.statusReason}
+                    </div>
+
+                    {(metaConfig.embeddedSignup.connectionState.wabaId ||
+                      metaConfig.embeddedSignup.connectionState.phoneNumberId ||
+                      metaConfig.embeddedSignup.connectionState.displayPhoneNumber) && (
+                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs">
+                        <div className="p-2.5 bg-white border border-[#E2E7EB] rounded">
+                          <span className="text-[#5A6877] block">WABA ID</span>
+                          <span className="font-mono text-[#25364A]">
+                            {metaConfig.embeddedSignup.connectionState.wabaId ?? 'Pendiente'}
+                          </span>
+                        </div>
+                        <div className="p-2.5 bg-white border border-[#E2E7EB] rounded">
+                          <span className="text-[#5A6877] block">Phone Number ID</span>
+                          <span className="font-mono text-[#25364A]">
+                            {metaConfig.embeddedSignup.connectionState.phoneNumberId ?? 'Pendiente'}
+                          </span>
+                        </div>
+                        <div className="p-2.5 bg-white border border-[#E2E7EB] rounded">
+                          <span className="text-[#5A6877] block">Número · Suscripción</span>
+                          <span className="font-mono text-[#25364A]">
+                            {metaConfig.embeddedSignup.connectionState.displayPhoneNumber ?? 'Sin número'} ·{' '}
+                            {metaConfig.embeddedSignup.connectionState.subscribedToWaba ? 'Suscrita' : 'Pendiente'}
+                          </span>
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+                      <p className="text-xs text-[#5A6877]">
+                        {metaConfig.embeddedSignup.launchReady
+                          ? 'Listo para iniciar el flujo oficial desde Nala o desde el enlace generado en Meta.'
+                          : 'Para iniciar desde este botón configurá META_APP_ID y META_EMBEDDED_SIGNUP_CONFIG_ID en Cloudflare. Si usás "Generar enlace" en Meta, pegá la URI OAuth de arriba.'}
+                      </p>
+                      <button
+                        type="button"
+                        disabled={busy || !metaConfig.embeddedSignup.launchReady}
+                        onClick={() => {
+                          window.location.assign(
+                            `${metaConfig.embeddedSignup.startPath}?businessId=${encodeURIComponent(business.id)}`
+                          );
+                        }}
+                        className="inline-flex items-center gap-2 min-h-[40px] px-4 py-2 text-xs font-semibold text-white bg-[#167D83] rounded-[9px] hover:bg-[#116B70] disabled:opacity-50 whitespace-nowrap shrink-0"
+                      >
+                        <span>Conectar WhatsApp (Coexistencia)</span>
+                      </button>
                     </div>
                   </div>
                 </section>

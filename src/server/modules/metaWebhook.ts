@@ -14,6 +14,7 @@ import {
   startOrGetSimulatorConversation,
 } from './conversations.ts';
 import { computeNextRetryIso } from './integrations.ts';
+import { getMetaEmbeddedSignupOverview } from './metaEmbeddedSignup.ts';
 import { getStorageBackendInfo, withStoreTransaction } from './persistence.ts';
 import { resolveSafeAppBaseUrl } from './urlHelper.ts';
 
@@ -242,6 +243,7 @@ export async function getMetaIntegrationConfig(requestOrigin?: string) {
   const storageInfo = getStorageBackendInfo();
   const kService = getEnv('K_SERVICE') || null;
   const isWorkers = isWorkerRuntime();
+  const embeddedSignup = await getMetaEmbeddedSignupOverview(baseUrl);
 
   return {
     targetBusinessId: getEnv('META_BUSINESS_ID')?.trim() || 'biz_nexo',
@@ -250,6 +252,7 @@ export async function getMetaIntegrationConfig(requestOrigin?: string) {
     verifyToken: token,
     verifyTokenSource: source,
     outboundEnabled: isMetaOutboundEnabled(),
+    embeddedSignup,
     envStatus: {
       appSecretConfigured: Boolean(getEnv('META_APP_SECRET')?.trim()),
       verifyTokenOverriddenByEnv: Boolean(getEnv('META_VERIFY_TOKEN')?.trim()),
