@@ -7,7 +7,14 @@ import { BusinessOverview } from './client/components/BusinessOverview';
 import { FlowAndRulesDesigner } from './client/components/FlowAndRulesDesigner';
 import { NalaHome } from './client/components/NalaHome';
 import { OperationsWorkspace } from './client/components/OperationsWorkspace';
+import { PrivacyPolicyPage } from './client/components/PrivacyPolicyPage';
 import { SimulatorWorkspace } from './client/components/SimulatorWorkspace';
+
+function isPrivacyPolicyRoute(): boolean {
+  if (typeof window === 'undefined') return false;
+  const normalized = window.location.pathname.replace(/\/+$/, '') || '/';
+  return normalized === '/privacidad';
+}
 
 type WorkspaceTab =
   | 'nala'
@@ -59,7 +66,13 @@ export default function App() {
     }
   }, []);
 
+  const isPrivacyRoute = isPrivacyPolicyRoute();
+
   useEffect(() => {
+    if (isPrivacyRoute) {
+      setAuthLoading(false);
+      return;
+    }
     if (typeof window !== 'undefined') {
       const params = new URLSearchParams(window.location.search);
       const authError = params.get('authError');
@@ -72,7 +85,7 @@ export default function App() {
       }
     }
     loadSession();
-  }, [loadSession]);
+  }, [isPrivacyRoute, loadSession]);
 
   const loadBootstrap = useCallback(async () => {
     if (!authSession?.authenticated || !authSession.user) return;
@@ -178,6 +191,10 @@ export default function App() {
   function navigateTo(nextTab: WorkspaceTab) {
     setTab(nextTab);
     setMobileMenuOpen(false);
+  }
+
+  if (isPrivacyRoute) {
+    return <PrivacyPolicyPage />;
   }
 
   if (authLoading) {
@@ -461,6 +478,14 @@ export default function App() {
               </div>
             </div>
           )}
+          <div className="pt-2 border-t border-[#E5E9ED] text-center">
+            <a
+              href="/privacidad"
+              className="text-xs text-[#167D83] hover:text-[#116B70] hover:underline"
+            >
+              Política de privacidad
+            </a>
+          </div>
         </div>
       </div>
     );
