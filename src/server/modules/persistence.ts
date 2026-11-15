@@ -191,9 +191,12 @@ export function upgradeOptingDraftIfStale(store: NalasStore): boolean {
 
 function assertFileDevAllowed(): void {
   if (isWorkerRuntime() || getEnv('NODE_ENV') === 'production') {
-    throw new Error(
+    const err = new Error(
       'DATABASE_URL (Neon PostgreSQL) es obligatorio en Cloudflare Workers y en producción.'
-    );
+    ) as Error & { statusCode?: number; code?: string };
+    err.statusCode = 503;
+    err.code = 'MISSING_DATABASE_URL';
+    throw err;
   }
 }
 

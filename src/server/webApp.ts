@@ -98,9 +98,12 @@ import {
 import {
   createWasapFlowConnectSession,
   getWasapFlowOverview,
+  logWasapFlowStage,
   processDueWasapFlowOutboxRetries,
   processWasapFlowWebhookEvent,
+  recordRejectedWasapFlowSignatureAudit,
   retrySingleWasapFlowOutbox,
+  sanitizeWebhookErrorDetail,
   verifyAndLinkWasapFlowNumber,
   verifyWasapFlowWebhookSignature,
   WASAPFLOW_CONNECTION_ID,
@@ -115,7 +118,7 @@ import {
   restoreBackupSnapshot,
   withStoreTransaction,
 } from './modules/persistence.ts';
-import { getEnv, isWorkerRuntime } from './runtimeContext.ts';
+import { getEnv, getRequestId, isWorkerRuntime } from './runtimeContext.ts';
 
 type AppVariables = {
   authUserId?: string;
@@ -1778,38 +1781,141 @@ webApp.post('/api/integrations/wasapflow/verify', async (c) => {
 });
 
 webApp.post(WASAPFLOW_WEBHOOK_PATH, async (c) => {
+  const reqStartMs = Date.now();
+  const cfRay = c.req.header('cf-ray')?.trim();
+  const requestId =
+    getRequestId() ||
+    (cfRay
+      ? `wf_${cfRay.slice(0, 12)}_${Math.random().toString(36).slice(2, 6)}`
+      : `wf_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`);
+  const eventHeader = c.req.header('x-wasapflow-event')?.trim();
+  let currentStage = 'read_body';
+
   try {
     const rawBytes = new Uint8Array(await c.req.arrayBuffer());
+    const readDoneMs = Date.now();
+    logWasapFlowStage('info', {
+      requestId,
+      stage: 'webhook_body_read',
+      eventHeader,
+      bodyBytes: rawBytes.byteLength,
+      durationMs: readDoneMs - reqStartMs,
+    });
+
+    currentStage = 'hmac_verify';
     const signatureHeader = c.req.header('x-wasapflow-signature');
     const sigCheck = await verifyWasapFlowWebhookSignature(rawBytes, signatureHeader);
+    const sigDoneMs = Date.now();
+    logWasapFlowStage('info', {
+      requestId,
+      stage: 'hmac_verified',
+      ok: sigCheck.ok,
+      httpStatus: sigCheck.ok ? undefined : sigCheck.status,
+      durationMs: sigDoneMs - readDoneMs,
+    });
 
     if (!sigCheck.ok) {
       try {
-        await withStoreTransaction((store) => {
-          appendAudit(store, {
-            businessId: getMetaTargetBusinessId(),
-            environment: 'produccion',
-            actorUserId: 'integraciones',
-            module: 'integraciones',
-            action: 'webhook_wasapflow_rechazado',
-            detail: sigCheck.reason,
-          });
-        });
+        await recordRejectedWasapFlowSignatureAudit(sigCheck.reason);
       } catch {
         // Preservar respuesta 401/503 aunque falle el registro de auditoría
       }
-      return new Response(JSON.stringify({ error: sigCheck.reason }), {
+      logWasapFlowStage('error', {
+        requestId,
+        stage: 'rejected_signature',
+        httpStatus: sigCheck.status,
+        totalDurationMs: Date.now() - reqStartMs,
+      });
+      return new Response(JSON.stringify({ error: sigCheck.reason, requestId }), {
         status: sigCheck.status,
         headers: { 'Content-Type': 'application/json; charset=utf-8' },
       });
     }
 
+    currentStage = 'json_parse';
     const bodyText = new TextDecoder().decode(rawBytes);
-    const payload = (bodyText ? JSON.parse(bodyText) : {}) as WasapFlowWebhookPayload;
-    const summary = await processWasapFlowWebhookEvent(payload);
-    return c.json({ status: 'ok', ...summary }, { status: 200 });
+    let payload: WasapFlowWebhookPayload;
+    try {
+      payload = (bodyText ? JSON.parse(bodyText) : {}) as WasapFlowWebhookPayload;
+    } catch {
+      logWasapFlowStage('error', {
+        requestId,
+        stage: 'invalid_json',
+        httpStatus: 400,
+        totalDurationMs: Date.now() - reqStartMs,
+      });
+      return new Response(
+        JSON.stringify({ error: 'Cuerpo JSON inválido en webhook WasapFlow.', requestId }),
+        {
+          status: 400,
+          headers: { 'Content-Type': 'application/json; charset=utf-8' },
+        }
+      );
+    }
+
+    const parseDoneMs = Date.now();
+    const payloadData = (payload.data ?? {}) as Record<string, unknown>;
+    logWasapFlowStage('info', {
+      requestId,
+      stage: 'payload_parsed',
+      event: (payload.event ?? eventHeader ?? '').trim() || undefined,
+      wabaId:
+        payload.waba_id?.trim() ||
+        (typeof payloadData.waba_id === 'string' ? payloadData.waba_id.trim() : undefined),
+      phoneNumberId:
+        payload.phone_number_id?.trim() ||
+        (typeof payloadData.phone_number_id === 'string'
+          ? payloadData.phone_number_id.trim()
+          : undefined),
+      durationMs: parseDoneMs - sigDoneMs,
+    });
+
+    currentStage = 'process_event';
+    const summary = await processWasapFlowWebhookEvent(payload, { requestId });
+    logWasapFlowStage('info', {
+      requestId,
+      stage: 'webhook_completed',
+      httpStatus: 200,
+      event: summary.event,
+      processedMessages: summary.processedMessages,
+      processedEchoes: summary.processedEchoes,
+      processedStatuses: summary.processedStatuses,
+      ignoredHistory: summary.ignoredHistory,
+      ignoredOther: summary.ignoredOther,
+      deduplicated: summary.deduplicated,
+      durationMs: Date.now() - parseDoneMs,
+      totalDurationMs: Date.now() - reqStartMs,
+    });
+
+    return c.json({ status: 'ok', requestId, ...summary }, { status: 200 });
   } catch (err) {
-    return errorResponse(err);
+    const rawStatus = (err as { statusCode?: number })?.statusCode;
+    const httpStatus =
+      typeof rawStatus === 'number' && rawStatus >= 400 && rawStatus <= 599 ? rawStatus : 500;
+    const errorCode = (err as { code?: string })?.code;
+    const errorDetail = sanitizeWebhookErrorDetail(err);
+
+    logWasapFlowStage('error', {
+      requestId,
+      stage: `failed_${currentStage}`,
+      httpStatus,
+      errorName: err instanceof Error ? err.name : 'UnknownError',
+      errorCode,
+      errorDetail,
+      totalDurationMs: Date.now() - reqStartMs,
+    });
+
+    return new Response(
+      JSON.stringify({
+        error: errorDetail || 'Error interno procesando webhook WasapFlow.',
+        code: errorCode,
+        requestId,
+      }),
+      {
+        status: httpStatus,
+        headers: { 'Content-Type': 'application/json; charset=utf-8' },
+      }
+    );
   }
 });
 

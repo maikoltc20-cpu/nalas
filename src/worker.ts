@@ -27,18 +27,74 @@ function toStringEnvMap(env: WorkerEnv): Record<string, string | undefined> {
   return map;
 }
 
+function buildSafeRequestId(request: Request): string {
+  const cfRay = request.headers.get('cf-ray')?.trim();
+  const suffix = globalThis.crypto?.randomUUID
+    ? globalThis.crypto.randomUUID().slice(0, 8)
+    : Math.random().toString(36).slice(2, 10);
+  return cfRay ? `wf_${cfRay.slice(0, 12)}_${suffix}` : `wf_${suffix}`;
+}
+
 export default {
   async fetch(request: Request, env: WorkerEnv, ctx: WorkerExecContext): Promise<Response> {
     const url = new URL(request.url);
 
     if (url.pathname.startsWith('/api/')) {
+      const isWasapFlowWebhook = url.pathname === '/api/webhooks/wasapflow';
+      const requestId = isWasapFlowWebhook ? buildSafeRequestId(request) : undefined;
+      const startedAt = isWasapFlowWebhook ? Date.now() : 0;
+
+      if (isWasapFlowWebhook) {
+        console.info(
+          JSON.stringify({
+            tag: 'wasapflow_webhook',
+            requestId,
+            stage: 'worker_fetch_enter',
+            method: request.method,
+            pathname: url.pathname,
+            eventHeader: request.headers.get('x-wasapflow-event') || undefined,
+            hasSignatureHeader: Boolean(request.headers.get('x-wasapflow-signature')),
+          })
+        );
+      }
+
       return runWithRuntimeContext(
         {
           env: toStringEnvMap(env),
           execCtx: ctx,
           isWorker: true,
+          requestId,
         },
-        () => webApp.fetch(request)
+        async () => {
+          try {
+            const response = await webApp.fetch(request);
+            if (isWasapFlowWebhook) {
+              console.info(
+                JSON.stringify({
+                  tag: 'wasapflow_webhook',
+                  requestId,
+                  stage: 'worker_fetch_exit',
+                  httpStatus: response.status,
+                  durationMs: Date.now() - startedAt,
+                })
+              );
+            }
+            return response;
+          } catch (err) {
+            if (isWasapFlowWebhook) {
+              console.error(
+                JSON.stringify({
+                  tag: 'wasapflow_webhook',
+                  requestId,
+                  stage: 'worker_fetch_error',
+                  durationMs: Date.now() - startedAt,
+                  errorName: err instanceof Error ? err.name : 'UnknownError',
+                })
+              );
+            }
+            throw err;
+          }
+        }
       );
     }
 

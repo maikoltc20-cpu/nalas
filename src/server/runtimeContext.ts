@@ -10,6 +10,7 @@ interface RuntimeContextValue {
   env: RuntimeEnvMap;
   execCtx?: WorkerExecContext;
   isWorker: boolean;
+  requestId?: string;
 }
 
 const runtimeAls = new AsyncLocalStorage<RuntimeContextValue>();
@@ -19,6 +20,10 @@ export function runWithRuntimeContext<T>(
   fn: () => Promise<T> | T
 ): Promise<T> | T {
   return runtimeAls.run(ctx, fn);
+}
+
+export function getRequestId(): string | undefined {
+  return runtimeAls.getStore()?.requestId;
 }
 
 export function isWorkerRuntime(): boolean {

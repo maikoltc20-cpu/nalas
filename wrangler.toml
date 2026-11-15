@@ -21,6 +21,15 @@ not_found_handling = "single-page-application"
 # El intento inmediato tras recibir mensajes por webhook se mantiene activo mediante ctx.waitUntil().
 crons = ["*/30 * * * *"]
 
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+invocation_logs = true
+persist = true
+
 [vars]
 NODE_ENV = "production"
 NALAS_DISABLE_DEMO_LOGIN = "true"

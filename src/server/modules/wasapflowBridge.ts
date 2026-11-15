@@ -1,12 +1,22 @@
 import type { ChannelConnection, Message, NalasStore, StructuredOption } from '../../shared/types.ts';
 import {
   claimDueOutboxIdsPg,
+  claimInboundEventPg,
   getIntegrationSettingPg,
+  insertAuditEventPg,
   isPostgresConfigured,
+  loadWasapFlowConversationBundlePg,
+  persistWasapFlowConversationBundlePg,
+  type PgQueryClient,
+  readWasapFlowBridgeStateAndConnPg,
+  setIntegrationSettingOnClientPg,
   setIntegrationSettingPg,
+  updateWasapFlowStatusPg,
+  upsertChannelConnectionPg,
   withPgClient,
+  withPgWebhookTransaction,
 } from '../db/pgStore.ts';
-import { getEnv, isWorkerRuntime, scheduleBackgroundTask } from '../runtimeContext.ts';
+import { getEnv, getRequestId, isWorkerRuntime, scheduleBackgroundTask } from '../runtimeContext.ts';
 import { getSessionSigningSecret } from './auth.ts';
 import { appendAudit } from './consumptionAndAudit.ts';
 import {
@@ -99,6 +109,36 @@ interface WasapFlowOutboxTarget {
 }
 
 let inMemoryWasapFlowState: WasapFlowBridgeState | null = null;
+
+export function sanitizeWebhookErrorDetail(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err ?? 'Error desconocido');
+  return raw
+    .replace(/postgres(?:ql)?:\/\/\S+/gi, 'postgresql://[redacted]')
+    .replace(/Bearer\s+\S+/gi, 'Bearer [redacted]')
+    .replace(/sha256=[a-f0-9]+/gi, 'sha256=[redacted]')
+    .slice(0, 280);
+}
+
+export function logWasapFlowStage(
+  level: 'info' | 'error',
+  payload: {
+    requestId: string;
+    stage: string;
+    durationMs?: number;
+    totalDurationMs?: number;
+    [key: string]: unknown;
+  }
+): void {
+  const line = JSON.stringify({
+    tag: 'wasapflow_webhook',
+    ...payload,
+  });
+  if (level === 'error') {
+    console.error(line);
+  } else {
+    console.info(line);
+  }
+}
 
 function bytesToHex(bytes: Uint8Array): string {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
@@ -261,6 +301,23 @@ function sanitizeStoredWasapFlowState(
     };
   }
   return parsed;
+}
+
+function parseAndSanitizeWasapFlowState(
+  rawSetting: string | null,
+  businessId: string
+): WasapFlowBridgeState {
+  if (rawSetting) {
+    try {
+      const parsed = JSON.parse(rawSetting) as WasapFlowBridgeState;
+      if (parsed && parsed.status) {
+        return sanitizeStoredWasapFlowState(parsed, businessId);
+      }
+    } catch {
+      // Fallback below
+    }
+  }
+  return buildDefaultWasapFlowState(businessId);
 }
 
 export async function readWasapFlowBridgeState(
@@ -442,6 +499,33 @@ export async function verifyWasapFlowWebhookSignature(
   }
 
   return { ok: true };
+}
+
+export async function recordRejectedWasapFlowSignatureAudit(reason: string): Promise<void> {
+  const targetBusinessId = getMetaTargetBusinessId();
+  if (isPostgresConfigured()) {
+    await withPgWebhookTransaction((client) =>
+      insertAuditEventPg(client, {
+        businessId: targetBusinessId,
+        environment: 'produccion',
+        actorUserId: 'integraciones',
+        module: 'integraciones',
+        action: 'webhook_wasapflow_rechazado',
+        detail: reason,
+      })
+    );
+    return;
+  }
+  await withStoreTransaction((store) => {
+    appendAudit(store, {
+      businessId: targetBusinessId,
+      environment: 'produccion',
+      actorUserId: 'integraciones',
+      module: 'integraciones',
+      action: 'webhook_wasapflow_rechazado',
+      detail: reason,
+    });
+  });
 }
 
 export async function createWasapFlowConnectSession(params: {
@@ -886,10 +970,9 @@ function safeTimestampIso(raw?: string): string {
   return Number.isNaN(dt.getTime()) ? new Date().toISOString() : dt.toISOString();
 }
 
-function isVerifiedWasapFlowLineForWebhook(
+function verifyWasapFlowLineMatch(
   state: WasapFlowBridgeState,
-  store: NalasStore,
-  targetBusinessId: string,
+  conn: ChannelConnection | undefined | null,
   phoneNumberId?: string,
   wabaId?: string
 ): { ok: true; conn: ChannelConnection } | { ok: false; reason: string } {
@@ -912,9 +995,6 @@ function isVerifiedWasapFlowLineForWebhook(
     };
   }
 
-  const conn = store.channelConnections.find(
-    (c) => c.id === WASAPFLOW_CONNECTION_ID && c.businessId === targetBusinessId
-  );
   if (!conn || conn.status !== 'activa' || conn.implementationStatus !== 'Producción conectada') {
     return {
       ok: false,
@@ -937,6 +1017,19 @@ function isVerifiedWasapFlowLineForWebhook(
   }
 
   return { ok: true, conn };
+}
+
+function isVerifiedWasapFlowLineForWebhook(
+  state: WasapFlowBridgeState,
+  store: NalasStore,
+  targetBusinessId: string,
+  phoneNumberId?: string,
+  wabaId?: string
+): { ok: true; conn: ChannelConnection } | { ok: false; reason: string } {
+  const conn = store.channelConnections.find(
+    (c) => c.id === WASAPFLOW_CONNECTION_ID && c.businessId === targetBusinessId
+  );
+  return verifyWasapFlowLineMatch(state, conn, phoneNumberId, wabaId);
 }
 
 function buildWasapFlowOutboundRequest(target: WasapFlowOutboxTarget): {
@@ -1378,7 +1471,11 @@ export async function processDueWasapFlowOutboxRetries(limit = 10): Promise<{
 }
 
 export async function processWasapFlowWebhookEvent(
-  payload: WasapFlowWebhookPayload
+  payload: WasapFlowWebhookPayload,
+  options?: {
+    requestId?: string;
+    pgClient?: PgQueryClient;
+  }
 ): Promise<{
   event: string;
   processedMessages: number;
@@ -1388,6 +1485,9 @@ export async function processWasapFlowWebhookEvent(
   ignoredOther: number;
   deduplicated: number;
 }> {
+  const fnStartMs = Date.now();
+  const requestId = options?.requestId || getRequestId() || `wf_${randomHex(4)}`;
+  const usePg = Boolean(options?.pgClient) || isPostgresConfigured();
   const targetBusinessId = getMetaTargetBusinessId();
   const event = (payload.event ?? '').trim();
   const data = (payload.data ?? {}) as Record<string, unknown>;
@@ -1406,6 +1506,12 @@ export async function processWasapFlowWebhookEvent(
 
   if (!event) {
     summary.ignoredOther += 1;
+    logWasapFlowStage('info', {
+      requestId,
+      stage: 'event_empty_ignored',
+      backend: usePg ? 'postgres' : 'local_json_dev',
+      totalDurationMs: Date.now() - fnStartMs,
+    });
     return summary;
   }
 
@@ -1418,92 +1524,279 @@ export async function processWasapFlowWebhookEvent(
     readBooleanField(data, 'standby')
   ) {
     const historyMsgId = readStringField(data, 'message_id');
-    await withStoreTransaction((store) => {
-      if (historyMsgId) {
-        const dedupKey = `${WASAPFLOW_CONNECTION_ID}:hist_${historyMsgId}`;
-        if (store.processedInboundEvents.some((e) => e.dedupKey === dedupKey)) {
-          summary.deduplicated += 1;
-          return;
+    const stageStart = Date.now();
+
+    if (usePg) {
+      await withPgWebhookTransaction(async (client) => {
+        if (historyMsgId) {
+          const dedupKey = `${WASAPFLOW_CONNECTION_ID}:hist_${historyMsgId}`;
+          const claimed = await claimInboundEventPg(client, dedupKey, 'wasapflow_history');
+          if (!claimed) {
+            summary.deduplicated += 1;
+            return;
+          }
         }
-        store.processedInboundEvents.push({
-          dedupKey,
-          conversationId: 'wasapflow_history',
-          processedAt: new Date().toISOString(),
+        await insertAuditEventPg(client, {
+          businessId: targetBusinessId,
+          environment: 'produccion',
+          actorUserId: 'integraciones',
+          module: 'integraciones',
+          action: 'wasapflow_historico_omitido',
+          detail: `Evento "${event}" recibido e ignorado para respuestas automáticas (sin disparar bot ni outbox).`,
         });
-      }
-      appendAudit(store, {
-        businessId: targetBusinessId,
-        environment: 'produccion',
-        actorUserId: 'integraciones',
-        module: 'integraciones',
-        action: 'wasapflow_historico_omitido',
-        detail: `Evento "${event}" recibido e ignorado para respuestas automáticas (sin disparar bot ni outbox).`,
+        summary.ignoredHistory += 1;
+      }, options?.pgClient);
+    } else {
+      await withStoreTransaction((store) => {
+        if (historyMsgId) {
+          const dedupKey = `${WASAPFLOW_CONNECTION_ID}:hist_${historyMsgId}`;
+          if (store.processedInboundEvents.some((e) => e.dedupKey === dedupKey)) {
+            summary.deduplicated += 1;
+            return;
+          }
+          store.processedInboundEvents.push({
+            dedupKey,
+            conversationId: 'wasapflow_history',
+            processedAt: new Date().toISOString(),
+          });
+        }
+        appendAudit(store, {
+          businessId: targetBusinessId,
+          environment: 'produccion',
+          actorUserId: 'integraciones',
+          module: 'integraciones',
+          action: 'wasapflow_historico_omitido',
+          detail: `Evento "${event}" recibido e ignorado para respuestas automáticas (sin disparar bot ni outbox).`,
+        });
+        summary.ignoredHistory += 1;
       });
-      summary.ignoredHistory += 1;
+    }
+
+    logWasapFlowStage('info', {
+      requestId,
+      stage: 'history_event_committed',
+      event,
+      wabaId,
+      phoneNumberId,
+      backend: usePg ? 'postgres' : 'local_json_dev',
+      durationMs: Date.now() - stageStart,
+      totalDurationMs: Date.now() - fnStartMs,
+      deduplicated: summary.deduplicated,
+      ignoredHistory: summary.ignoredHistory,
     });
     return summary;
   }
 
   // 2. Eventos de ciclo de vida WABA
   if (event === 'waba.offboarded' || event === 'waba.partner_removed') {
-    const prevState = await readWasapFlowBridgeState(targetBusinessId);
-    if (!wabaId || !prevState.wabaId || prevState.wabaId === wabaId) {
-      await saveWasapFlowBridgeState({
-        ...prevState,
-        status: 'error',
-        connectionState: event === 'waba.offboarded' ? 'offboarded' : 'partner_removed',
-        statusReason: `WasapFlow reportó evento "${event}" para el WABA conectado. El canal fue pausado.`,
-        lastError: `Evento recibido: ${event}`,
-      });
-      await withStoreTransaction((store) => {
-        pauseWasapFlowChannelConnection(store, targetBusinessId);
-        appendAudit(store, {
-          businessId: targetBusinessId,
-          environment: 'produccion',
-          actorUserId: 'integraciones',
-          module: 'integraciones',
-          action: 'wasapflow_waba_desconectado',
-          detail: `Webhook WasapFlow "${event}" recibido (WABA ${wabaId || 'sin ID'}). Canal pausado.`,
+    const stageStart = Date.now();
+    if (usePg) {
+      let nextStateToCache: WasapFlowBridgeState | null = null;
+      await withPgWebhookTransaction(async (client) => {
+        const { rawStateSetting, connection } = await readWasapFlowBridgeStateAndConnPg(
+          client,
+          WASAPFLOW_STATE_SETTING_KEY,
+          targetBusinessId,
+          WASAPFLOW_CONNECTION_ID
+        );
+        const prevState = parseAndSanitizeWasapFlowState(rawStateSetting, targetBusinessId);
+        if (!wabaId || !prevState.wabaId || prevState.wabaId === wabaId) {
+          const nextState: WasapFlowBridgeState = {
+            ...prevState,
+            connectionId: WASAPFLOW_CONNECTION_ID,
+            status: 'error',
+            connectionState: event === 'waba.offboarded' ? 'offboarded' : 'partner_removed',
+            statusReason: `WasapFlow reportó evento "${event}" para el WABA conectado. El canal fue pausado.`,
+            lastError: `Evento recibido: ${event}`,
+            updatedAt: new Date().toISOString(),
+          };
+          nextStateToCache = nextState;
+          await setIntegrationSettingOnClientPg(
+            client,
+            WASAPFLOW_STATE_SETTING_KEY,
+            JSON.stringify(nextState)
+          );
+          const pausedConn: ChannelConnection = connection
+            ? {
+                ...connection,
+                destinationAddress: 'pendiente://wasapflow-sin-conectar',
+                displayName: 'WhatsApp NEXO · WasapFlow (Sin conectar)',
+                implementationStatus: 'Simulada',
+                status: 'pausada',
+              }
+            : {
+                id: WASAPFLOW_CONNECTION_ID,
+                businessId: targetBusinessId,
+                assistantId: 'asst_nexo_main',
+                environment: 'produccion',
+                channelType: 'whatsapp_prueba',
+                displayName: 'WhatsApp NEXO · WasapFlow (Sin conectar)',
+                destinationAddress: 'pendiente://wasapflow-sin-conectar',
+                supportsButtons: true,
+                maxButtons: 10,
+                adapterId: 'adapter_wa_official',
+                implementationStatus: 'Simulada',
+                status: 'pausada',
+              };
+          await upsertChannelConnectionPg(client, pausedConn);
+          await insertAuditEventPg(client, {
+            businessId: targetBusinessId,
+            environment: 'produccion',
+            actorUserId: 'integraciones',
+            module: 'integraciones',
+            action: 'wasapflow_waba_desconectado',
+            detail: `Webhook WasapFlow "${event}" recibido (WABA ${wabaId || 'sin ID'}). Canal pausado.`,
+          });
+        }
+      }, options?.pgClient);
+      if (nextStateToCache) inMemoryWasapFlowState = nextStateToCache;
+    } else {
+      const prevState = await readWasapFlowBridgeState(targetBusinessId);
+      if (!wabaId || !prevState.wabaId || prevState.wabaId === wabaId) {
+        await saveWasapFlowBridgeState({
+          ...prevState,
+          status: 'error',
+          connectionState: event === 'waba.offboarded' ? 'offboarded' : 'partner_removed',
+          statusReason: `WasapFlow reportó evento "${event}" para el WABA conectado. El canal fue pausado.`,
+          lastError: `Evento recibido: ${event}`,
         });
-      });
+        await withStoreTransaction((store) => {
+          pauseWasapFlowChannelConnection(store, targetBusinessId);
+          appendAudit(store, {
+            businessId: targetBusinessId,
+            environment: 'produccion',
+            actorUserId: 'integraciones',
+            module: 'integraciones',
+            action: 'wasapflow_waba_desconectado',
+            detail: `Webhook WasapFlow "${event}" recibido (WABA ${wabaId || 'sin ID'}). Canal pausado.`,
+          });
+        });
+      }
     }
     summary.ignoredOther += 1;
+    logWasapFlowStage('info', {
+      requestId,
+      stage: 'waba_disconnect_committed',
+      event,
+      wabaId,
+      backend: usePg ? 'postgres' : 'local_json_dev',
+      durationMs: Date.now() - stageStart,
+      totalDurationMs: Date.now() - fnStartMs,
+    });
     return summary;
   }
 
   if (event === 'waba.reconnected') {
-    const prevState = await readWasapFlowBridgeState(targetBusinessId);
-    if (
-      prevState.wabaId &&
-      wabaId === prevState.wabaId &&
-      isExpectedProdDisplayPhone(prevState.displayPhoneNumber)
-    ) {
-      await saveWasapFlowBridgeState({
-        ...prevState,
-        status: 'conectado',
-        connectionState: 'connected',
-        lastError: undefined,
-        statusReason: `WasapFlow reconectado para ${NEXO_EXPECTED_PROD_DISPLAY_PHONE}.`,
-      });
-      await withStoreTransaction((store) => {
-        const conn = ensureWasapFlowChannelConnection(store, targetBusinessId);
-        if (prevState.phoneNumberId) {
-          conn.destinationAddress = prevState.phoneNumberId;
-          conn.displayName = `WhatsApp NEXO · WasapFlow (${NEXO_EXPECTED_PROD_DISPLAY_PHONE})`;
-          conn.implementationStatus = 'Producción conectada';
-          conn.status = 'activa';
+    const stageStart = Date.now();
+    if (usePg) {
+      let nextStateToCache: WasapFlowBridgeState | null = null;
+      await withPgWebhookTransaction(async (client) => {
+        const { rawStateSetting, connection } = await readWasapFlowBridgeStateAndConnPg(
+          client,
+          WASAPFLOW_STATE_SETTING_KEY,
+          targetBusinessId,
+          WASAPFLOW_CONNECTION_ID
+        );
+        const prevState = parseAndSanitizeWasapFlowState(rawStateSetting, targetBusinessId);
+        if (
+          prevState.wabaId &&
+          wabaId === prevState.wabaId &&
+          isExpectedProdDisplayPhone(prevState.displayPhoneNumber)
+        ) {
+          const nextState: WasapFlowBridgeState = {
+            ...prevState,
+            connectionId: WASAPFLOW_CONNECTION_ID,
+            status: 'conectado',
+            connectionState: 'connected',
+            lastError: undefined,
+            statusReason: `WasapFlow reconectado para ${NEXO_EXPECTED_PROD_DISPLAY_PHONE}.`,
+            updatedAt: new Date().toISOString(),
+          };
+          nextStateToCache = nextState;
+          await setIntegrationSettingOnClientPg(
+            client,
+            WASAPFLOW_STATE_SETTING_KEY,
+            JSON.stringify(nextState)
+          );
+          if (prevState.phoneNumberId) {
+            const activeConn: ChannelConnection = connection
+              ? {
+                  ...connection,
+                  destinationAddress: prevState.phoneNumberId,
+                  displayName: `WhatsApp NEXO · WasapFlow (${NEXO_EXPECTED_PROD_DISPLAY_PHONE})`,
+                  implementationStatus: 'Producción conectada',
+                  status: 'activa',
+                }
+              : {
+                  id: WASAPFLOW_CONNECTION_ID,
+                  businessId: targetBusinessId,
+                  assistantId: 'asst_nexo_main',
+                  environment: 'produccion',
+                  channelType: 'whatsapp_prueba',
+                  displayName: `WhatsApp NEXO · WasapFlow (${NEXO_EXPECTED_PROD_DISPLAY_PHONE})`,
+                  destinationAddress: prevState.phoneNumberId,
+                  supportsButtons: true,
+                  maxButtons: 10,
+                  adapterId: 'adapter_wa_official',
+                  implementationStatus: 'Producción conectada',
+                  status: 'activa',
+                };
+            await upsertChannelConnectionPg(client, activeConn);
+          }
+          await insertAuditEventPg(client, {
+            businessId: targetBusinessId,
+            environment: 'produccion',
+            actorUserId: 'integraciones',
+            module: 'integraciones',
+            action: 'wasapflow_waba_reconectado',
+            detail: `Webhook WasapFlow "waba.reconnected" para WABA ${wabaId}.`,
+          });
         }
-        appendAudit(store, {
-          businessId: targetBusinessId,
-          environment: 'produccion',
-          actorUserId: 'integraciones',
-          module: 'integraciones',
-          action: 'wasapflow_waba_reconectado',
-          detail: `Webhook WasapFlow "waba.reconnected" para WABA ${wabaId}.`,
+      }, options?.pgClient);
+      if (nextStateToCache) inMemoryWasapFlowState = nextStateToCache;
+    } else {
+      const prevState = await readWasapFlowBridgeState(targetBusinessId);
+      if (
+        prevState.wabaId &&
+        wabaId === prevState.wabaId &&
+        isExpectedProdDisplayPhone(prevState.displayPhoneNumber)
+      ) {
+        await saveWasapFlowBridgeState({
+          ...prevState,
+          status: 'conectado',
+          connectionState: 'connected',
+          lastError: undefined,
+          statusReason: `WasapFlow reconectado para ${NEXO_EXPECTED_PROD_DISPLAY_PHONE}.`,
         });
-      });
+        await withStoreTransaction((store) => {
+          const conn = ensureWasapFlowChannelConnection(store, targetBusinessId);
+          if (prevState.phoneNumberId) {
+            conn.destinationAddress = prevState.phoneNumberId;
+            conn.displayName = `WhatsApp NEXO · WasapFlow (${NEXO_EXPECTED_PROD_DISPLAY_PHONE})`;
+            conn.implementationStatus = 'Producción conectada';
+            conn.status = 'activa';
+          }
+          appendAudit(store, {
+            businessId: targetBusinessId,
+            environment: 'produccion',
+            actorUserId: 'integraciones',
+            module: 'integraciones',
+            action: 'wasapflow_waba_reconectado',
+            detail: `Webhook WasapFlow "waba.reconnected" para WABA ${wabaId}.`,
+          });
+        });
+      }
     }
     summary.ignoredOther += 1;
+    logWasapFlowStage('info', {
+      requestId,
+      stage: 'waba_reconnect_committed',
+      event,
+      wabaId,
+      backend: usePg ? 'postgres' : 'local_json_dev',
+      durationMs: Date.now() - stageStart,
+      totalDurationMs: Date.now() - fnStartMs,
+    });
     return summary;
   }
 
@@ -1521,72 +1814,98 @@ export async function processWasapFlowWebhookEvent(
       return summary;
     }
 
-    await withStoreTransaction((store) => {
-      const outbox = store.outboxEvents.find(
-        (o) =>
-          o.businessId === targetBusinessId &&
-          o.connectionId === WASAPFLOW_CONNECTION_ID &&
-          ((opaqueOutboxId && o.id === opaqueOutboxId) ||
-            (messageId && o.providerMessageId === messageId) ||
-            (messageId &&
-              store.messages.some((m) => m.id === o.messageId && m.providerEventId === messageId)))
-      );
-      const msg = store.messages.find(
-        (m) =>
-          m.businessId === targetBusinessId &&
-          ((messageId && m.providerEventId === messageId) || m.id === outbox?.messageId)
-      );
+    const mappedStatus: 'aceptado' | 'entregado' | 'fallido' =
+      event === 'message.delivered' || event === 'message.read'
+        ? 'entregado'
+        : event === 'message.failed'
+          ? 'fallido'
+          : 'aceptado';
 
-      const mappedStatus: 'aceptado' | 'entregado' | 'fallido' =
-        event === 'message.delivered' || event === 'message.read'
-          ? 'entregado'
-          : event === 'message.failed'
-            ? 'fallido'
-            : 'aceptado';
+    let errDetail: string | undefined;
+    if (event === 'message.failed') {
+      const errors = Array.isArray(data.errors)
+        ? (data.errors as Array<{ code?: unknown; title?: string; message?: string }>)
+        : [];
+      errDetail =
+        errors
+          .map((e) => `${e.code ?? ''}: ${e.title ?? e.message ?? 'Error'}`.trim())
+          .filter(Boolean)
+          .join('; ') || 'Entrega fallida reportada por WasapFlow.';
+    }
 
-      let errDetail: string | undefined;
-      if (event === 'message.failed') {
-        const errors = Array.isArray(data.errors)
-          ? (data.errors as Array<{ code?: unknown; title?: string; message?: string }>)
-          : [];
-        errDetail =
-          errors
-            .map((e) => `${e.code ?? ''}: ${e.title ?? e.message ?? 'Error'}`.trim())
-            .filter(Boolean)
-            .join('; ') || 'Entrega fallida reportada por WasapFlow.';
-      }
+    const stageStart = Date.now();
+    if (usePg) {
+      await withPgWebhookTransaction(async (client) => {
+        await updateWasapFlowStatusPg(client, {
+          businessId: targetBusinessId,
+          connectionId: WASAPFLOW_CONNECTION_ID,
+          messageId,
+          opaqueOutboxId,
+          mappedStatus,
+          errDetail,
+          event,
+        });
+        summary.processedStatuses += 1;
+      }, options?.pgClient);
+    } else {
+      await withStoreTransaction((store) => {
+        const outbox = store.outboxEvents.find(
+          (o) =>
+            o.businessId === targetBusinessId &&
+            o.connectionId === WASAPFLOW_CONNECTION_ID &&
+            ((opaqueOutboxId && o.id === opaqueOutboxId) ||
+              (messageId && o.providerMessageId === messageId) ||
+              (messageId &&
+                store.messages.some((m) => m.id === o.messageId && m.providerEventId === messageId)))
+        );
+        const msg = store.messages.find(
+          (m) =>
+            m.businessId === targetBusinessId &&
+            ((messageId && m.providerEventId === messageId) || m.id === outbox?.messageId)
+        );
 
-      if (outbox) {
-        outbox.deliveryStatus = mappedStatus;
-        if (messageId && !outbox.providerMessageId) {
-          outbox.providerMessageId = messageId;
+        if (outbox) {
+          outbox.deliveryStatus = mappedStatus;
+          if (messageId && !outbox.providerMessageId) {
+            outbox.providerMessageId = messageId;
+          }
+          outbox.lastError = errDetail;
+          outbox.nextRetryAt = undefined;
+          outbox.updatedAt = new Date().toISOString();
         }
-        outbox.lastError = errDetail;
-        outbox.nextRetryAt = undefined;
-        outbox.updatedAt = new Date().toISOString();
-      }
-      if (msg) {
-        msg.deliveryStatus = mappedStatus;
-        if (messageId && !msg.providerEventId) {
-          msg.providerEventId = messageId;
+        if (msg) {
+          msg.deliveryStatus = mappedStatus;
+          if (messageId && !msg.providerEventId) {
+            msg.providerEventId = messageId;
+          }
         }
-      }
 
-      appendAudit(store, {
-        businessId: targetBusinessId,
-        environment: 'produccion',
-        actorUserId: 'integraciones',
-        module: 'integraciones',
-        action: 'estado_wasapflow_whatsapp',
-        detail: `Estado WasapFlow "${event}" para mensaje ${messageId || opaqueOutboxId}${errDetail ? ` (${errDetail})` : ''}.`,
-        correlationId: outbox?.conversationId,
+        appendAudit(store, {
+          businessId: targetBusinessId,
+          environment: 'produccion',
+          actorUserId: 'integraciones',
+          module: 'integraciones',
+          action: 'estado_wasapflow_whatsapp',
+          detail: `Estado WasapFlow "${event}" para mensaje ${messageId || opaqueOutboxId}${errDetail ? ` (${errDetail})` : ''}.`,
+          correlationId: outbox?.conversationId,
+        });
+        summary.processedStatuses += 1;
       });
-      summary.processedStatuses += 1;
+    }
+
+    logWasapFlowStage('info', {
+      requestId,
+      stage: 'status_event_committed',
+      event,
+      wabaId,
+      phoneNumberId,
+      mappedStatus,
+      backend: usePg ? 'postgres' : 'local_json_dev',
+      durationMs: Date.now() - stageStart,
+      totalDurationMs: Date.now() - fnStartMs,
     });
     return summary;
   }
-
-  const state = await readWasapFlowBridgeState(targetBusinessId);
 
   // 4. Eco saliente enviado desde la app WhatsApp Business del iPhone -> registrar y pausar bot
   if (event === 'message.echo') {
@@ -1597,6 +1916,144 @@ export async function processWasapFlowWebhookEvent(
       return summary;
     }
 
+    const { text: echoText } = extractWasapFlowMessageContent(data);
+    const echoCreatedAt = safeTimestampIso(readStringField(data, 'timestamp') || payload.timestamp);
+    const dedupKey = `${WASAPFLOW_CONNECTION_ID}:echo_${echoId}`;
+
+    if (usePg) {
+      const txStart = Date.now();
+      await withPgWebhookTransaction(async (client) => {
+        const s0 = Date.now();
+        const { rawStateSetting, connection } = await readWasapFlowBridgeStateAndConnPg(
+          client,
+          WASAPFLOW_STATE_SETTING_KEY,
+          targetBusinessId,
+          WASAPFLOW_CONNECTION_ID
+        );
+        const state = parseAndSanitizeWasapFlowState(rawStateSetting, targetBusinessId);
+        const check = verifyWasapFlowLineMatch(state, connection, phoneNumberId, wabaId);
+        logWasapFlowStage('info', {
+          requestId,
+          stage: 'db_state_conn_loaded',
+          event,
+          wabaId,
+          phoneNumberId,
+          lineMatched: check.ok,
+          durationMs: Date.now() - s0,
+        });
+
+        if (!check.ok) {
+          await insertAuditEventPg(client, {
+            businessId: targetBusinessId,
+            environment: 'produccion',
+            actorUserId: 'integraciones',
+            module: 'integraciones',
+            action: 'webhook_wasapflow_canal_no_vinculado',
+            detail: `Eco iPhone ignorado: ${check.reason}`,
+          });
+          summary.ignoredOther += 1;
+          return;
+        }
+
+        const s1 = Date.now();
+        await client.query(`SELECT pg_advisory_xact_lock(hashtext('wf:' || $1 || ':' || $2))`, [
+          targetBusinessId,
+          customer.externalUserId,
+        ]);
+        const { miniStore, preExisting } = await loadWasapFlowConversationBundlePg(client, {
+          businessId: targetBusinessId,
+          connection: check.conn,
+          externalUserId: customer.externalUserId,
+        });
+        logWasapFlowStage('info', {
+          requestId,
+          stage: 'db_bundle_loaded',
+          event,
+          hadOpenConversation: preExisting.hadOpenConversation,
+          durationMs: Date.now() - s1,
+        });
+
+        const started = startOrGetSimulatorConversation(miniStore, {
+          businessId: targetBusinessId,
+          connectionId: check.conn.id,
+          externalUserId: customer.externalUserId,
+          contactPhone: customer.contactPhone,
+          forceNew: false,
+        });
+
+        const s2 = Date.now();
+        const claimed = await claimInboundEventPg(client, dedupKey, started.conversation.id);
+        logWasapFlowStage('info', {
+          requestId,
+          stage: 'db_dedup_claimed',
+          event,
+          claimed,
+          durationMs: Date.now() - s2,
+        });
+
+        if (!claimed) {
+          summary.deduplicated += 1;
+          return;
+        }
+
+        started.conversation.control = 'humano_activo';
+        started.conversation.updatedAt = new Date().toISOString();
+
+        const humanMsg: Message = {
+          id: `msg_${Date.now()}_iphone_${Math.random().toString(36).slice(2, 6)}`,
+          businessId: targetBusinessId,
+          environment: started.conversation.environment,
+          conversationId: started.conversation.id,
+          sender: 'agente_humano',
+          text: echoText,
+          deliveryStatus: 'entregado',
+          providerEventId: echoId,
+          createdAt: echoCreatedAt,
+        };
+        miniStore.messages.push(humanMsg);
+
+        appendAudit(miniStore, {
+          businessId: targetBusinessId,
+          environment: started.conversation.environment,
+          actorUserId: 'integraciones',
+          module: 'conversaciones',
+          action: 'eco_iphone_wasapflow',
+          detail: `Respuesta manual detectada desde WhatsApp Business en iPhone (${readStringField(data, 'source') || 'business_app'}). Bot pausado automáticamente (control=humano_activo).`,
+          correlationId: started.conversation.id,
+        });
+
+        const s3 = Date.now();
+        const { queriesExecuted } = await persistWasapFlowConversationBundlePg(
+          client,
+          miniStore,
+          preExisting
+        );
+        logWasapFlowStage('info', {
+          requestId,
+          stage: 'db_bundle_persisted',
+          event,
+          queriesExecuted,
+          durationMs: Date.now() - s3,
+        });
+        summary.processedEchoes += 1;
+      }, options?.pgClient);
+
+      logWasapFlowStage('info', {
+        requestId,
+        stage: 'db_tx_committed',
+        event,
+        wabaId,
+        phoneNumberId,
+        processedEchoes: summary.processedEchoes,
+        deduplicated: summary.deduplicated,
+        ignoredOther: summary.ignoredOther,
+        durationMs: Date.now() - txStart,
+        totalDurationMs: Date.now() - fnStartMs,
+      });
+      return summary;
+    }
+
+    const state = await readWasapFlowBridgeState(targetBusinessId);
     const lineCheck = await withStoreTransaction((store) => {
       const check = isVerifiedWasapFlowLineForWebhook(
         state,
@@ -1617,7 +2074,6 @@ export async function processWasapFlowWebhookEvent(
         return { matched: false as const };
       }
 
-      const dedupKey = `${WASAPFLOW_CONNECTION_ID}:echo_${echoId}`;
       if (store.processedInboundEvents.some((e) => e.dedupKey === dedupKey)) {
         return { matched: true as const, deduplicated: true as const };
       }
@@ -1645,10 +2101,6 @@ export async function processWasapFlowWebhookEvent(
       summary.deduplicated += 1;
       return summary;
     }
-
-    const { text: echoText } = extractWasapFlowMessageContent(data);
-    const echoCreatedAt = safeTimestampIso(readStringField(data, 'timestamp') || payload.timestamp);
-    const dedupKey = `${WASAPFLOW_CONNECTION_ID}:echo_${echoId}`;
 
     await runSerializedForConversation(lineCheck.conversationId, () =>
       withStoreTransaction((store) => {
@@ -1694,6 +2146,14 @@ export async function processWasapFlowWebhookEvent(
       })
     );
 
+    logWasapFlowStage('info', {
+      requestId,
+      stage: 'local_echo_committed',
+      event,
+      processedEchoes: summary.processedEchoes,
+      deduplicated: summary.deduplicated,
+      totalDurationMs: Date.now() - fnStartMs,
+    });
     return summary;
   }
 
@@ -1703,12 +2163,213 @@ export async function processWasapFlowWebhookEvent(
     const customer = resolveWasapFlowCustomerIdentity(data, false);
     if (!messageId || !customer) {
       summary.ignoredOther += 1;
+      logWasapFlowStage('info', {
+        requestId,
+        stage: 'inbound_missing_id_or_customer',
+        event,
+        wabaId,
+        phoneNumberId,
+        totalDurationMs: Date.now() - fnStartMs,
+      });
       return summary;
     }
 
     const contactName = readStringField(data, 'contact_name');
     const { text, selectedOptionId } = extractWasapFlowMessageContent(data);
+    const outboundEnabled = isWasapFlowOutboundEnabled();
 
+    if (usePg) {
+      const txStart = Date.now();
+      let backgroundTargets: WasapFlowOutboxTarget[] = [];
+
+      await withPgWebhookTransaction(async (client) => {
+        const s0 = Date.now();
+        const { rawStateSetting, connection } = await readWasapFlowBridgeStateAndConnPg(
+          client,
+          WASAPFLOW_STATE_SETTING_KEY,
+          targetBusinessId,
+          WASAPFLOW_CONNECTION_ID
+        );
+        const state = parseAndSanitizeWasapFlowState(rawStateSetting, targetBusinessId);
+        const check = verifyWasapFlowLineMatch(state, connection, phoneNumberId, wabaId);
+        logWasapFlowStage('info', {
+          requestId,
+          stage: 'db_state_conn_loaded',
+          event,
+          wabaId,
+          phoneNumberId,
+          lineMatched: check.ok,
+          durationMs: Date.now() - s0,
+        });
+
+        if (!check.ok) {
+          await insertAuditEventPg(client, {
+            businessId: targetBusinessId,
+            environment: 'produccion',
+            actorUserId: 'integraciones',
+            module: 'integraciones',
+            action: 'webhook_wasapflow_canal_no_vinculado',
+            detail: `Mensaje entrante WasapFlow ignorado: ${check.reason}`,
+          });
+          summary.ignoredOther += 1;
+          return;
+        }
+
+        const s1 = Date.now();
+        await client.query(`SELECT pg_advisory_xact_lock(hashtext('wf:' || $1 || ':' || $2))`, [
+          targetBusinessId,
+          customer.externalUserId,
+        ]);
+        const { miniStore, preExisting } = await loadWasapFlowConversationBundlePg(client, {
+          businessId: targetBusinessId,
+          connection: check.conn,
+          externalUserId: customer.externalUserId,
+        });
+        logWasapFlowStage('info', {
+          requestId,
+          stage: 'db_bundle_loaded',
+          event,
+          hadOpenConversation: preExisting.hadOpenConversation,
+          durationMs: Date.now() - s1,
+        });
+
+        const started = startOrGetSimulatorConversation(miniStore, {
+          businessId: targetBusinessId,
+          connectionId: check.conn.id,
+          externalUserId: customer.externalUserId,
+          contactName,
+          contactPhone: customer.contactPhone,
+          forceNew: false,
+        });
+
+        const dedupKey = `${check.conn.id}:${messageId}`;
+        const s2 = Date.now();
+        const claimed = await claimInboundEventPg(client, dedupKey, started.conversation.id);
+        logWasapFlowStage('info', {
+          requestId,
+          stage: 'db_dedup_claimed',
+          event,
+          claimed,
+          durationMs: Date.now() - s2,
+        });
+
+        if (!claimed) {
+          await insertAuditEventPg(client, {
+            businessId: targetBusinessId,
+            environment: started.conversation.environment,
+            actorUserId: 'integraciones',
+            module: 'integraciones',
+            action: 'evento_duplicado_omitido',
+            detail: `Evento entrante "${messageId}" deduplicado en conexión ${check.conn.id}.`,
+            correlationId: started.conversation.id,
+          });
+          summary.deduplicated += 1;
+          return;
+        }
+
+        const s3 = Date.now();
+        const existingMsgIds = new Set(miniStore.messages.map((m) => m.id));
+        const out = await processInboundMessage(miniStore, {
+          businessId: targetBusinessId,
+          conversationId: started.conversation.id,
+          text,
+          selectedOptionId,
+          providerEventId: messageId,
+          idempotencyKey: `wasapflow_${messageId}`,
+          deferRemoteDispatch: true,
+        });
+        logWasapFlowStage('info', {
+          requestId,
+          stage: 'engine_processed',
+          event,
+          engine: started.conversation.activeEngine,
+          botReplied: out.botReplied,
+          aiCalled: out.aiCalled,
+          outboundEnabled,
+          durationMs: Date.now() - s3,
+        });
+
+        if (out.deduplicated) {
+          summary.deduplicated += 1;
+          return;
+        }
+
+        const newBotMsgs = miniStore.messages.filter(
+          (m) =>
+            m.conversationId === started.conversation.id &&
+            m.sender === 'bot_basica' &&
+            !existingMsgIds.has(m.id)
+        );
+        const fallbackList: Message[] =
+          newBotMsgs.length > 0 ? newBotMsgs : out.outgoingMessage ? [out.outgoingMessage] : [];
+
+        const targets: WasapFlowOutboxTarget[] = [];
+        for (const msg of fallbackList) {
+          const ob = miniStore.outboxEvents.find((o) => o.messageId === msg.id);
+          if (!ob) continue;
+          if (!outboundEnabled) {
+            ob.deliveryStatus = 'pendiente';
+            ob.nextRetryAt = undefined;
+            ob.lastError =
+              'Envío saliente por WasapFlow pausado (WASAPFLOW_OUTBOUND_ENABLED=false). Evento persistido en outbox y excluido de despacho automático.';
+            msg.deliveryStatus = 'pendiente';
+          } else {
+            targets.push({
+              outboxId: ob.id,
+              messageId: msg.id,
+              businessId: targetBusinessId,
+              connectionId: check.conn.id,
+              environment: check.conn.environment,
+              toRecipient: customer.externalUserId,
+              useUserIdField: isBsuidIdentifier(customer.externalUserId),
+              text: msg.text,
+              options: msg.options,
+              createdAt: ob.createdAt,
+            });
+          }
+        }
+
+        const s4 = Date.now();
+        const { queriesExecuted } = await persistWasapFlowConversationBundlePg(
+          client,
+          miniStore,
+          preExisting
+        );
+        logWasapFlowStage('info', {
+          requestId,
+          stage: 'db_bundle_persisted',
+          event,
+          queriesExecuted,
+          queuedOutboxCount: targets.length,
+          durationMs: Date.now() - s4,
+        });
+
+        summary.processedMessages += 1;
+        backgroundTargets = targets;
+      }, options?.pgClient);
+
+      logWasapFlowStage('info', {
+        requestId,
+        stage: 'db_tx_committed',
+        event,
+        wabaId,
+        phoneNumberId,
+        processedMessages: summary.processedMessages,
+        deduplicated: summary.deduplicated,
+        ignoredOther: summary.ignoredOther,
+        outboundEnabled,
+        durationMs: Date.now() - txStart,
+        totalDurationMs: Date.now() - fnStartMs,
+      });
+
+      if (backgroundTargets.length > 0 && outboundEnabled) {
+        scheduleBackgroundTask(dispatchWasapFlowOutboxTargets(backgroundTargets));
+      }
+      return summary;
+    }
+
+    const s0 = Date.now();
+    const state = await readWasapFlowBridgeState(targetBusinessId);
     const convResolution = await withStoreTransaction((store) => {
       const check = isVerifiedWasapFlowLineForWebhook(
         state,
@@ -1746,11 +2407,20 @@ export async function processWasapFlowWebhookEvent(
       };
     });
 
+    logWasapFlowStage('info', {
+      requestId,
+      stage: 'local_conv_resolved',
+      event,
+      lineMatched: convResolution.matched,
+      durationMs: Date.now() - s0,
+    });
+
     if (!convResolution.matched) {
       summary.ignoredOther += 1;
       return summary;
     }
 
+    const s1 = Date.now();
     const result = await runSerializedForConversation(convResolution.conversationId, () =>
       withStoreTransaction(async (store) => {
         const existingMsgIds = new Set(
@@ -1785,7 +2455,6 @@ export async function processWasapFlowWebhookEvent(
               ? [out.outgoingMessage]
               : [];
 
-        const outboundEnabled = isWasapFlowOutboundEnabled();
         const targets: WasapFlowOutboxTarget[] = [];
 
         for (const msg of fallbackList) {
@@ -1819,17 +2488,41 @@ export async function processWasapFlowWebhookEvent(
 
     if (result.deduplicated) {
       summary.deduplicated += 1;
+      logWasapFlowStage('info', {
+        requestId,
+        stage: 'local_inbound_deduplicated',
+        event,
+        durationMs: Date.now() - s1,
+        totalDurationMs: Date.now() - fnStartMs,
+      });
       return summary;
     }
 
     summary.processedMessages += 1;
-    if (result.targets.length > 0 && isWasapFlowOutboundEnabled()) {
+    logWasapFlowStage('info', {
+      requestId,
+      stage: 'local_inbound_committed',
+      event,
+      processedMessages: summary.processedMessages,
+      outboundEnabled,
+      durationMs: Date.now() - s1,
+      totalDurationMs: Date.now() - fnStartMs,
+    });
+    if (result.targets.length > 0 && outboundEnabled) {
       scheduleBackgroundTask(dispatchWasapFlowOutboxTargets(result.targets));
     }
     return summary;
   }
 
   summary.ignoredOther += 1;
+  logWasapFlowStage('info', {
+    requestId,
+    stage: 'event_other_ignored',
+    event,
+    wabaId,
+    phoneNumberId,
+    totalDurationMs: Date.now() - fnStartMs,
+  });
   return summary;
 }
 
