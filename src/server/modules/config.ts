@@ -281,6 +281,74 @@ export function resolvePublishedFlowForKey(
   return published[0];
 }
 
+/**
+ * Reconcilia de forma no destructiva opciones de menú legadas que carecen de `flowKey`
+ * explícito (ej. `prod_nexo_opting` previo a multi-conversación), vinculándolas a la
+ * identidad estable de la conversación existente sin alterar versiones ni publicar el menú.
+ */
+export function reconcileStableProductFlowKeys(store: NalasStore): boolean {
+  let changed = false;
+
+  for (const biz of store.businesses) {
+    const bizFlows = store.flowVersions.filter((f) => f.businessId === biz.id);
+    if (bizFlows.length === 0) continue;
+
+    const flowById = new Map(bizFlows.map((f) => [f.id, f]));
+    const existingKeys = new Set(bizFlows.map((f) => getFlowKey(f)));
+
+    const reconcileList = (list?: BusinessProduct[]) => {
+      if (!Array.isArray(list)) return;
+      for (const prod of list) {
+        if (prod.targetType === 'handoff') continue;
+
+        const currentKey = prod.flowKey?.trim();
+        if (currentKey && existingKeys.has(currentKey)) {
+          if (!prod.targetType) {
+            prod.targetType = 'flow';
+            changed = true;
+          }
+          continue;
+        }
+        if (currentKey) continue;
+
+        let resolvedKey: string | undefined;
+        const linkedFlow =
+          (prod.flowVersionId ? flowById.get(prod.flowVersionId) : undefined) ??
+          (prod.draftFlowVersionId ? flowById.get(prod.draftFlowVersionId) : undefined);
+
+        if (linkedFlow) {
+          resolvedKey = getFlowKey(linkedFlow);
+        } else {
+          const candidates = [
+            prod.referencePrefix ? normalizeFlowKey(prod.referencePrefix) : '',
+            prod.name ? normalizeFlowKey(prod.name) : '',
+            prod.optionLabel ? normalizeFlowKey(prod.optionLabel) : '',
+          ].filter(Boolean);
+          for (const candidate of candidates) {
+            if (existingKeys.has(candidate)) {
+              resolvedKey = candidate;
+              break;
+            }
+          }
+        }
+
+        if (resolvedKey && existingKeys.has(resolvedKey)) {
+          prod.flowKey = resolvedKey;
+          if (!prod.targetType) {
+            prod.targetType = 'flow';
+          }
+          changed = true;
+        }
+      }
+    };
+
+    reconcileList(biz.products);
+    reconcileList(biz.entryDraft?.products);
+  }
+
+  return changed;
+}
+
 export function createFlowConversation(
   store: NalasStore,
   businessId: string,
@@ -310,7 +378,6 @@ export function createFlowConversation(
 
   const now = new Date().toISOString();
   const baseStepPrefix = `${resolvedKey}_paso`;
-  const templateFlow = store.flowVersions.find((f) => f.id === biz.activeFlowVersionId);
 
   const starterSteps: FlowStep[] = [
     {
@@ -341,11 +408,13 @@ export function createFlowConversation(
     status: 'borrador',
     steps: starterSteps,
     outOfScriptRules: [],
-    humanHandoffConfig: resolveHumanHandoffConfig(templateFlow?.humanHandoffConfig),
-    handoffMessage: templateFlow?.handoffMessage,
-    handoffNoContactMessage: templateFlow?.handoffNoContactMessage,
-    cancelMessage: templateFlow?.cancelMessage,
-    outOfScriptPrompt: templateFlow?.outOfScriptPrompt,
+    humanHandoffConfig: resolveHumanHandoffConfig(undefined),
+    handoffMessage:
+      'Dejamos registrada tu solicitud de atención con nuestro equipo. El asistente automático quedará en pausa en esta conversación.',
+    cancelMessage:
+      'Conversación cerrada. Si más adelante querés retomarla, podés escribirnos de nuevo.',
+    outOfScriptPrompt:
+      'No encontré una opción exacta para esa consulta. ¿Querés continuar con la pregunta o pedir atención humana?',
     hideInternalCategorizationInClosure: true,
     createdAt: now,
   };
@@ -571,7 +640,7 @@ export function publishFlowDraft(
       draftRuleset.defaultReason !== activeRuleset.defaultReason ||
       JSON.stringify(draftRuleset.rules) !== JSON.stringify(activeRuleset.rules));
 
-  if (draftRuleset && rulesetDraftDiffers) {
+  if (targetKey === primaryFlowKey && draftRuleset && rulesetDraftDiffers) {
     const maxRulesVer = Math.max(
       0,
       ...store.rulesetVersions.filter((r) => r.businessId === businessId).map((r) => r.versionNumber)

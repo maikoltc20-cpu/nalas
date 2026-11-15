@@ -46,6 +46,16 @@ function getClientFlowKey(flow: Pick<FlowVersion, 'businessId' | 'flowKey'>): st
   return flow.businessId === 'biz_nexo' ? 'opting' : 'default';
 }
 
+function normalizeClientFlowKey(raw: string): string {
+  return raw
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9_]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+}
+
 function buildDefaultEntryConfig(business: Business): BusinessEntryConfig {
   return {
     enabled: business.entryConfig?.enabled ?? false,
@@ -140,6 +150,8 @@ export function FlowAndRulesDesigner({
   })();
 
   const [selectedFlowKey, setSelectedFlowKey] = useState<string>(defaultFlowKey);
+  const [pendingFlowKey, setPendingFlowKey] = useState<string | null>(null);
+  const [pendingCreateConvName, setPendingCreateConvName] = useState<string | null>(null);
   const [showNewConvForm, setShowNewConvForm] = useState(false);
   const [newConvName, setNewConvName] = useState('');
 
@@ -149,6 +161,43 @@ export function FlowAndRulesDesigner({
     flowGroups[0];
   const effectiveFlowKey = activeGroup?.flowKey ?? defaultFlowKey;
   const draftFlow = activeGroup?.draft ?? activeGroup?.latestPublished;
+
+  function resolveProductFlowKey(prod: BusinessProduct): string {
+    if (prod.targetType === 'handoff') return '';
+    if (prod.flowKey?.trim()) return prod.flowKey.trim();
+    if (prod.flowVersionId) {
+      const matched = scoped.flowVersions.find((f) => f.id === prod.flowVersionId);
+      if (matched) return getClientFlowKey(matched);
+    }
+    if (prod.draftFlowVersionId) {
+      const matched = scoped.flowVersions.find((f) => f.id === prod.draftFlowVersionId);
+      if (matched) return getClientFlowKey(matched);
+    }
+    const candidates = [prod.referencePrefix, prod.name, prod.optionLabel]
+      .filter((x): x is string => Boolean(x && x.trim()))
+      .map((x) => normalizeClientFlowKey(x));
+    for (const candidate of candidates) {
+      if (flowGroups.some((g) => g.flowKey === candidate)) {
+        return candidate;
+      }
+    }
+    return '';
+  }
+
+  function hydrateEntryProductsForDisplay(products?: BusinessProduct[]): BusinessProduct[] {
+    return structuredClone(products ?? []).map((prod) => {
+      if (prod.targetType === 'handoff') return prod;
+      const resolvedKey = resolveProductFlowKey(prod);
+      if (resolvedKey && !prod.flowKey) {
+        return {
+          ...prod,
+          targetType: prod.targetType ?? 'flow',
+          flowKey: resolvedKey,
+        };
+      }
+      return prod;
+    });
+  }
 
   const [flowName, setFlowName] = useState<string>(() => draftFlow?.name ?? '');
   const [steps, setSteps] = useState<FlowStep[]>(() => structuredClone(draftFlow?.steps ?? []));
@@ -174,7 +223,7 @@ export function FlowAndRulesDesigner({
     structuredClone(initialEntrySource.entryConfig ?? buildDefaultEntryConfig(business))
   );
   const [entryProducts, setEntryProducts] = useState<BusinessProduct[]>(() =>
-    structuredClone(initialEntrySource.products ?? [])
+    hydrateEntryProductsForDisplay(initialEntrySource.products)
   );
   const [entryDirty, setEntryDirty] = useState(false);
   const [entryError, setEntryError] = useState<string | null>(null);
@@ -207,6 +256,8 @@ export function FlowAndRulesDesigner({
 
   useEffect(() => {
     setSelectedFlowKey(defaultFlowKey);
+    setPendingFlowKey(null);
+    setPendingCreateConvName(null);
     setDraftDirty(false);
     setRulesDirty(false);
     setEntryDirty(false);
@@ -217,7 +268,7 @@ export function FlowAndRulesDesigner({
   }, [business.id]);
 
   const draftSignature = draftFlow
-    ? `${effectiveFlowKey}:${draftFlow.id}:${draftFlow.name}:${draftFlow.versionNumber}:${draftFlow.steps.map((s) => `${s.id}:${s.prompt}`).join('|')}:${JSON.stringify(draftFlow.humanHandoffConfig ?? null)}`
+    ? `${effectiveFlowKey}:${draftFlow.id}:${draftFlow.status}:${draftFlow.name}:${draftFlow.versionNumber}:${JSON.stringify(draftFlow.steps)}:${JSON.stringify(draftFlow.outOfScriptRules)}:${JSON.stringify(draftFlow.humanHandoffConfig ?? null)}`
     : `${effectiveFlowKey}:empty`;
 
   const entrySignature = JSON.stringify({
@@ -249,9 +300,9 @@ export function FlowAndRulesDesigner({
         products: business.products ?? [],
       };
       setEntryConfig(structuredClone(src.entryConfig ?? buildDefaultEntryConfig(business)));
-      setEntryProducts(structuredClone(src.products ?? []));
+      setEntryProducts(hydrateEntryProductsForDisplay(src.products));
     }
-  }, [business.id, entrySignature]);
+  }, [business.id, entrySignature, scoped.flowVersions.length]);
 
   useEffect(() => {
     const nextDraftRules = scoped.rulesetVersions.find((r) => r.status === 'borrador');
@@ -372,8 +423,9 @@ export function FlowAndRulesDesigner({
     }
   }
 
-  function handleSelectConversation(nextKey: string) {
-    if (nextKey === effectiveFlowKey) return;
+  function applySelectedConversation(nextKey: string) {
+    setPendingFlowKey(null);
+    setPendingCreateConvName(null);
     setSelectedFlowKey(nextKey);
     setDraftDirty(false);
     setValidationMessages([]);
@@ -385,21 +437,37 @@ export function FlowAndRulesDesigner({
       setOosRules(structuredClone(fv.outOfScriptRules));
       setHumanHandoffConfig(resolveHumanHandoffConfig(fv.humanHandoffConfig));
       setSelectedStepId(fv.steps[0]?.id ?? '');
+    } else {
+      setFlowName('');
+      setSteps([]);
+      setOosRules([]);
+      setHumanHandoffConfig(resolveHumanHandoffConfig(undefined));
+      setSelectedStepId('');
     }
   }
 
-  async function handleCreateConversation() {
-    const cleanName = newConvName.trim();
-    if (!cleanName) {
-      onError('Escribí un nombre para la nueva conversación.');
+  function handleSelectConversation(nextKey: string) {
+    if (nextKey === effectiveFlowKey) {
+      setPendingFlowKey(null);
       return;
     }
+    if (draftDirty) {
+      setPendingCreateConvName(null);
+      setPendingFlowKey(nextKey);
+      return;
+    }
+    applySelectedConversation(nextKey);
+  }
+
+  async function executeCreateConversation(cleanName: string) {
     setBusy(true);
     try {
       const created = await nalasApi.createConversation(ctx, { name: cleanName });
       const createdKey = getClientFlowKey(created);
       setNewConvName('');
       setShowNewConvForm(false);
+      setPendingFlowKey(null);
+      setPendingCreateConvName(null);
       setDraftDirty(false);
       setValidationMessages([]);
       setSelectedFlowKey(createdKey);
@@ -410,12 +478,69 @@ export function FlowAndRulesDesigner({
       setSelectedStepId(created.steps[0]?.id ?? '');
       await onRefresh();
       onNotice(
-        `Conversación «${created.name}» (${createdKey}) creada en borrador. Editala y publicala cuando esté lista.`
+        `Conversación «${created.name}» creada en borrador. Editala y publicala cuando esté lista.`
       );
     } catch (e) {
       onError(e instanceof Error ? e.message : 'No se pudo crear la conversación.');
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function handleCreateConversation() {
+    const cleanName = newConvName.trim();
+    if (!cleanName) {
+      onError('Escribí un nombre para la nueva conversación.');
+      return;
+    }
+    if (draftDirty) {
+      setPendingFlowKey(null);
+      setPendingCreateConvName(cleanName);
+      return;
+    }
+    await executeCreateConversation(cleanName);
+  }
+
+  async function handleSaveAndProceedSwitch() {
+    setBusy(true);
+    try {
+      const res = await nalasApi.saveFlowDraft(ctx, {
+        steps,
+        outOfScriptRules: oosRules,
+        humanHandoffConfig,
+        name: flowName.trim() || draftFlow?.name,
+        flowKey: effectiveFlowKey,
+      });
+      setValidationMessages(res.issues);
+      setDraftDirty(false);
+      await onRefresh();
+      if (pendingCreateConvName) {
+        const nameToCreate = pendingCreateConvName;
+        setPendingCreateConvName(null);
+        await executeCreateConversation(nameToCreate);
+        return;
+      }
+      if (pendingFlowKey) {
+        applySelectedConversation(pendingFlowKey);
+      }
+      onNotice('Cambios guardados en el borrador de la conversación anterior.');
+    } catch (e) {
+      onError(e instanceof Error ? e.message : 'No se pudieron guardar los cambios antes de cambiar.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleDiscardAndProceedSwitch() {
+    if (pendingCreateConvName) {
+      const nameToCreate = pendingCreateConvName;
+      setPendingCreateConvName(null);
+      setDraftDirty(false);
+      await executeCreateConversation(nameToCreate);
+      return;
+    }
+    if (pendingFlowKey) {
+      applySelectedConversation(pendingFlowKey);
     }
   }
 
@@ -589,17 +714,8 @@ export function FlowAndRulesDesigner({
       });
       setDraftDirty(false);
       setValidationMessages(res.issues);
-      if (rulesDirty) {
-        await nalasApi.saveRulesetDraft(ctx, {
-          name: `Criterios ${business.name} (Borrador)`,
-          defaultPriority,
-          defaultReason,
-          rules,
-        });
-        setRulesDirty(false);
-      }
       await onRefresh();
-      onNotice('Cambios guardados en tu borrador. Tus conversaciones publicadas siguen intactas.');
+      onNotice('Cambios guardados en el borrador de esta conversación. Tus conversaciones publicadas siguen intactas.');
     } catch (e) {
       onError(e instanceof Error ? e.message : 'No se pudieron guardar los cambios.');
     } finally {
@@ -641,7 +757,7 @@ export function FlowAndRulesDesigner({
         skipEntryMenu: true,
         useEntryDraft: false,
       });
-      onNotice(`Conversación de prueba abierta con el borrador de «${flowName || effectiveFlowKey}».`);
+      onNotice(`Conversación de prueba abierta con el borrador de «${flowName.trim() || activeGroup?.label || 'la conversación'}».`);
     } catch (e) {
       onError(e instanceof Error ? e.message : 'No se pudo abrir la prueba.');
     } finally {
@@ -994,7 +1110,8 @@ export function FlowAndRulesDesigner({
               <div className="space-y-3">
                 {entryProducts.map((prod, idx) => {
                   const targetType = prod.targetType === 'handoff' ? 'handoff' : 'flow';
-                  const linkedGroup = flowGroups.find((g) => g.flowKey === prod.flowKey);
+                  const effectiveProdFlowKey = resolveProductFlowKey(prod);
+                  const linkedGroup = flowGroups.find((g) => g.flowKey === effectiveProdFlowKey);
                   const missingPublishedTarget =
                     prod.active && targetType === 'flow' && !linkedGroup?.latestPublished;
                   return (
@@ -1131,7 +1248,7 @@ export function FlowAndRulesDesigner({
                             />
                           ) : (
                             <select
-                              value={prod.flowKey ?? ''}
+                              value={effectiveProdFlowKey}
                               onChange={(e) => {
                                 const val = e.target.value || undefined;
                                 setEntryDirty(true);
@@ -1200,7 +1317,7 @@ export function FlowAndRulesDesigner({
                   Conversaciones de {business.name}
                 </h2>
                 <p className="text-xs text-[#5A6877] mt-0.5">
-                  Cada conversación tiene identidad estable ({effectiveFlowKey}) y versiones independientes. Publicar aplica a nuevas conversaciones.
+                  Cada conversación tiene su propio flujo, respuestas rápidas y configuración de atención humana. Publicar aplica solo a la conversación elegida.
                 </p>
               </div>
               <button
@@ -1219,7 +1336,7 @@ export function FlowAndRulesDesigner({
                   type="text"
                   value={newConvName}
                   onChange={(e) => setNewConvName(e.target.value)}
-                  placeholder="Nombre de la conversación (ej: Nala, BenefitOS)"
+                  placeholder="Nombre de la conversación (ej: Nala, VOLVÉ, BenefitOS)"
                   className="flex-1 min-w-[220px] min-h-[40px] text-sm border border-[#DCE3E8] rounded-[8px] px-3 py-1.5 bg-white"
                 />
                 <button
@@ -1228,61 +1345,135 @@ export function FlowAndRulesDesigner({
                   onClick={handleCreateConversation}
                   className="min-h-[40px] px-4 py-1.5 text-sm font-semibold text-white bg-[#167D83] rounded-[8px] hover:bg-[#116B70]"
                 >
-                  Crear borrador
+                  Crear borrador independiente
                 </button>
               </div>
             )}
 
-            <div className="flex flex-wrap items-center gap-2">
-              {flowGroups.map((g) => {
-                const isSelected = g.flowKey === effectiveFlowKey;
-                return (
-                  <button
-                    key={g.flowKey}
-                    type="button"
-                    onClick={() => handleSelectConversation(g.flowKey)}
-                    className={`min-h-[40px] px-3.5 py-1.5 text-sm rounded-[9px] border text-left transition-colors ${
-                      isSelected
-                        ? 'bg-[#EAF5F2] border-[#167D83] text-[#116B70] font-semibold'
-                        : 'bg-white border-[#DCE3E8] text-[#25364A] hover:bg-[#F7F8FA]'
-                    }`}
-                  >
-                    <span>{g.label}</span>
-                    <span className="ml-2 text-xs text-[#5A6877]">
-                      {g.latestPublished ? `v${g.latestPublished.versionNumber}` : 'borrador'}
-                    </span>
-                  </button>
-                );
-              })}
-            </div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-1">
               <div>
-                <label className="block text-xs font-semibold text-[#5A6877] mb-1">
-                  Nombre de esta conversación
+                <label
+                  htmlFor="conversation-selector"
+                  className="block text-xs font-semibold text-[#5A6877] mb-1"
+                >
+                  Conversación
+                </label>
+                <select
+                  id="conversation-selector"
+                  value={effectiveFlowKey}
+                  disabled={busy}
+                  onChange={(e) => handleSelectConversation(e.target.value)}
+                  className="w-full min-h-[42px] text-sm font-medium text-[#25364A] border border-[#DCE3E8] rounded-[9px] px-3 py-2 bg-white"
+                >
+                  {flowGroups.map((g) => (
+                    <option key={g.flowKey} value={g.flowKey}>
+                      {g.label} —{' '}
+                      {g.latestPublished
+                        ? `Publicada (v${g.latestPublished.versionNumber})`
+                        : 'Solo borrador'}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label
+                  htmlFor="conversation-name-input"
+                  className="block text-xs font-semibold text-[#5A6877] mb-1"
+                >
+                  Nombre de la conversación seleccionada
                 </label>
                 <input
+                  id="conversation-name-input"
                   type="text"
                   value={flowName}
                   onChange={(e) => {
                     setDraftDirty(true);
                     setFlowName(e.target.value);
                   }}
-                  className="w-full min-h-[40px] text-sm border border-[#DCE3E8] rounded-[8px] px-3 py-1.5 bg-white"
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-semibold text-[#5A6877] mb-1">
-                  Identidad estable (flowKey)
-                </label>
-                <input
-                  type="text"
-                  readOnly
-                  value={effectiveFlowKey}
-                  className="w-full min-h-[40px] text-sm font-mono border border-[#E2E7EB] rounded-[8px] px-3 py-1.5 bg-[#F7F8FA] text-[#5A6877]"
+                  className="w-full min-h-[42px] text-sm border border-[#DCE3E8] rounded-[9px] px-3 py-2 bg-white"
                 />
               </div>
             </div>
+
+            {draftFlow && (
+              <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-[#EDF0F2] text-sm">
+                <div className="flex flex-wrap items-center gap-4">
+                  <div>
+                    <span className="text-xs text-[#5A6877] mr-1.5">Nombre:</span>
+                    <span className="font-semibold text-[#25364A]">
+                      {flowName.trim() || draftFlow.name}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-xs text-[#5A6877]">Estado:</span>
+                    <span
+                      className={`inline-block rounded-md px-2 py-0.5 text-xs font-semibold ${
+                        hasFlowDraft
+                          ? 'bg-[#FFF0E3] text-[#8C542C]'
+                          : 'bg-[#EAF5F2] text-[#116B70]'
+                      }`}
+                    >
+                      {draftDirty
+                        ? 'Cambios sin guardar'
+                        : draftFlow.status === 'borrador'
+                          ? 'Borrador'
+                          : 'Publicada'}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-xs text-[#5A6877] mr-1.5">Versión:</span>
+                    <span className="font-medium text-[#25364A]">
+                      v{draftFlow.versionNumber}
+                      {activeGroup?.latestPublished && draftFlow.status === 'borrador'
+                        ? ` (en uso: v${activeGroup.latestPublished.versionNumber})`
+                        : ''}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {(pendingFlowKey !== null || pendingCreateConvName !== null) && (
+              <div className="bg-[#FFF0E3] border border-[#F2D7BF] rounded-[11px] p-4 space-y-3">
+                <div className="text-sm font-semibold text-[#8C542C]">
+                  Tenés modificaciones sin guardar en «{flowName.trim() || activeGroup?.label || 'esta conversación'}»
+                </div>
+                <p className="text-xs text-[#8C542C]">
+                  {pendingCreateConvName
+                    ? `Si creás y pasás a «${pendingCreateConvName}» ahora sin guardar, se perderán tus cambios actuales.`
+                    : `Si cambiás a «${flowGroups.find((g) => g.flowKey === pendingFlowKey)?.label ?? 'la otra conversación'}» sin guardar, se perderán tus cambios actuales.`}
+                </p>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={handleSaveAndProceedSwitch}
+                    className="min-h-[38px] px-3.5 py-1.5 text-xs font-semibold text-white bg-[#167D83] rounded-[8px] hover:bg-[#116B70]"
+                  >
+                    Guardar y continuar
+                  </button>
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={handleDiscardAndProceedSwitch}
+                    className="min-h-[38px] px-3.5 py-1.5 text-xs font-semibold text-[#8C542C] bg-white border border-[#E5C1A0] rounded-[8px] hover:bg-[#FFF8F1]"
+                  >
+                    Descartar cambios y continuar
+                  </button>
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => {
+                      setPendingFlowKey(null);
+                      setPendingCreateConvName(null);
+                    }}
+                    className="min-h-[38px] px-3.5 py-1.5 text-xs font-medium text-[#25364A] bg-white border border-[#DCE3E8] rounded-[8px] hover:bg-[#F7F8FA]"
+                  >
+                    Seguir editando
+                  </button>
+                </div>
+              </div>
+            )}
           </section>
 
           {validationMessages.length > 0 && (
@@ -1586,7 +1777,8 @@ export function FlowAndRulesDesigner({
                   </div>
                   <button
                     type="button"
-                    onClick={() =>
+                    onClick={() => {
+                      setDraftDirty(true);
                       setOosRules((prev) => [
                         ...prev,
                         {
@@ -1595,8 +1787,8 @@ export function FlowAndRulesDesigner({
                           response: 'Respuesta preparada por tu negocio.',
                           offerHumanHandoff: true,
                         },
-                      ])
-                    }
+                      ]);
+                    }}
                     className="text-sm font-medium text-[#167D83] hover:underline min-h-[40px] px-2"
                   >
                     + Agregar respuesta
@@ -1616,6 +1808,7 @@ export function FlowAndRulesDesigner({
                             type="text"
                             value={r.keywords.join(', ')}
                             onChange={(e) => {
+                              setDraftDirty(true);
                               const copy = [...oosRules];
                               copy[idx] = {
                                 ...r,
@@ -1631,9 +1824,10 @@ export function FlowAndRulesDesigner({
                           />
                           <button
                             type="button"
-                            onClick={() =>
-                              setOosRules((prev) => prev.filter((_, i) => i !== idx))
-                            }
+                            onClick={() => {
+                              setDraftDirty(true);
+                              setOosRules((prev) => prev.filter((_, i) => i !== idx));
+                            }}
                             className="text-sm text-red-700 hover:underline px-2 min-h-[40px]"
                           >
                             Quitar
@@ -1643,6 +1837,7 @@ export function FlowAndRulesDesigner({
                           type="text"
                           value={r.response}
                           onChange={(e) => {
+                            setDraftDirty(true);
                             const copy = [...oosRules];
                             copy[idx] = { ...r, response: e.target.value };
                             setOosRules(copy);
@@ -1785,15 +1980,23 @@ export function FlowAndRulesDesigner({
               {/* Published version history */}
               <section className="bg-white border border-[#E2E7EB] rounded-[13px] p-6 space-y-3">
                 <h3 className="text-base font-semibold text-[#25364A]">
-                  Ediciones publicadas ({activeGroup?.label ?? effectiveFlowKey})
+                  Ediciones publicadas ({activeGroup?.label ?? (flowName.trim() || 'Conversación')})
                 </h3>
                 <div className="divide-y divide-[#EDF0F2]">
-                  {publishedFlows.map((fv, idx) => {
-                    const isActive =
-                      fv.id === business.activeFlowVersionId ||
-                      (!publishedFlows.some((x) => x.id === business.activeFlowVersionId) &&
-                        idx === 0);
-                    return (
+                  {(() => {
+                    const linkedProd = (business.products ?? []).find(
+                      (p) =>
+                        p.targetType !== 'handoff' &&
+                        resolveProductFlowKey(p) === effectiveFlowKey &&
+                        p.flowVersionId
+                    );
+                    const activePubIdForGroup =
+                      publishedFlows.find((x) => x.id === business.activeFlowVersionId)?.id ??
+                      publishedFlows.find((x) => x.id === linkedProd?.flowVersionId)?.id ??
+                      publishedFlows[0]?.id;
+                    return publishedFlows.map((fv) => {
+                      const isActive = fv.id === activePubIdForGroup;
+                      return (
                       <div
                         key={fv.id}
                         className="py-3 flex flex-wrap items-center justify-between gap-3 text-sm"
@@ -1826,8 +2029,9 @@ export function FlowAndRulesDesigner({
                           </button>
                         )}
                       </div>
-                    );
-                  })}
+                      );
+                    });
+                  })()}
                 </div>
               </section>
             </div>

@@ -29,6 +29,7 @@ import type {
   UserCredential,
   UserExternalIdentity,
 } from '../../shared/types.ts';
+import { reconcileStableProductFlowKeys } from '../modules/config.ts';
 import { translatePgConnectionError, validateDatabaseUrl } from '../modules/urlHelper.ts';
 import { getEnv, isWorkerRuntime, scheduleBackgroundTask } from '../runtimeContext.ts';
 import { SCHEMA_STATEMENTS } from './schemaSql.ts';
@@ -810,7 +811,7 @@ export async function loadStoreFromPg(client: PoolClient): Promise<NalasStore | 
     proAiCallsTotal: Number(counterRow?.pro_ai_calls_total ?? 0),
   };
 
-  return {
+  const loadedStore: NalasStore = {
     businesses,
     users,
     userCredentials,
@@ -838,6 +839,8 @@ export async function loadStoreFromPg(client: PoolClient): Promise<NalasStore | 
     backups,
     counters,
   };
+  reconcileStableProductFlowKeys(loadedStore);
+  return loadedStore;
 }
 
 export async function saveStoreToPg(client: PoolClient, store: NalasStore): Promise<void> {
@@ -2166,6 +2169,7 @@ export async function loadWasapFlowConversationBundlePg(
     backups: [],
     counters,
   };
+  reconcileStableProductFlowKeys(miniStore);
 
   const preExisting: WasapFlowBundlePreExisting = {
     contactIds: new Set(contacts.map((c) => c.id)),

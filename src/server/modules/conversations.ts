@@ -123,7 +123,7 @@ function getConversationHandoffConfig(
   const pinnedFlow = session?.pinnedFlowVersionId
     ? store.flowVersions.find((f) => f.id === session.pinnedFlowVersionId)
     : undefined;
-  if (pinnedFlow?.humanHandoffConfig) {
+  if (pinnedFlow) {
     return resolveHumanHandoffConfig(pinnedFlow.humanHandoffConfig);
   }
   const biz = store.businesses.find((b) => b.id === businessId);

@@ -8,6 +8,7 @@ import {
 } from '../db/pgStore.ts';
 import { getEnv, isWorkerRuntime } from '../runtimeContext.ts';
 import { repairExistingAgentContacts } from './commercial.ts';
+import { reconcileStableProductFlowKeys } from './config.ts';
 import { sanitizeErroneousProdWhatsAppBinding } from './metaAssetPolicy.ts';
 import { createInitialStore } from './seed.ts';
 
@@ -168,6 +169,10 @@ export function upgradeOptingDraftIfStale(store: NalasStore): boolean {
   }
 
   if (sanitizeErroneousProdWhatsAppBinding(store)) {
+    changed = true;
+  }
+
+  if (reconcileStableProductFlowKeys(store)) {
     changed = true;
   }
 

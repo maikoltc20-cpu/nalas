@@ -1136,7 +1136,15 @@ webApp.post('/api/flows/draft', async (c) => {
       const targetRuleset =
         store.rulesetVersions.find((r) => r.businessId === businessId && r.status === 'borrador') ??
         store.rulesetVersions.find((r) => r.id === biz.activeRulesetVersionId);
-      const isPrimaryKey = getFlowKey(draft) === (businessId === 'biz_nexo' ? 'opting' : 'default');
+      const activeFlow = store.flowVersions.find(
+        (f) => f.id === biz.activeFlowVersionId && f.businessId === businessId
+      );
+      const primaryKey = activeFlow
+        ? getFlowKey(activeFlow)
+        : businessId === 'biz_nexo'
+          ? 'opting'
+          : 'default';
+      const isPrimaryKey = getFlowKey(draft) === primaryKey;
       const issues = validateFlowAndDependencies(draft, isPrimaryKey ? targetRuleset : undefined);
       return { draft, issues };
     });
