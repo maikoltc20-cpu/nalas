@@ -5,6 +5,9 @@ name = "nalas-piloto"
 main = "src/worker.ts"
 compatibility_date = "2026-03-01"
 compatibility_flags = ["nodejs_compat"]
+# Preserva variables de texto configuradas en Cloudflare Dashboard (p. ej. META_EMBEDDED_SIGNUP_CONFIG_ID, APP_URL)
+# para que los despliegues posteriores no las sobrescriban ni eliminen al sincronizar [vars].
+keep_vars = true
 
 [assets]
 directory = "./dist"
@@ -22,24 +25,29 @@ crons = ["*/30 * * * *"]
 NODE_ENV = "production"
 NALAS_DISABLE_DEMO_LOGIN = "true"
 META_BUSINESS_ID = "biz_nexo"
+# Identificador público de la app Meta ("Nalas") para intercambio OAuth y Registro insertado
+META_APP_ID = "1816168166333946"
 # Mantener en "false" hasta validar webhook y credenciales definitivas de WhatsApp Cloud API
 META_OUTBOUND_ENABLED = "false"
 # Habilita respuestas automáticas exclusivamente para conn_nexo_wa_test (Espacio de prueba); mantener "false" por defecto
 META_TEST_OUTBOUND_ENABLED = "false"
 
+# Variables públicas opcionales que persisten entre publicaciones gracias a keep_vars = true
+# (configurar como Text/Variable en Cloudflare Dashboard -> Settings -> Variables and Secrets, o agregar aquí):
+#   - META_EMBEDDED_SIGNUP_CONFIG_ID (ID público de configuración de Facebook Login for Business en Meta para Registro insertado)
+#   - APP_URL                        (opcional: https://<worker>.<subdominio>.workers.dev)
+#   - META_PHONE_NUMBER_ID           (identificador del número real de NEXO en Producción)
+#   - META_TEST_PHONE_NUMBER_ID      (opcional: número de prueba de Meta en Espacio de prueba; por defecto 1435307863000385)
+
 # Configurar únicamente como Secrets en Cloudflare Dashboard (Workers & Pages -> Settings -> Variables and Secrets)
 # o con "npx wrangler secret put <NOMBRE>" (nunca incluir valores secretos en este repositorio):
-#   - DATABASE_URL              (obligatorio: cadena Neon "-pooler")
-#   - NALAS_SESSION_SECRET      (obligatorio: >= 32 caracteres aleatorios)
-#   - NALAS_ADMIN_EMAIL         (obligatorio para login/inicialización controlada)
-#   - NALAS_ADMIN_PASSWORD      (obligatorio para login/inicialización controlada)
-#   - NALAS_INIT_SECRET         (opcional: token dedicado para POST /api/system/initialize)
-#   - GOOGLE_CLIENT_ID          (opcional: Client ID OAuth para "Continuar con Google")
-#   - GOOGLE_CLIENT_SECRET      (opcional: Client Secret OAuth para "Continuar con Google")
-#   - META_APP_ID               (obligatorio para intercambiar el código OAuth del registro alojado de Meta)
-#   - META_APP_SECRET           (obligatorio al validar firma de Meta Webhook e intercambio OAuth)
-#   - META_EMBEDDED_SIGNUP_CONFIG_ID (opcional/obligatorio para iniciar el flujo desde Nala con Facebook Login for Business)
-#   - APP_URL                   (opcional: https://<worker>.<subdominio>.workers.dev)
-#   - META_WHATSAPP_ACCESS_TOKEN / META_PHONE_NUMBER_ID (credenciales del número real en Producción)
+#   - DATABASE_URL                    (obligatorio: cadena Neon "-pooler")
+#   - NALAS_SESSION_SECRET            (obligatorio: >= 32 caracteres aleatorios)
+#   - NALAS_ADMIN_EMAIL               (obligatorio para login/inicialización controlada)
+#   - NALAS_ADMIN_PASSWORD            (obligatorio para login/inicialización controlada)
+#   - NALAS_INIT_SECRET               (opcional: token dedicado para POST /api/system/initialize)
+#   - GOOGLE_CLIENT_ID                (opcional: Client ID OAuth para "Continuar con Google")
+#   - GOOGLE_CLIENT_SECRET            (opcional: Client Secret OAuth para "Continuar con Google")
+#   - META_APP_SECRET                 (obligatorio al validar firma de Meta Webhook e intercambio OAuth)
+#   - META_WHATSAPP_ACCESS_TOKEN      (token del número real en Producción)
 #   - META_TEST_WHATSAPP_ACCESS_TOKEN (obligatorio al activar META_TEST_OUTBOUND_ENABLED="true"; token exclusivo del número de prueba)
-#   - META_TEST_PHONE_NUMBER_ID (opcional: número de prueba de Meta en Espacio de prueba; por defecto 1435307863000385)
