@@ -77,9 +77,10 @@ import {
   buildClearMetaSignupCookieHeader,
   completeMetaEmbeddedSignupExchange,
   createMetaConfirmToken,
-  createMetaEmbeddedSignupRequest,
   getMetaTargetBusinessId,
   isErroneousProdWhatsAppConnection,
+  type MetaEmbeddedSignupSessionEvent,
+  processMetaEmbeddedSignupSdkCompletion,
   sanitizeErroneousProdWhatsAppBinding,
   saveMetaEmbeddedSignupState,
   verifyMetaConfirmToken,
@@ -1334,48 +1335,64 @@ function buildMetaSignupRedirect(
   return new Response(null, { status: 302, headers });
 }
 
+const ALLOWED_META_SDK_ORIGINS = new Set([
+  'https://www.facebook.com',
+  'https://web.facebook.com',
+  'https://business.facebook.com',
+]);
+
 webApp.get('/api/integrations/meta/embedded-signup/start', async (c) => {
-  const https = isHttpsRequest(c.req.raw, (n) => c.req.header(n));
-  const wantsJson = (c.req.header('accept') || '').includes('application/json') &&
+  const wantsJson =
+    (c.req.header('accept') || '').includes('application/json') &&
     !(c.req.header('accept') || '').includes('text/html');
+  const msg =
+    'La redirección OAuth directa fue reemplazada por el lanzador oficial de Embedded Signup (Coexistencia v4) con Facebook JavaScript SDK desde el panel de Integraciones.';
+  if (wantsJson) {
+    return c.json({ error: msg }, { status: 410 });
+  }
+  return buildMetaSignupRedirect(c.req.raw, 'error', msg);
+});
+
+webApp.post('/api/integrations/meta/embedded-signup/sdk-complete', async (c) => {
   try {
     const userId = c.get('authUserId');
     if (!userId) {
       return c.json({ error: 'Sesión no autenticada.' }, { status: 401 });
     }
+    const body = (await c.req.json().catch(() => ({}))) as {
+      businessId?: string;
+      code?: string;
+      loginStatus?: string;
+      sessionEvent?: MetaEmbeddedSignupSessionEvent | null;
+    };
     const targetBusinessId =
-      String(c.req.query('businessId') || '').trim() || getMetaTargetBusinessId();
+      String(body.businessId || '').trim() || getMetaTargetBusinessId();
     const store = await readStore();
     const ctx = resolveActorContext(store, userId, targetBusinessId);
     assertPermission(ctx, 'manageIntegrations');
 
-    const { authorizationUrl, stateCookieHeader } = await createMetaEmbeddedSignupRequest({
+    if (
+      body.sessionEvent?.origin &&
+      !ALLOWED_META_SDK_ORIGINS.has(String(body.sessionEvent.origin).trim())
+    ) {
+      return c.json(
+        { error: 'Origen del evento WA_EMBEDDED_SIGNUP no autorizado.' },
+        { status: 400 }
+      );
+    }
+
+    const result = await processMetaEmbeddedSignupSdkCompletion({
       request: c.req.raw,
-      isHttps: https,
-      actorUserId: userId,
       businessId: targetBusinessId,
+      actorUserId: userId,
+      code: typeof body.code === 'string' ? body.code : undefined,
+      loginStatus: typeof body.loginStatus === 'string' ? body.loginStatus : undefined,
+      sessionEvent: body.sessionEvent ?? null,
     });
 
-    if (wantsJson) {
-      const headers = new Headers({ 'Content-Type': 'application/json; charset=utf-8' });
-      headers.append('Set-Cookie', stateCookieHeader);
-      return new Response(JSON.stringify({ authorizationUrl }), { status: 200, headers });
-    }
-
-    const headers = new Headers();
-    headers.set('Location', authorizationUrl);
-    headers.append('Set-Cookie', stateCookieHeader);
-    return new Response(null, { status: 302, headers });
+    return c.json(result);
   } catch (err) {
-    const statusCode = (err as { statusCode?: number })?.statusCode ?? 500;
-    const msg =
-      err instanceof Error
-        ? err.message
-        : 'No se pudo iniciar el registro alojado de Meta.';
-    if (wantsJson || statusCode === 403 || statusCode === 401) {
-      return c.json({ error: msg }, { status: statusCode as 401 | 403 | 500 | 503 });
-    }
-    return buildMetaSignupRedirect(c.req.raw, 'error', msg);
+    return errorResponse(err);
   }
 });
 

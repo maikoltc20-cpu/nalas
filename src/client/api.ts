@@ -357,8 +357,13 @@ export const nalasApi = {
         };
       };
       embeddedSignup: {
+        appId: string;
+        configId: string;
+        graphVersion: string;
+        embeddedSignupVersion: string;
         redirectUri: string;
         startPath: string;
+        sdkCompletePath: string;
         appIdConfigured: boolean;
         appSecretConfigured: boolean;
         configIdConfigured: boolean;
@@ -423,6 +428,45 @@ export const nalasApi = {
       ctx,
       { method: 'POST', body: JSON.stringify({}) }
     );
+  },
+  completeMetaEmbeddedSignupSdk(
+    ctx: ApiContext,
+    payload: {
+      businessId?: string;
+      code?: string;
+      loginStatus?: string;
+      sessionEvent?: {
+        event: string;
+        wabaId?: string;
+        phoneNumberId?: string;
+        businessPortfolioId?: string;
+        errorMessage?: string;
+        errorId?: string;
+        sessionId?: string;
+        currentStep?: string;
+        origin: string;
+      } | null;
+    }
+  ) {
+    return apiFetch<{
+      status: 'pendiente' | 'conectado' | 'error';
+      businessId: string;
+      connectionId: string;
+      wabaId?: string;
+      phoneNumberId?: string;
+      displayPhoneNumber?: string;
+      verifiedName?: string;
+      platformType?: string;
+      coexistenceMode: boolean;
+      subscribedToWaba: boolean;
+      tokenExchanged: boolean;
+      statusReason: string;
+      lastError?: string;
+      updatedAt?: string;
+    }>('/api/integrations/meta/embedded-signup/sdk-complete', ctx, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
   },
   retryOutbox(ctx: ApiContext, outboxId: string) {
     return apiFetch(`/api/outbox/${outboxId}/retry`, ctx, {

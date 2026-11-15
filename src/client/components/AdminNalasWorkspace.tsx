@@ -15,6 +15,7 @@ import {
 } from 'lucide-react';
 import type { AcceptanceCriterionResult, Business } from '../../shared/types';
 import { type ApiContext, type BootstrapResponse, formatMoney, nalasApi } from '../api';
+import { launchMetaEmbeddedSignup } from '../metaSdk';
 
 interface Props {
   data: BootstrapResponse;
@@ -210,6 +211,69 @@ export function AdminNalasWorkspace({
       onNotice('Token de verificación regenerado en servidor.');
     } catch (e) {
       onError(e instanceof Error ? e.message : 'No se pudo regenerar el token.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleLaunchMetaEmbeddedSignup() {
+    if (!metaConfig?.embeddedSignup) {
+      onError('La configuración de Meta Embedded Signup aún no está cargada.');
+      return;
+    }
+    const { appId, configId, graphVersion, launchReady } = metaConfig.embeddedSignup;
+    if (!launchReady || !appId || !configId) {
+      onError(
+        'Falta configurar META_APP_ID, META_APP_SECRET o META_EMBEDDED_SIGNUP_CONFIG_ID en Cloudflare.'
+      );
+      return;
+    }
+
+    setBusy(true);
+    try {
+      const sdkResult = await launchMetaEmbeddedSignup({
+        appId,
+        configId,
+        graphVersion,
+      });
+
+      const updatedState = await nalasApi.completeMetaEmbeddedSignupSdk(ctx, {
+        businessId: metaConfig.embeddedSignup.connectionState.businessId || ctx.businessId,
+        code: sdkResult.code,
+        loginStatus: sdkResult.loginStatus,
+        sessionEvent: sdkResult.sessionEvent,
+      });
+
+      setMetaConfig((prev) =>
+        prev
+          ? {
+              ...prev,
+              embeddedSignup: {
+                ...prev.embeddedSignup,
+                connectionState: updatedState,
+              },
+            }
+          : prev
+      );
+      await onRefresh();
+
+      if (updatedState.status === 'conectado' && updatedState.coexistenceMode) {
+        onNotice(updatedState.statusReason);
+      } else if (updatedState.status === 'error' || updatedState.lastError) {
+        onError(
+          updatedState.lastError
+            ? `${updatedState.statusReason} (${updatedState.lastError})`
+            : updatedState.statusReason
+        );
+      } else {
+        onNotice(updatedState.statusReason);
+      }
+    } catch (e) {
+      onError(
+        e instanceof Error
+          ? e.message
+          : 'No se pudo completar el lanzador oficial de Meta Embedded Signup.'
+      );
     } finally {
       setBusy(false);
     }
@@ -833,10 +897,10 @@ export function AdminNalasWorkspace({
                     <div className="flex flex-wrap items-center justify-between gap-3">
                       <div>
                         <h3 className="text-sm font-semibold text-[#25364A]">
-                          Registro insertado alojado por Meta (Coexistencia iPhone)
+                          Embedded Signup oficial por SDK JS (Coexistencia iPhone · {metaConfig.embeddedSignup.embeddedSignupVersion})
                         </h3>
                         <p className="text-xs text-[#5A6877] mt-0.5">
-                          Conecta el número existente sin re-registrarlo ni desconectar la app WhatsApp Business del iPhone.
+                          Abre el flujo oficial mediante Facebook JavaScript SDK ({metaConfig.embeddedSignup.graphVersion}) para vincular el WhatsApp Business existente (+506 7058 2232) sin re-registrarlo ni desconectar el iPhone.
                         </p>
                       </div>
                       <span
@@ -856,34 +920,16 @@ export function AdminNalasWorkspace({
                       </span>
                     </div>
 
-                    <div className="space-y-1.5">
-                      <div className="text-xs font-medium text-[#5A6877]">
-                        URI de redireccionamiento OAuth (pegar en Meta → Generar enlace)
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <code className="flex-1 text-xs font-mono bg-white border border-[#E2E7EB] rounded px-3 py-2 text-[#25364A] break-all">
-                          {metaConfig.embeddedSignup.redirectUri}
-                        </code>
-                        <button
-                          type="button"
-                          onClick={() =>
-                            handleCopyText('oauth_redirect', metaConfig.embeddedSignup.redirectUri)
-                          }
-                          className="inline-flex items-center gap-1.5 min-h-[40px] px-3 py-2 text-xs font-medium text-[#25364A] bg-white border border-[#DCE3E8] rounded-[8px] hover:bg-[#F7F8FA] shrink-0"
-                        >
-                          {copiedField === 'oauth_redirect' ? (
-                            <Check className="w-3.5 h-3.5 text-[#167D83]" />
-                          ) : (
-                            <Copy className="w-3.5 h-3.5" />
-                          )}
-                          <span>{copiedField === 'oauth_redirect' ? 'Copiada' : 'Copiar'}</span>
-                        </button>
-                      </div>
-                    </div>
-
                     <div className="text-xs text-[#25364A] leading-relaxed">
                       {metaConfig.embeddedSignup.connectionState.statusReason}
                     </div>
+
+                    {metaConfig.embeddedSignup.connectionState.lastError && (
+                      <div className="p-2.5 bg-red-50 border border-red-200 rounded text-xs text-red-800 break-words">
+                        <span className="font-semibold">Detalle devuelto por Meta:</span>{' '}
+                        {metaConfig.embeddedSignup.connectionState.lastError}
+                      </div>
+                    )}
 
                     <div className="text-xs text-[#5A6877]">
                       Coexistencia iPhone:{' '}
@@ -891,7 +937,7 @@ export function AdminNalasWorkspace({
                         {metaConfig.embeddedSignup.connectionState.status === 'conectado' &&
                         metaConfig.embeddedSignup.connectionState.coexistenceMode
                           ? 'Activa (+506 7058 2232)'
-                          : 'No activa (pendiente de vincular +506 7058 2232)'}
+                          : 'No activa (pendiente de confirmar +506 7058 2232 en modo coexistencia)'}
                       </strong>
                     </div>
 
@@ -924,17 +970,13 @@ export function AdminNalasWorkspace({
                     <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
                       <p className="text-xs text-[#5A6877]">
                         {metaConfig.embeddedSignup.launchReady
-                          ? 'Listo para iniciar el flujo oficial desde Nala o desde el enlace generado en Meta.'
-                          : 'Para iniciar desde este botón configurá META_APP_ID y META_EMBEDDED_SIGNUP_CONFIG_ID en Cloudflare. Si usás "Generar enlace" en Meta, pegá la URI OAuth de arriba.'}
+                          ? 'Listo para abrir el popup oficial de Embedded Signup (SDK JS). Requiere dominio autorizado en Meta.'
+                          : 'Configurá META_APP_ID, META_APP_SECRET y META_EMBEDDED_SIGNUP_CONFIG_ID en Cloudflare para habilitar el lanzador oficial.'}
                       </p>
                       <button
                         type="button"
                         disabled={busy || !metaConfig.embeddedSignup.launchReady}
-                        onClick={() => {
-                          window.location.assign(
-                            `${metaConfig.embeddedSignup.startPath}?businessId=${encodeURIComponent(business.id)}`
-                          );
-                        }}
+                        onClick={handleLaunchMetaEmbeddedSignup}
                         className="inline-flex items-center gap-2 min-h-[40px] px-4 py-2 text-xs font-semibold text-white bg-[#167D83] rounded-[9px] hover:bg-[#116B70] disabled:opacity-50 whitespace-nowrap shrink-0"
                       >
                         <span>Conectar WhatsApp (Coexistencia)</span>

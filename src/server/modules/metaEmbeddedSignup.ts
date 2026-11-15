@@ -24,6 +24,20 @@ import { resolveSafeAppBaseUrl } from './urlHelper.ts';
 
 export type MetaEmbeddedConnectionStatus = 'pendiente' | 'conectado' | 'error';
 
+export const META_EMBEDDED_SIGNUP_VERSION = 'v4';
+
+export interface MetaEmbeddedSignupSessionEvent {
+  event?: string;
+  wabaId?: string;
+  phoneNumberId?: string;
+  businessPortfolioId?: string;
+  errorMessage?: string;
+  errorId?: string;
+  sessionId?: string;
+  currentStep?: string;
+  origin?: string;
+}
+
 export interface MetaEmbeddedSignupState {
   status: MetaEmbeddedConnectionStatus;
   businessId: string;
@@ -170,7 +184,7 @@ export function getMetaEmbeddedSignupConfigId(): string {
 }
 
 export function getMetaGraphVersion(): string {
-  return getEnv('META_GRAPH_API_VERSION')?.trim() || 'v21.0';
+  return getEnv('META_GRAPH_API_VERSION')?.trim() || 'v24.0';
 }
 
 export function getMetaEmbeddedSignupRedirectUri(requestOrOrigin?: Request | string): string {
@@ -613,11 +627,20 @@ interface MetaPhoneNumberItem {
   code_verification_status?: string;
   quality_rating?: string;
   platform_type?: string;
+  is_on_biz_app?: boolean;
   is_official_business_account?: boolean;
 }
 
 interface PhoneNumbersResponse {
   data?: MetaPhoneNumberItem[];
+}
+
+interface MetaPhoneCoexistenceCheckResponse {
+  id?: string;
+  display_phone_number?: string;
+  verified_name?: string;
+  platform_type?: string;
+  is_on_biz_app?: boolean;
 }
 
 function resolveProductionWhatsAppConnectionInStore(
@@ -662,6 +685,118 @@ async function retireErroneousProdAndRecordRejection(params: {
   }
 }
 
+export async function processMetaEmbeddedSignupSdkCompletion(params: {
+  request: Request;
+  businessId: string;
+  actorUserId: string;
+  code?: string;
+  loginStatus?: string;
+  sessionEvent?: MetaEmbeddedSignupSessionEvent | null;
+}): Promise<MetaEmbeddedSignupState> {
+  const targetBusinessId = params.businessId || getMetaTargetBusinessId();
+  const sessionEvent = params.sessionEvent ?? undefined;
+  const eventName = sessionEvent?.event?.trim() || '';
+  const code = params.code?.trim() || '';
+
+  if (eventName === 'ERROR') {
+    const metaErrParts = [
+      sessionEvent?.errorMessage?.trim() || 'Meta reportó un error durante el registro insertado.',
+      sessionEvent?.errorId ? `error_id=${sessionEvent.errorId}` : null,
+      sessionEvent?.sessionId ? `session_id=${sessionEvent.sessionId}` : null,
+    ].filter(Boolean);
+    const errDetail = metaErrParts.join(' · ');
+    const reason = `Error real reportado por Meta Embedded Signup: ${errDetail}. No se vinculó producción ni se activó coexistencia.`;
+    await retireErroneousProdAndRecordRejection({
+      businessId: targetBusinessId,
+      actorUserId: params.actorUserId,
+      reasonDetail: reason,
+    });
+    return saveMetaEmbeddedSignupState({
+      status: 'error',
+      businessId: targetBusinessId,
+      connectionId: 'conn_nexo_wa_prod',
+      coexistenceMode: false,
+      subscribedToWaba: false,
+      tokenExchanged: false,
+      statusReason: reason,
+      lastError: errDetail,
+    });
+  }
+
+  if (eventName === 'CANCEL') {
+    const step = sessionEvent?.currentStep?.trim();
+    const reason = step
+      ? `El proceso de Meta Embedded Signup se canceló en el paso "${step}". La conexión de producción permanece pendiente y sin modo coexistencia.`
+      : 'El proceso de Meta Embedded Signup fue cancelado antes de completar la vinculación. La conexión permanece pendiente y sin modo coexistencia.';
+    await retireErroneousProdAndRecordRejection({
+      businessId: targetBusinessId,
+      actorUserId: params.actorUserId,
+      reasonDetail: reason,
+    });
+    return saveMetaEmbeddedSignupState({
+      status: 'pendiente',
+      businessId: targetBusinessId,
+      connectionId: 'conn_nexo_wa_prod',
+      coexistenceMode: false,
+      subscribedToWaba: false,
+      tokenExchanged: false,
+      statusReason: reason,
+    });
+  }
+
+  if (!code) {
+    const statusLabel = params.loginStatus?.trim() || 'sin autorización';
+    const reason = `Meta no devolvió un código de autorización (${statusLabel}). Verificá si cerraste el popup o si la app Meta aún tiene pendiente App Review / Tech Provider. La conexión permanece pendiente y sin modo coexistencia.`;
+    await retireErroneousProdAndRecordRejection({
+      businessId: targetBusinessId,
+      actorUserId: params.actorUserId,
+      reasonDetail: reason,
+    });
+    return saveMetaEmbeddedSignupState({
+      status: 'pendiente',
+      businessId: targetBusinessId,
+      connectionId: 'conn_nexo_wa_prod',
+      coexistenceMode: false,
+      subscribedToWaba: false,
+      tokenExchanged: false,
+      statusReason: reason,
+      lastError: params.loginStatus ? `FB.login status=${params.loginStatus}` : undefined,
+    });
+  }
+
+  if (eventName !== 'FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING') {
+    const observed = eventName || 'ningún evento WA_EMBEDDED_SIGNUP';
+    const reason = `Meta devolvió código OAuth pero no confirmó el registro del WhatsApp Business existente (evento recibido: ${observed}; requerido: FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING). Esto ocurre si se eligió flujo Cloud API estándar, si el config_id no es de Embedded Signup con coexistencia o si Meta aún restringe la incorporación. No se vinculó conn_nexo_wa_prod ni se declaró coexistencia.`;
+    await retireErroneousProdAndRecordRejection({
+      businessId: targetBusinessId,
+      actorUserId: params.actorUserId,
+      reasonDetail: reason,
+    });
+    return saveMetaEmbeddedSignupState({
+      status: 'pendiente',
+      businessId: targetBusinessId,
+      connectionId: 'conn_nexo_wa_prod',
+      coexistenceMode: false,
+      subscribedToWaba: false,
+      tokenExchanged: false,
+      statusReason: reason,
+      lastError: `Evento WA_EMBEDDED_SIGNUP recibido: ${observed}`,
+    });
+  }
+
+  return completeMetaEmbeddedSignupExchange({
+    request: params.request,
+    code,
+    businessId: targetBusinessId,
+    actorUserId: params.actorUserId,
+    allowEmptyRedirectUriFallback: true,
+    wabaIdHint: sessionEvent?.wabaId?.trim() || undefined,
+    phoneNumberIdHint: sessionEvent?.phoneNumberId?.trim() || undefined,
+    source: 'js_sdk',
+    sessionEvent,
+  });
+}
+
 export async function completeMetaEmbeddedSignupExchange(params: {
   request: Request;
   code: string;
@@ -671,12 +806,37 @@ export async function completeMetaEmbeddedSignupExchange(params: {
   allowEmptyRedirectUriFallback: boolean;
   wabaIdHint?: string;
   phoneNumberIdHint?: string;
+  source?: 'js_sdk' | 'oauth_callback';
+  sessionEvent?: MetaEmbeddedSignupSessionEvent;
 }): Promise<MetaEmbeddedSignupState> {
   const targetBusinessId = params.businessId || getMetaTargetBusinessId();
   const appId = getMetaAppId();
   const appSecret = getMetaAppSecret();
   const graphVersion = getMetaGraphVersion();
   const configuredPhoneId = getEnv('META_PHONE_NUMBER_ID')?.trim() || '';
+
+  if (
+    params.source === 'js_sdk' &&
+    params.sessionEvent?.event?.trim() !== 'FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING'
+  ) {
+    const observed = params.sessionEvent?.event?.trim() || 'sin evento WA_EMBEDDED_SIGNUP';
+    const reason = `Meta no confirmó el registro del WhatsApp Business existente (evento recibido: ${observed}). La conexión permanece pendiente y sin coexistencia.`;
+    await retireErroneousProdAndRecordRejection({
+      businessId: targetBusinessId,
+      actorUserId: params.actorUserId,
+      reasonDetail: reason,
+    });
+    return saveMetaEmbeddedSignupState({
+      status: 'pendiente',
+      businessId: targetBusinessId,
+      connectionId: 'conn_nexo_wa_prod',
+      coexistenceMode: false,
+      subscribedToWaba: false,
+      tokenExchanged: false,
+      statusReason: reason,
+      lastError: `Evento WA_EMBEDDED_SIGNUP recibido: ${observed}`,
+    });
+  }
 
   if (!appId || !appSecret) {
     const missing = [!appId ? 'META_APP_ID' : null, !appSecret ? 'META_APP_SECRET' : null]
@@ -695,7 +855,9 @@ export async function completeMetaEmbeddedSignupExchange(params: {
   }
 
   const redirectUri =
-    params.redirectUriOverride || getMetaEmbeddedSignupRedirectUri(params.request);
+    params.source === 'js_sdk'
+      ? undefined
+      : params.redirectUriOverride || getMetaEmbeddedSignupRedirectUri(params.request);
 
   // 1. Intercambio de código OAuth del lado servidor (nunca exponer tokens ni secretos al cliente)
   const tokenRes = await exchangeMetaCodeForAccessToken({
@@ -965,7 +1127,93 @@ export async function completeMetaEmbeddedSignupExchange(params: {
     });
   }
 
-  // 4. Suscribir la app Nalas únicamente al WABA real verificado con +506 7058 2232
+  // 3b. Verificar directamente en Graph API que el número +506 7058 2232 confirme coexistencia (is_on_biz_app=true, platform_type=CLOUD_API)
+  const coexistenceCheckUrl = new URL(
+    `https://graph.facebook.com/${graphVersion}/${encodeURIComponent(resolvedPhoneNumberId)}`
+  );
+  coexistenceCheckUrl.searchParams.set(
+    'fields',
+    'id,display_phone_number,verified_name,platform_type,is_on_biz_app'
+  );
+
+  const coexistResp = await fetch(coexistenceCheckUrl.toString(), {
+    headers: {
+      Authorization: `Bearer ${userAccessToken}`,
+      Accept: 'application/json',
+    },
+  });
+  const coexistJson = (await coexistResp.json().catch(() => ({}))) as MetaPhoneCoexistenceCheckResponse &
+    MetaGraphErrorPayload;
+
+  if (!coexistResp.ok) {
+    const errMsg = formatMetaGraphError(coexistJson, coexistResp.status);
+    const reason = `Se encontró el número ${displayPhoneNumber} (${resolvedPhoneNumberId}), pero Meta falló al confirmar el estado de coexistencia (is_on_biz_app): ${errMsg}`;
+    await retireErroneousProdAndRecordRejection({
+      businessId: targetBusinessId,
+      actorUserId: params.actorUserId,
+      reasonDetail: reason,
+    });
+    return saveMetaEmbeddedSignupState({
+      status: 'error',
+      businessId: targetBusinessId,
+      connectionId: 'conn_nexo_wa_prod',
+      coexistenceMode: false,
+      subscribedToWaba: false,
+      tokenExchanged: true,
+      statusReason: reason,
+      lastError: errMsg,
+    });
+  }
+
+  const confirmedDisplayPhone = coexistJson.display_phone_number?.trim() || displayPhoneNumber;
+  const confirmedPlatformType = coexistJson.platform_type?.trim() || platformType;
+  const confirmedIsOnBizApp = coexistJson.is_on_biz_app === true;
+
+  if (
+    !isExpectedProdDisplayPhone(confirmedDisplayPhone) ||
+    isTestWhatsAppAsset({
+      wabaId: matchedWabaId,
+      phoneNumberId: resolvedPhoneNumberId,
+      displayPhoneNumber: confirmedDisplayPhone,
+    })
+  ) {
+    const reason = `El número verificado (${confirmedDisplayPhone ?? 'sin número'}) no coincide exclusivamente con ${NEXO_EXPECTED_PROD_DISPLAY_PHONE}. La conexión permanece pendiente y sin modo coexistencia.`;
+    await retireErroneousProdAndRecordRejection({
+      businessId: targetBusinessId,
+      actorUserId: params.actorUserId,
+      reasonDetail: reason,
+    });
+    return saveMetaEmbeddedSignupState({
+      status: 'pendiente',
+      businessId: targetBusinessId,
+      connectionId: 'conn_nexo_wa_prod',
+      coexistenceMode: false,
+      subscribedToWaba: false,
+      tokenExchanged: true,
+      statusReason: reason,
+    });
+  }
+
+  if (!confirmedIsOnBizApp || (confirmedPlatformType && confirmedPlatformType !== 'CLOUD_API')) {
+    const reason = `Meta devolvió el número ${confirmedDisplayPhone} (${resolvedPhoneNumberId}), pero no confirmó coexistencia activa con WhatsApp Business móvil (is_on_biz_app=${String(coexistJson.is_on_biz_app)}, platform_type=${confirmedPlatformType ?? 'sin valor'}). No se re-registró el número ni se declaró coexistencia.`;
+    await retireErroneousProdAndRecordRejection({
+      businessId: targetBusinessId,
+      actorUserId: params.actorUserId,
+      reasonDetail: reason,
+    });
+    return saveMetaEmbeddedSignupState({
+      status: 'pendiente',
+      businessId: targetBusinessId,
+      connectionId: 'conn_nexo_wa_prod',
+      coexistenceMode: false,
+      subscribedToWaba: false,
+      tokenExchanged: true,
+      statusReason: reason,
+      lastError: `is_on_biz_app=${String(coexistJson.is_on_biz_app)}, platform_type=${confirmedPlatformType ?? 'sin valor'}`,
+    });
+  }
+
+  // 4. Suscribir la app Nalas únicamente al WABA real verificado con +506 7058 2232 (PROHIBIDO llamar /register para conservar coexistencia en iPhone)
   const subResp = await fetch(
     `https://graph.facebook.com/${graphVersion}/${encodeURIComponent(matchedWabaId)}/subscribed_apps`,
     {
@@ -989,13 +1237,13 @@ export async function completeMetaEmbeddedSignupExchange(params: {
       connectionId: 'conn_nexo_wa_prod',
       wabaId: matchedWabaId,
       phoneNumberId: resolvedPhoneNumberId,
-      displayPhoneNumber,
-      verifiedName,
-      platformType,
+      displayPhoneNumber: confirmedDisplayPhone,
+      verifiedName: coexistJson.verified_name?.trim() || verifiedName,
+      platformType: confirmedPlatformType,
       coexistenceMode: false,
       subscribedToWaba: false,
       tokenExchanged: true,
-      statusReason: `Se identificó WABA ${matchedWabaId} y número ${displayPhoneNumber} (${resolvedPhoneNumberId}), pero falló la suscripción de la app (subscribed_apps): ${errMsg}. La coexistencia aún no está activa.`,
+      statusReason: `Se identificó WABA ${matchedWabaId} y número ${confirmedDisplayPhone} (${resolvedPhoneNumberId}), pero falló la suscripción de la app (subscribed_apps): ${errMsg}. La coexistencia aún no está activa.`,
       lastError: errMsg,
     });
   }
@@ -1004,7 +1252,7 @@ export async function completeMetaEmbeddedSignupExchange(params: {
   const linkedConn = await withStoreTransaction((store) => {
     const conn = resolveProductionWhatsAppConnectionInStore(store, targetBusinessId);
     conn.destinationAddress = resolvedPhoneNumberId;
-    conn.displayName = `WhatsApp NEXO (${displayPhoneNumber})`;
+    conn.displayName = `WhatsApp NEXO (${confirmedDisplayPhone})`;
     conn.implementationStatus = 'Producción conectada';
     conn.status = 'activa';
 
@@ -1015,7 +1263,7 @@ export async function completeMetaEmbeddedSignupExchange(params: {
       module: 'integraciones',
       action: 'vincular_meta_embedded_signup',
       correlationId: conn.id,
-      detail: `Meta Embedded Signup (coexistencia) vinculado a ${targetBusinessId}: WABA=${matchedWabaId}, phone_number_id=${resolvedPhoneNumberId}, número=${displayPhoneNumber}, subscribed_apps=true.`,
+      detail: `Meta Embedded Signup (coexistencia) vinculado a ${targetBusinessId}: WABA=${matchedWabaId}, phone_number_id=${resolvedPhoneNumberId}, número=${confirmedDisplayPhone}, is_on_biz_app=true, platform_type=${confirmedPlatformType ?? 'CLOUD_API'}, subscribed_apps=true.`,
     });
     return { id: conn.id };
   });
@@ -1026,20 +1274,25 @@ export async function completeMetaEmbeddedSignupExchange(params: {
     connectionId: linkedConn.id,
     wabaId: matchedWabaId,
     phoneNumberId: resolvedPhoneNumberId,
-    displayPhoneNumber,
-    verifiedName,
-    platformType,
+    displayPhoneNumber: confirmedDisplayPhone,
+    verifiedName: coexistJson.verified_name?.trim() || verifiedName,
+    platformType: confirmedPlatformType,
     coexistenceMode: true,
     subscribedToWaba: true,
     tokenExchanged: true,
     statusReason:
-      'WABA y número real +506 7058 2232 vinculados correctamente con suscripción activa en modo coexistencia (sin re-registrar ni desconectar el iPhone). Recordá que los envíos siguen pausados (META_OUTBOUND_ENABLED=false) y la sincronización bidireccional completa depende de Tech Provider / campos de coexistencia.',
+      'WABA y número real +506 7058 2232 confirmados por Meta con coexistencia activa (is_on_biz_app=true, suscripción al WABA activa, sin re-registrar ni desconectar el iPhone). Los envíos siguen pausados (META_OUTBOUND_ENABLED=false).',
   });
 }
 
 export async function getMetaEmbeddedSignupOverview(requestOrigin?: string): Promise<{
+  appId: string;
+  configId: string;
+  graphVersion: string;
+  embeddedSignupVersion: string;
   redirectUri: string;
   startPath: string;
+  sdkCompletePath: string;
   appIdConfigured: boolean;
   appSecretConfigured: boolean;
   configIdConfigured: boolean;
@@ -1048,15 +1301,23 @@ export async function getMetaEmbeddedSignupOverview(requestOrigin?: string): Pro
   connectionState: MetaEmbeddedSignupState;
 }> {
   const businessId = getMetaTargetBusinessId();
+  const appId = getMetaAppId();
+  const configId = getMetaEmbeddedSignupConfigId();
+  const graphVersion = getMetaGraphVersion();
   const redirectUri = getMetaEmbeddedSignupRedirectUri(requestOrigin);
-  const appIdConfigured = Boolean(getMetaAppId());
+  const appIdConfigured = Boolean(appId);
   const appSecretConfigured = Boolean(getMetaAppSecret());
-  const configIdConfigured = Boolean(getMetaEmbeddedSignupConfigId());
+  const configIdConfigured = Boolean(configId);
   const connectionState = await readMetaEmbeddedSignupState(businessId);
 
   return {
+    appId,
+    configId,
+    graphVersion,
+    embeddedSignupVersion: META_EMBEDDED_SIGNUP_VERSION,
     redirectUri,
     startPath: '/api/integrations/meta/embedded-signup/start',
+    sdkCompletePath: '/api/integrations/meta/embedded-signup/sdk-complete',
     appIdConfigured,
     appSecretConfigured,
     configIdConfigured,
