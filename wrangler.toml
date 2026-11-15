@@ -31,6 +31,8 @@ META_APP_ID = "1816168166333946"
 META_OUTBOUND_ENABLED = "false"
 # Habilita respuestas automáticas exclusivamente para conn_nexo_wa_test (Espacio de prueba); mantener "false" por defecto
 META_TEST_OUTBOUND_ENABLED = "false"
+# Habilita envíos salientes exclusivamente para conn_nexo_wasapflow (+506 7058 2232); mantener "false" por defecto
+WASAPFLOW_OUTBOUND_ENABLED = "false"
 
 # Variables públicas opcionales que persisten entre publicaciones gracias a keep_vars = true
 # (configurar como Text/Variable en Cloudflare Dashboard -> Settings -> Variables and Secrets, o agregar aquí):
@@ -51,3 +53,5 @@ META_TEST_OUTBOUND_ENABLED = "false"
 #   - META_APP_SECRET                 (obligatorio al validar firma de Meta Webhook e intercambio OAuth)
 #   - META_WHATSAPP_ACCESS_TOKEN      (token del número real en Producción)
 #   - META_TEST_WHATSAPP_ACCESS_TOKEN (obligatorio al activar META_TEST_OUTBOUND_ENABLED="true"; token exclusivo del número de prueba)
+#   - WASAPFLOW_PARTNER_KEY           (obligatorio en servidor para WasapFlow Bridge /connect/session, /clients y /messages)
+#   - WASAPFLOW_WEBHOOK_SECRET        (obligatorio en servidor para validar firma x-wasapflow-signature en /api/webhooks/wasapflow)

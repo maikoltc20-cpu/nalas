@@ -474,6 +474,74 @@ export const nalasApi = {
       body: JSON.stringify({}),
     });
   },
+  getWasapFlowConfig(ctx: ApiContext) {
+    return apiFetch<{
+      targetBusinessId: string;
+      connectionId: string;
+      webhookPath: string;
+      webhookUrl: string;
+      expectedPhone: string;
+      allowedOrigin: string;
+      partnerKeyConfigured: boolean;
+      webhookSecretConfigured: boolean;
+      outboundEnabled: boolean;
+      readyToConnect: boolean;
+      connectionState: {
+        status: 'pendiente' | 'conectado' | 'error';
+        businessId: string;
+        connectionId: string;
+        wabaId?: string;
+        phoneNumberId?: string;
+        displayPhoneNumber?: string;
+        verifiedName?: string;
+        connectionMode?: string;
+        connectionState?: string;
+        qualityRating?: string;
+        statusReason: string;
+        lastError?: string;
+        connectedAt?: string;
+        updatedAt?: string;
+      };
+    }>('/api/integrations/wasapflow/config', ctx);
+  },
+  createWasapFlowConnectSession(
+    ctx: ApiContext,
+    payload?: { businessId?: string; displayName?: string }
+  ) {
+    return apiFetch<{
+      connectUrl: string;
+      expiresIn: number;
+      state: string;
+      allowedOrigin: string;
+    }>('/api/integrations/wasapflow/connect-session', ctx, {
+      method: 'POST',
+      body: JSON.stringify(payload ?? {}),
+    });
+  },
+  verifyWasapFlowConnection(
+    ctx: ApiContext,
+    payload?: { businessId?: string; stateToken?: string; wabaId?: string; phoneNumberId?: string }
+  ) {
+    return apiFetch<{
+      status: 'pendiente' | 'conectado' | 'error';
+      businessId: string;
+      connectionId: string;
+      wabaId?: string;
+      phoneNumberId?: string;
+      displayPhoneNumber?: string;
+      verifiedName?: string;
+      connectionMode?: string;
+      connectionState?: string;
+      qualityRating?: string;
+      statusReason: string;
+      lastError?: string;
+      connectedAt?: string;
+      updatedAt?: string;
+    }>('/api/integrations/wasapflow/verify', ctx, {
+      method: 'POST',
+      body: JSON.stringify(payload ?? {}),
+    });
+  },
   startSimulator(
     ctx: ApiContext,
     payload: {

@@ -56,6 +56,9 @@ export function isExpectedProdDisplayPhone(displayPhoneNumber?: string | null): 
 }
 
 export function isErroneousProdWhatsAppConnection(conn: ChannelConnection): boolean {
+  if (conn.id === 'conn_nexo_wasapflow') {
+    return false;
+  }
   if (conn.environment !== 'produccion' || conn.channelType !== 'whatsapp_prueba') {
     return false;
   }

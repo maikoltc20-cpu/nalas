@@ -96,6 +96,18 @@ import {
   verifyMetaSignature,
 } from './modules/metaWebhook.ts';
 import {
+  createWasapFlowConnectSession,
+  getWasapFlowOverview,
+  processDueWasapFlowOutboxRetries,
+  processWasapFlowWebhookEvent,
+  retrySingleWasapFlowOutbox,
+  verifyAndLinkWasapFlowNumber,
+  verifyWasapFlowWebhookSignature,
+  WASAPFLOW_CONNECTION_ID,
+  WASAPFLOW_WEBHOOK_PATH,
+  type WasapFlowWebhookPayload,
+} from './modules/wasapflowBridge.ts';
+import {
   assertTenantScope,
   createBackupSnapshot,
   getStorageBackendInfo,
@@ -589,7 +601,8 @@ webApp.use('/api/*', async (c, next) => {
     pathname === '/api/system/status' ||
     pathname === '/api/system/initialize' ||
     pathname.startsWith('/api/auth/') ||
-    pathname === '/api/webhooks/meta/whatsapp'
+    pathname === '/api/webhooks/meta/whatsapp' ||
+    pathname === WASAPFLOW_WEBHOOK_PATH
   ) {
     await next();
     return;
@@ -1224,6 +1237,20 @@ webApp.post('/api/outbox/:outboxId/retry', async (c) => {
   try {
     const { userId, businessId } = getActorContext(c);
     const outboxId = c.req.param('outboxId');
+    const preCheck = await readStore();
+    const preCtx = resolveActorContext(preCheck, userId, businessId);
+    assertPermission(preCtx, 'manageIntegrations');
+    const preEvt = assertTenantScope(
+      preCheck.outboxEvents.find((o) => o.id === outboxId),
+      businessId,
+      'OutboxEvent'
+    );
+
+    if (preEvt.connectionId === WASAPFLOW_CONNECTION_ID) {
+      const updated = await retrySingleWasapFlowOutbox(outboxId);
+      return c.json(updated);
+    }
+
     const outbox = await withStoreTransaction((store) => {
       const ctx = resolveActorContext(store, userId, businessId);
       assertPermission(ctx, 'manageIntegrations');
@@ -1248,8 +1275,17 @@ webApp.post('/api/outbox/process-pending', async (c) => {
     const store = await readStore();
     const ctx = resolveActorContext(store, userId, businessId);
     assertPermission(ctx, 'manageIntegrations');
-    const res = await processDueOutboxRetries(10);
-    return c.json(res);
+    const metaRes = await processDueOutboxRetries(10);
+    const wasapflowRes = await processDueWasapFlowOutboxRetries(10);
+    return c.json({
+      meta: metaRes,
+      wasapflow: wasapflowRes,
+      claimedCount: metaRes.claimedCount + wasapflowRes.claimedCount,
+      processed: metaRes.processed + wasapflowRes.processed,
+      succeeded: metaRes.succeeded + wasapflowRes.succeeded,
+      failed: metaRes.failed + wasapflowRes.failed,
+      pausedOutbound: metaRes.pausedOutbound && wasapflowRes.pausedOutbound,
+    });
   } catch (err) {
     return errorResponse(err);
   }
@@ -1633,6 +1669,144 @@ webApp.post('/api/webhooks/meta/whatsapp', async (c) => {
     const bodyText = new TextDecoder().decode(rawBytes);
     const payload = bodyText ? JSON.parse(bodyText) : {};
     const summary = await processMetaWebhookEvents(payload);
+    return c.json({ status: 'ok', ...summary }, { status: 200 });
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 2c. WasapFlow Bridge (Prueba aislada +506 7058 2232 en Coexistencia iPhone)
+// ---------------------------------------------------------------------------
+
+webApp.get('/api/integrations/wasapflow/config', async (c) => {
+  try {
+    const { userId, businessId } = getActorContext(c);
+    const store = await readStore();
+    const ctx = resolveActorContext(store, userId, businessId);
+    assertPermission(ctx, 'manageIntegrations');
+
+    const url = new URL(c.req.url);
+    const forwardedHost = c.req.header('x-forwarded-host') || c.req.header('host');
+    const forwardedProto = c.req.header('x-forwarded-proto') || url.protocol.replace(':', '');
+    const origin = forwardedHost ? `${forwardedProto}://${forwardedHost}` : url.origin;
+    const overview = await getWasapFlowOverview(origin);
+    return c.json(overview);
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.post('/api/integrations/wasapflow/connect-session', async (c) => {
+  try {
+    const { userId, businessId } = getActorContext(c);
+    const store = await readStore();
+    const ctx = resolveActorContext(store, userId, businessId);
+    assertPermission(ctx, 'manageIntegrations');
+    const actorUser = store.users.find((u) => u.id === userId);
+    if (
+      !actorUser?.isPlatformAdmin &&
+      ctx.effectiveRole !== 'propietario' &&
+      ctx.effectiveRole !== 'administrador'
+    ) {
+      return c.json(
+        { error: 'Se requiere permiso de administrador para crear enlaces de WasapFlow.' },
+        { status: 403 }
+      );
+    }
+
+    const body = (await c.req.json().catch(() => ({}))) as {
+      businessId?: string;
+      displayName?: string;
+    };
+    const targetBizId = body.businessId?.trim() || getMetaTargetBusinessId();
+    if (businessId !== targetBizId && !actorUser?.isPlatformAdmin) {
+      return c.json({ error: 'Solo administradores de NEXO pueden iniciar WasapFlow.' }, { status: 403 });
+    }
+
+    const sessionRes = await createWasapFlowConnectSession({
+      actorUserId: userId,
+      businessId: targetBizId,
+      displayName: body.displayName,
+    });
+    return c.json(sessionRes);
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.post('/api/integrations/wasapflow/verify', async (c) => {
+  try {
+    const { userId, businessId } = getActorContext(c);
+    const store = await readStore();
+    const ctx = resolveActorContext(store, userId, businessId);
+    assertPermission(ctx, 'manageIntegrations');
+    const actorUser = store.users.find((u) => u.id === userId);
+    if (
+      !actorUser?.isPlatformAdmin &&
+      ctx.effectiveRole !== 'propietario' &&
+      ctx.effectiveRole !== 'administrador'
+    ) {
+      return c.json(
+        { error: 'Se requiere permiso de administrador para verificar la conexión de WasapFlow.' },
+        { status: 403 }
+      );
+    }
+
+    const body = (await c.req.json().catch(() => ({}))) as {
+      businessId?: string;
+      stateToken?: string;
+      wabaId?: string;
+      phoneNumberId?: string;
+    };
+    const targetBizId = body.businessId?.trim() || getMetaTargetBusinessId();
+    if (businessId !== targetBizId && !actorUser?.isPlatformAdmin) {
+      return c.json({ error: 'Solo administradores de NEXO pueden verificar WasapFlow.' }, { status: 403 });
+    }
+
+    const state = await verifyAndLinkWasapFlowNumber({
+      actorUserId: userId,
+      businessId: targetBizId,
+      stateToken: body.stateToken,
+      hintWabaId: body.wabaId,
+      hintPhoneNumberId: body.phoneNumberId,
+    });
+    return c.json(state);
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.post(WASAPFLOW_WEBHOOK_PATH, async (c) => {
+  try {
+    const rawBytes = new Uint8Array(await c.req.arrayBuffer());
+    const signatureHeader = c.req.header('x-wasapflow-signature');
+    const sigCheck = await verifyWasapFlowWebhookSignature(rawBytes, signatureHeader);
+
+    if (!sigCheck.ok) {
+      try {
+        await withStoreTransaction((store) => {
+          appendAudit(store, {
+            businessId: getMetaTargetBusinessId(),
+            environment: 'produccion',
+            actorUserId: 'integraciones',
+            module: 'integraciones',
+            action: 'webhook_wasapflow_rechazado',
+            detail: sigCheck.reason,
+          });
+        });
+      } catch {
+        // Preservar respuesta 401/503 aunque falle el registro de auditoría
+      }
+      return new Response(JSON.stringify({ error: sigCheck.reason }), {
+        status: sigCheck.status,
+        headers: { 'Content-Type': 'application/json; charset=utf-8' },
+      });
+    }
+
+    const bodyText = new TextDecoder().decode(rawBytes);
+    const payload = (bodyText ? JSON.parse(bodyText) : {}) as WasapFlowWebhookPayload;
+    const summary = await processWasapFlowWebhookEvent(payload);
     return c.json({ status: 'ok', ...summary }, { status: 200 });
   } catch (err) {
     return errorResponse(err);

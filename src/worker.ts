@@ -1,4 +1,5 @@
 import { processDueOutboxRetries } from './server/modules/metaWebhook.ts';
+import { processDueWasapFlowOutboxRetries } from './server/modules/wasapflowBridge.ts';
 import { runWithRuntimeContext, type WorkerExecContext } from './server/runtimeContext.ts';
 import { webApp } from './server/webApp.ts';
 
@@ -53,8 +54,12 @@ export default {
     env: WorkerEnv,
     ctx: WorkerExecContext
   ): Promise<void> {
-    // Evitar despertar o consultar Neon cuando los envíos salientes de producción y prueba están pausados
-    if (env.META_OUTBOUND_ENABLED !== 'true' && env.META_TEST_OUTBOUND_ENABLED !== 'true') {
+    // Evitar despertar o consultar Neon cuando los envíos salientes de Meta y WasapFlow están pausados
+    if (
+      env.META_OUTBOUND_ENABLED !== 'true' &&
+      env.META_TEST_OUTBOUND_ENABLED !== 'true' &&
+      env.WASAPFLOW_OUTBOUND_ENABLED !== 'true'
+    ) {
       return;
     }
 
@@ -64,7 +69,10 @@ export default {
         execCtx: ctx,
         isWorker: true,
       },
-      () => processDueOutboxRetries(10)
+      async () => {
+        await processDueOutboxRetries(10);
+        await processDueWasapFlowOutboxRetries(10);
+      }
     );
     ctx.waitUntil(
       Promise.resolve(task).catch((err) => {

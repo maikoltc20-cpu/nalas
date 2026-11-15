@@ -49,6 +49,15 @@ export function AdminNalasWorkspace({
   const [metaConfig, setMetaConfig] = useState<Awaited<
     ReturnType<typeof nalasApi.getMetaConfig>
   > | null>(null);
+  const [wasapFlowConfig, setWasapFlowConfig] = useState<Awaited<
+    ReturnType<typeof nalasApi.getWasapFlowConfig>
+  > | null>(null);
+  const [wasapFlowSession, setWasapFlowSession] = useState<{
+    connectUrl: string;
+    expiresIn: number;
+    state: string;
+    allowedOrigin: string;
+  } | null>(null);
   const [copiedField, setCopiedField] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -60,6 +69,7 @@ export function AdminNalasWorkspace({
   useEffect(() => {
     if (!canManageIntegrations || !data.scoped) {
       setMetaConfig(null);
+      setWasapFlowConfig(null);
       return;
     }
     let cancelled = false;
@@ -71,10 +81,48 @@ export function AdminNalasWorkspace({
       .catch(() => {
         if (!cancelled) setMetaConfig(null);
       });
+    nalasApi
+      .getWasapFlowConfig(ctx)
+      .then((wf) => {
+        if (!cancelled) setWasapFlowConfig(wf);
+      })
+      .catch(() => {
+        if (!cancelled) setWasapFlowConfig(null);
+      });
     return () => {
       cancelled = true;
     };
   }, [ctx.businessId, ctx.userId, canManageIntegrations, Boolean(data.scoped)]);
+
+  useEffect(() => {
+    const allowedOrigin = wasapFlowConfig?.allowedOrigin || 'https://officialapi.wasapflow.com';
+    function onWasapFlowMessage(event: MessageEvent) {
+      if (event.origin !== allowedOrigin || !event.data || typeof event.data !== 'object') {
+        return;
+      }
+      const msg = event.data as {
+        type?: string;
+        waba_id?: string;
+        phone_number_id?: string;
+        message?: string;
+        reason?: string;
+        state?: string;
+      };
+      if (msg.type === 'WASAPFLOW_CONNECT_SUCCESS') {
+        void handleVerifyWasapFlowConnection({
+          stateToken: msg.state || wasapFlowSession?.state,
+          wabaId: msg.waba_id,
+          phoneNumberId: msg.phone_number_id,
+        });
+      } else if (msg.type === 'WASAPFLOW_CONNECT_CANCEL') {
+        onNotice(`Conexión WasapFlow cancelada (${msg.reason || 'usuario'}).`);
+      } else if (msg.type === 'WASAPFLOW_CONNECT_ERROR') {
+        onError(msg.message || 'WasapFlow reportó un error durante la conexión.');
+      }
+    }
+    window.addEventListener('message', onWasapFlowMessage);
+    return () => window.removeEventListener('message', onWasapFlowMessage);
+  }, [wasapFlowConfig?.allowedOrigin, wasapFlowSession?.state, ctx.businessId, ctx.userId]);
 
   async function handleCreateBusiness(e: React.FormEvent) {
     e.preventDefault();
@@ -273,6 +321,72 @@ export function AdminNalasWorkspace({
         e instanceof Error
           ? e.message
           : 'No se pudo completar el lanzador oficial de Meta Embedded Signup.'
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleCreateWasapFlowSession() {
+    setBusy(true);
+    try {
+      const sessionRes = await nalasApi.createWasapFlowConnectSession(ctx, {
+        businessId: wasapFlowConfig?.targetBusinessId || ctx.businessId,
+      });
+      setWasapFlowSession(sessionRes);
+      onNotice(
+        'Enlace de conexión WasapFlow generado en el servidor. Abrilo para vincular +506 7058 2232 sin desconectar el iPhone.'
+      );
+    } catch (e) {
+      onError(
+        e instanceof Error
+          ? e.message
+          : 'No se pudo generar la sesión de conexión en WasapFlow Bridge.'
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleVerifyWasapFlowConnection(overrides?: {
+    stateToken?: string;
+    wabaId?: string;
+    phoneNumberId?: string;
+  }) {
+    setBusy(true);
+    try {
+      const updatedState = await nalasApi.verifyWasapFlowConnection(ctx, {
+        businessId: wasapFlowConfig?.targetBusinessId || ctx.businessId,
+        stateToken: overrides?.stateToken ?? wasapFlowSession?.state,
+        wabaId: overrides?.wabaId,
+        phoneNumberId: overrides?.phoneNumberId,
+      });
+      setWasapFlowConfig((prev) =>
+        prev
+          ? {
+              ...prev,
+              connectionState: updatedState,
+            }
+          : prev
+      );
+      await onRefresh();
+      if (updatedState.status === 'conectado') {
+        setWasapFlowSession(null);
+        onNotice(updatedState.statusReason);
+      } else if (updatedState.status === 'error' || updatedState.lastError) {
+        onError(
+          updatedState.lastError
+            ? `${updatedState.statusReason} (${updatedState.lastError})`
+            : updatedState.statusReason
+        );
+      } else {
+        onNotice(updatedState.statusReason);
+      }
+    } catch (e) {
+      onError(
+        e instanceof Error
+          ? e.message
+          : 'No se pudo verificar el número conectado en WasapFlow Bridge.'
       );
     } finally {
       setBusy(false);
@@ -980,6 +1094,165 @@ export function AdminNalasWorkspace({
                         className="inline-flex items-center gap-2 min-h-[40px] px-4 py-2 text-xs font-semibold text-white bg-[#167D83] rounded-[9px] hover:bg-[#116B70] disabled:opacity-50 whitespace-nowrap shrink-0"
                       >
                         <span>Conectar WhatsApp (Coexistencia)</span>
+                      </button>
+                    </div>
+                  </div>
+                </section>
+              )}
+
+              {wasapFlowConfig && wasapFlowConfig.targetBusinessId === business.id && (
+                <section className="bg-white border border-[#E2E7EB] rounded-[13px] p-6 space-y-5">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                      <h2 className="text-lg font-semibold text-[#25364A]">
+                        WasapFlow Bridge (Prueba Coexistencia iPhone · {wasapFlowConfig.expectedPhone})
+                      </h2>
+                      <p className="text-sm text-[#5A6877] mt-0.5">
+                        Canal aislado <span className="font-mono">{wasapFlowConfig.connectionId}</span> exclusivo para {business.name}. Conserva Meta directo y META_OUTBOUND_ENABLED=false sin cambios.
+                      </p>
+                    </div>
+                    <span
+                      className={`text-xs font-semibold px-2.5 py-1 rounded border ${
+                        wasapFlowConfig.connectionState.status === 'conectado'
+                          ? 'bg-[#EAF5F2] text-[#116B70] border-[#C6E5DF]'
+                          : wasapFlowConfig.connectionState.status === 'error'
+                            ? 'bg-red-50 text-red-700 border-red-200'
+                            : 'bg-[#FFF0E3] text-[#8C542C] border-[#F2D7BF]'
+                      }`}
+                    >
+                      {wasapFlowConfig.connectionState.status === 'conectado'
+                        ? 'Conectado'
+                        : wasapFlowConfig.connectionState.status === 'error'
+                          ? 'Rechazado / Error'
+                          : 'Pendiente'}
+                    </span>
+                  </div>
+
+                  <div className="p-4 border border-[#E2E7EB] rounded-[10px] space-y-2">
+                    <div className="text-xs font-medium text-[#5A6877]">
+                      Webhook URL de WasapFlow (separado de Meta)
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <code className="flex-1 text-xs font-mono bg-[#F7F8FA] border border-[#E2E7EB] rounded px-3 py-2 text-[#25364A] break-all">
+                        {wasapFlowConfig.webhookUrl}
+                      </code>
+                      <button
+                        type="button"
+                        onClick={() => handleCopyText('wf_url', wasapFlowConfig.webhookUrl)}
+                        className="inline-flex items-center gap-1.5 min-h-[40px] px-3 py-2 text-xs font-medium text-[#25364A] bg-white border border-[#DCE3E8] rounded-[8px] hover:bg-[#F7F8FA] shrink-0"
+                      >
+                        {copiedField === 'wf_url' ? (
+                          <Check className="w-3.5 h-3.5 text-[#167D83]" />
+                        ) : (
+                          <Copy className="w-3.5 h-3.5" />
+                        )}
+                        <span>{copiedField === 'wf_url' ? 'Copiada' : 'Copiar'}</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
+                    <div className="p-3 bg-[#F7F8FA] border border-[#E2E7EB] rounded-[9px] flex items-center justify-between gap-2">
+                      <span className="font-mono text-[#25364A]">WASAPFLOW_PARTNER_KEY</span>
+                      <span className={wasapFlowConfig.partnerKeyConfigured ? 'text-[#116B70] font-semibold' : 'text-[#8C542C] font-semibold'}>
+                        {wasapFlowConfig.partnerKeyConfigured ? 'Configurada' : 'Pendiente'}
+                      </span>
+                    </div>
+                    <div className="p-3 bg-[#F7F8FA] border border-[#E2E7EB] rounded-[9px] flex items-center justify-between gap-2">
+                      <span className="font-mono text-[#25364A]">WASAPFLOW_WEBHOOK_SECRET</span>
+                      <span className={wasapFlowConfig.webhookSecretConfigured ? 'text-[#116B70] font-semibold' : 'text-[#8C542C] font-semibold'}>
+                        {wasapFlowConfig.webhookSecretConfigured ? 'Configurada' : 'Pendiente'}
+                      </span>
+                    </div>
+                    <div className="p-3 bg-[#F7F8FA] border border-[#E2E7EB] rounded-[9px] flex items-center justify-between gap-2">
+                      <span className="font-mono text-[#25364A]">WASAPFLOW_OUTBOUND_ENABLED</span>
+                      <span className={wasapFlowConfig.outboundEnabled ? 'text-[#116B70] font-semibold' : 'text-[#5A6877] font-semibold'}>
+                        {wasapFlowConfig.outboundEnabled ? 'Activo' : 'Pausado'}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="p-4 border border-[#E2E7EB] rounded-[10px] space-y-3 bg-[#F7F8FA]">
+                    <div className="text-xs text-[#25364A] leading-relaxed">
+                      {wasapFlowConfig.connectionState.statusReason}
+                    </div>
+
+                    {wasapFlowConfig.connectionState.lastError && (
+                      <div className="p-2.5 bg-red-50 border border-red-200 rounded text-xs text-red-800 break-words">
+                        <span className="font-semibold">Detalle:</span>{' '}
+                        {wasapFlowConfig.connectionState.lastError}
+                      </div>
+                    )}
+
+                    {(wasapFlowConfig.connectionState.wabaId ||
+                      wasapFlowConfig.connectionState.phoneNumberId ||
+                      wasapFlowConfig.connectionState.displayPhoneNumber) && (
+                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs">
+                        <div className="p-2.5 bg-white border border-[#E2E7EB] rounded">
+                          <span className="text-[#5A6877] block">WABA ID</span>
+                          <span className="font-mono text-[#25364A]">
+                            {wasapFlowConfig.connectionState.wabaId ?? 'Pendiente'}
+                          </span>
+                        </div>
+                        <div className="p-2.5 bg-white border border-[#E2E7EB] rounded">
+                          <span className="text-[#5A6877] block">Phone Number ID</span>
+                          <span className="font-mono text-[#25364A]">
+                            {wasapFlowConfig.connectionState.phoneNumberId ?? 'Pendiente'}
+                          </span>
+                        </div>
+                        <div className="p-2.5 bg-white border border-[#E2E7EB] rounded">
+                          <span className="text-[#5A6877] block">Número · Modo</span>
+                          <span className="font-mono text-[#25364A]">
+                            {wasapFlowConfig.connectionState.displayPhoneNumber ?? 'Sin número'} ·{' '}
+                            {wasapFlowConfig.connectionState.connectionMode ?? 'coexistence'}
+                          </span>
+                        </div>
+                      </div>
+                    )}
+
+                    {wasapFlowSession && (
+                      <div className="p-3 bg-[#EAF5F2] border border-[#CBE4DD] rounded-[9px] flex flex-wrap items-center justify-between gap-2">
+                        <div className="text-xs text-[#116B70]">
+                          Enlace temporal generado (expira en {Math.round(wasapFlowSession.expiresIn / 60)} min). Abrilo para autorizar {wasapFlowConfig.expectedPhone} y luego verificá el número conectado.
+                        </div>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <a
+                            href={wasapFlowSession.connectUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center gap-1.5 min-h-[36px] px-3 py-1.5 text-xs font-semibold text-white bg-[#167D83] rounded-[8px] hover:bg-[#116B70]"
+                          >
+                            <span>Abrir asistente WasapFlow</span>
+                          </a>
+                          <button
+                            type="button"
+                            onClick={() => handleCopyText('wf_connect', wasapFlowSession.connectUrl)}
+                            className="inline-flex items-center gap-1 min-h-[36px] px-3 py-1.5 text-xs font-medium text-[#25364A] bg-white border border-[#DCE3E8] rounded-[8px] hover:bg-[#F7F8FA]"
+                          >
+                            <Copy className="w-3.5 h-3.5" />
+                            <span>{copiedField === 'wf_connect' ? 'Copiado' : 'Copiar enlace'}</span>
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="flex flex-wrap items-center justify-end gap-2 pt-1">
+                      <button
+                        type="button"
+                        disabled={busy || !wasapFlowConfig.readyToConnect}
+                        onClick={handleCreateWasapFlowSession}
+                        className="inline-flex items-center gap-2 min-h-[40px] px-4 py-2 text-xs font-semibold text-white bg-[#167D83] rounded-[9px] hover:bg-[#116B70] disabled:opacity-50 whitespace-nowrap"
+                      >
+                        <span>Generar enlace de conexión</span>
+                      </button>
+                      <button
+                        type="button"
+                        disabled={busy || !wasapFlowConfig.partnerKeyConfigured}
+                        onClick={() => handleVerifyWasapFlowConnection()}
+                        className="inline-flex items-center gap-2 min-h-[40px] px-4 py-2 text-xs font-semibold text-[#25364A] bg-white border border-[#DCE3E8] rounded-[9px] hover:bg-[#F7F8FA] disabled:opacity-50 whitespace-nowrap"
+                      >
+                        <RefreshCw className="w-3.5 h-3.5" />
+                        <span>Verificar número conectado</span>
                       </button>
                     </div>
                   </div>
