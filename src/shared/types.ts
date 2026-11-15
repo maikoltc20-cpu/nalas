@@ -108,6 +108,7 @@ export interface HumanHandoffConfig {
 export interface FlowVersion {
   id: string;
   businessId: string;
+  flowKey?: string;
   versionNumber: number;
   name: string;
   status: 'borrador' | 'publicada';
@@ -209,6 +210,9 @@ export interface BusinessProduct {
   name: string;
   optionLabel: string;
   referencePrefix: string;
+  targetType?: 'flow' | 'handoff';
+  flowKey?: string;
+  handoffLabel?: string;
   flowVersionId?: string;
   draftFlowVersionId?: string;
   rulesetVersionId?: string;
@@ -220,6 +224,12 @@ export interface BusinessEntryConfig {
   enabled: boolean;
   greetingPrompt: string;
   unconfiguredProductPrompt: string;
+}
+
+export interface BusinessEntryDraft {
+  entryConfig: BusinessEntryConfig;
+  products: BusinessProduct[];
+  updatedAt?: string;
 }
 
 export interface ReferenceSequence {
@@ -242,6 +252,7 @@ export interface Business {
   defaultReferencePrefix?: string;
   products?: BusinessProduct[];
   entryConfig?: BusinessEntryConfig;
+  entryDraft?: BusinessEntryDraft;
   subscription: BusinessSubscription;
   activeFlowVersionId: string;
   activeRulesetVersionId: string;
@@ -371,6 +382,7 @@ export interface Message {
   sender: 'cliente' | 'bot_basica' | 'bot_pro' | 'agente_humano' | 'sistema';
   text: string;
   options?: StructuredOption[];
+  allowMultiple?: boolean;
   renderedChannelText?: string;
   deliveryStatus: DeliveryStatus;
   providerEventId?: string;
@@ -406,6 +418,7 @@ export interface Session {
   confirmedIdempotencyKey?: string;
   awaitingEntryProductSelection?: boolean;
   enteredViaEntryMenu?: boolean;
+  useEntryDraft?: boolean;
   awaitingUnconfiguredProductAction?: boolean;
   awaitingContextSubmode?: 'choice' | 'append' | null;
   awaitingCorrectionFieldSelection?: boolean;

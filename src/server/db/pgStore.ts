@@ -4,6 +4,8 @@ import type {
   Assistant,
   AuditEvent,
   Business,
+  BusinessEntryConfig,
+  BusinessEntryDraft,
   ChannelConnection,
   ChannelIdentity,
   Contact,
@@ -229,17 +231,26 @@ export async function claimDueOutboxIdsPg(
     return [];
   }
   const res = await client.query<{ id: string }>(
-    `SELECT id
-     FROM nalas_outbox_events
-     WHERE connection_id = ANY($2::text[])
-       AND delivery_status IN ('pendiente', 'fallido')
-       AND attempts < COALESCE(max_attempts, 3)
-       AND next_retry_at IS NOT NULL
-       AND next_retry_at <= NOW()
-       AND COALESCE(last_error, '') NOT ILIKE '%pausado%'
-     ORDER BY created_at ASC
-     FOR UPDATE SKIP LOCKED
-     LIMIT $1`,
+    `WITH due AS (
+       SELECT id
+       FROM nalas_outbox_events
+       WHERE connection_id = ANY($2::text[])
+         AND delivery_status IN ('pendiente', 'fallido')
+         AND attempts < COALESCE(max_attempts, 3)
+         AND next_retry_at IS NOT NULL
+         AND next_retry_at <= NOW()
+         AND COALESCE(last_error, '') NOT ILIKE '%pausado%'
+         AND COALESCE(last_error, '') NOT ILIKE '%excluido%'
+       ORDER BY created_at ASC
+       FOR UPDATE SKIP LOCKED
+       LIMIT $1
+     )
+     UPDATE nalas_outbox_events o
+     SET next_retry_at = NOW() + INTERVAL '5 minutes',
+         updated_at = NOW()
+     FROM due
+     WHERE o.id = due.id
+     RETURNING o.id`,
     [limit, connFilter]
   );
   return res.rows.map((r) => r.id);
@@ -357,6 +368,35 @@ export async function allocateCommercialReferencePg(
   }
 }
 
+function unpackPgEntryConfig(raw: unknown): {
+  entryConfig?: BusinessEntryConfig;
+  entryDraft?: BusinessEntryDraft;
+} {
+  if (!raw || typeof raw !== 'object') return {};
+  const obj = raw as Record<string, unknown>;
+  const draft = obj.__draft as BusinessEntryDraft | undefined;
+  const clean: Record<string, unknown> = { ...obj };
+  delete clean.__draft;
+  return {
+    entryConfig: clean as unknown as BusinessEntryConfig,
+    entryDraft: draft && typeof draft === 'object' ? draft : undefined,
+  };
+}
+
+function packPgEntryConfig(
+  entryConfig?: BusinessEntryConfig,
+  entryDraft?: BusinessEntryDraft
+): string | null {
+  if (!entryConfig && !entryDraft) return null;
+  const base: Record<string, unknown> = entryConfig
+    ? { ...entryConfig }
+    : { enabled: false, greetingPrompt: '', unconfiguredProductPrompt: '' };
+  if (entryDraft) {
+    base.__draft = entryDraft;
+  }
+  return JSON.stringify(base);
+}
+
 export async function loadStoreFromPg(client: PoolClient): Promise<NalasStore | null> {
   const bizRes = await client.query('SELECT * FROM nalas_businesses ORDER BY created_at ASC');
   if (bizRes.rowCount === 0) {
@@ -427,24 +467,28 @@ export async function loadStoreFromPg(client: PoolClient): Promise<NalasStore | 
   const toIso = (v: Date | string | null | undefined) =>
     v ? new Date(v).toISOString() : undefined;
 
-  const businesses: Business[] = bizRes.rows.map((r) => ({
-    id: r.id,
-    slug: r.slug,
-    name: r.name,
-    currency: r.currency,
-    currencyDecimals: r.currency_decimals,
-    timezone: r.timezone,
-    language: r.language,
-    contactFormat: r.contact_format,
-    defaultReferencePrefix: r.default_reference_prefix ?? undefined,
-    products: r.products ?? undefined,
-    entryConfig: r.entry_config ?? undefined,
-    subscription: r.subscription,
-    activeFlowVersionId: r.active_flow_version_id,
-    activeRulesetVersionId: r.active_ruleset_version_id,
-    activeProPolicyVersionId: r.active_pro_policy_version_id,
-    createdAt: toIso(r.created_at)!,
-  }));
+  const businesses: Business[] = bizRes.rows.map((r) => {
+    const { entryConfig, entryDraft } = unpackPgEntryConfig(r.entry_config);
+    return {
+      id: r.id,
+      slug: r.slug,
+      name: r.name,
+      currency: r.currency,
+      currencyDecimals: r.currency_decimals,
+      timezone: r.timezone,
+      language: r.language,
+      contactFormat: r.contact_format,
+      defaultReferencePrefix: r.default_reference_prefix ?? undefined,
+      products: r.products ?? undefined,
+      entryConfig,
+      entryDraft,
+      subscription: r.subscription,
+      activeFlowVersionId: r.active_flow_version_id,
+      activeRulesetVersionId: r.active_ruleset_version_id,
+      activeProPolicyVersionId: r.active_pro_policy_version_id,
+      createdAt: toIso(r.created_at)!,
+    };
+  });
 
   const users: User[] = usersRes.rows.map((r) => ({
     id: r.id,
@@ -830,7 +874,7 @@ export async function saveStoreToPg(client: PoolClient, store: NalasStore): Prom
         b.contactFormat,
         b.defaultReferencePrefix ?? null,
         b.products ? JSON.stringify(b.products) : null,
-        b.entryConfig ? JSON.stringify(b.entryConfig) : null,
+        packPgEntryConfig(b.entryConfig, b.entryDraft),
         JSON.stringify(b.subscription),
         b.activeFlowVersionId,
         b.activeRulesetVersionId,
@@ -967,6 +1011,7 @@ export async function saveStoreToPg(client: PoolClient, store: NalasStore): Prom
 
   for (const f of store.flowVersions) {
     const templates = {
+      flowKey: f.flowKey,
       summaryTemplate: f.summaryTemplate,
       closureTemplate: f.closureTemplate,
       referenceTemplate: f.referenceTemplate,
@@ -1175,6 +1220,7 @@ export async function saveStoreToPg(client: PoolClient, store: NalasStore): Prom
       confirmedIdempotencyKey: s.confirmedIdempotencyKey,
       awaitingEntryProductSelection: s.awaitingEntryProductSelection,
       enteredViaEntryMenu: s.enteredViaEntryMenu,
+      useEntryDraft: s.useEntryDraft,
       awaitingUnconfiguredProductAction: s.awaitingUnconfiguredProductAction,
       awaitingContextSubmode: s.awaitingContextSubmode,
       awaitingCorrectionFieldSelection: s.awaitingCorrectionFieldSelection,
@@ -1666,7 +1712,10 @@ export async function updateWasapFlowStatusPg(
     writes.push(
       client.query(
         `UPDATE nalas_outbox_events
-         SET delivery_status = $2,
+         SET delivery_status = CASE
+               WHEN delivery_status = 'entregado' AND $2 = 'aceptado' THEN 'entregado'
+               ELSE $2
+             END,
              provider_message_id = COALESCE(provider_message_id, $3),
              last_error = $4,
              next_retry_at = NULL,
@@ -1681,7 +1730,10 @@ export async function updateWasapFlowStatusPg(
     writes.push(
       client.query(
         `UPDATE nalas_messages
-         SET delivery_status = $2,
+         SET delivery_status = CASE
+               WHEN delivery_status = 'entregado' AND $2 = 'aceptado' THEN 'entregado'
+               ELSE $2
+             END,
              provider_event_id = COALESCE(provider_event_id, $3)
          WHERE id = $1`,
         [msgIdToUpdate, mappedStatus, messageId ?? null]
@@ -1708,6 +1760,32 @@ export async function updateWasapFlowStatusPg(
     messageUpdated: Boolean(msgIdToUpdate),
     conversationId: outboxRow?.conversation_id,
   };
+}
+
+export async function findOwnBotMessageByProviderIdPg(
+  client: PgQueryClient,
+  businessId: string,
+  providerMessageId: string
+): Promise<boolean> {
+  if (!providerMessageId) return false;
+  const outRes = await client.query(
+    `SELECT 1
+     FROM nalas_outbox_events
+     WHERE business_id = $1 AND provider_message_id = $2
+     LIMIT 1`,
+    [businessId, providerMessageId]
+  );
+  if ((outRes.rowCount ?? 0) > 0) return true;
+  const msgRes = await client.query(
+    `SELECT 1
+     FROM nalas_messages
+     WHERE business_id = $1
+       AND provider_event_id = $2
+       AND sender NOT IN ('cliente', 'agente_humano')
+     LIMIT 1`,
+    [businessId, providerMessageId]
+  );
+  return (msgRes.rowCount ?? 0) > 0;
 }
 
 export interface WasapFlowBundlePreExisting {
@@ -1769,24 +1847,28 @@ export async function loadWasapFlowConversationBundlePg(
       ),
     ]);
 
-  const businesses: Business[] = bizRes.rows.map((r) => ({
-    id: r.id,
-    slug: r.slug,
-    name: r.name,
-    currency: r.currency,
-    currencyDecimals: r.currency_decimals,
-    timezone: r.timezone,
-    language: r.language,
-    contactFormat: r.contact_format,
-    defaultReferencePrefix: r.default_reference_prefix ?? undefined,
-    products: r.products ?? undefined,
-    entryConfig: r.entry_config ?? undefined,
-    subscription: r.subscription,
-    activeFlowVersionId: r.active_flow_version_id,
-    activeRulesetVersionId: r.active_ruleset_version_id,
-    activeProPolicyVersionId: r.active_pro_policy_version_id,
-    createdAt: toIsoPg(r.created_at)!,
-  }));
+  const businesses: Business[] = bizRes.rows.map((r) => {
+    const { entryConfig, entryDraft } = unpackPgEntryConfig(r.entry_config);
+    return {
+      id: r.id,
+      slug: r.slug,
+      name: r.name,
+      currency: r.currency,
+      currencyDecimals: r.currency_decimals,
+      timezone: r.timezone,
+      language: r.language,
+      contactFormat: r.contact_format,
+      defaultReferencePrefix: r.default_reference_prefix ?? undefined,
+      products: r.products ?? undefined,
+      entryConfig,
+      entryDraft,
+      subscription: r.subscription,
+      activeFlowVersionId: r.active_flow_version_id,
+      activeRulesetVersionId: r.active_ruleset_version_id,
+      activeProPolicyVersionId: r.active_pro_policy_version_id,
+      createdAt: toIsoPg(r.created_at)!,
+    };
+  });
 
   const assistants: Assistant[] = asstRes.rows.map((r) => ({
     id: r.id,
@@ -2231,6 +2313,7 @@ export async function persistWasapFlowConversationBundlePg(
       confirmedIdempotencyKey: s.confirmedIdempotencyKey,
       awaitingEntryProductSelection: s.awaitingEntryProductSelection,
       enteredViaEntryMenu: s.enteredViaEntryMenu,
+      useEntryDraft: s.useEntryDraft,
       awaitingUnconfiguredProductAction: s.awaitingUnconfiguredProductAction,
       awaitingContextSubmode: s.awaitingContextSubmode,
       awaitingCorrectionFieldSelection: s.awaitingCorrectionFieldSelection,

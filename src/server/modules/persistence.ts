@@ -150,21 +150,6 @@ export function upgradeOptingDraftIfStale(store: NalasStore): boolean {
     }
   }
 
-  const canonicalNexoFlow = canonical.flowVersions.find((f) => f.id === 'flow_nexo_opting_v1');
-  if (canonicalNexoFlow) {
-    const nexoIdx = store.flowVersions.findIndex((f) => f.id === 'flow_nexo_opting_v1');
-    const existingNexo = nexoIdx >= 0 ? store.flowVersions[nexoIdx] : undefined;
-    const isNexoStale =
-      existingNexo &&
-      (!existingNexo.steps[0]?.entryPrompt?.includes('Claro. En Opting aplicamos ingeniería') ||
-        !existingNexo.alreadyRegisteredTemplate ||
-        !existingNexo.steps.find((s) => s.id === 'opt_empresa')?.correctionPrompt);
-    if (isNexoStale) {
-      store.flowVersions[nexoIdx] = structuredClone(canonicalNexoFlow);
-      changed = true;
-    }
-  }
-
   if (!store.referenceSequences) {
     store.referenceSequences = [];
     changed = true;

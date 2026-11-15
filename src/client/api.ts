@@ -4,6 +4,9 @@ import type {
   Assistant,
   AuditEvent,
   Business,
+  BusinessEntryConfig,
+  BusinessEntryDraft,
+  BusinessProduct,
   ChannelConnection,
   CommercialStatus,
   Contact,
@@ -256,6 +259,12 @@ export const nalasApi = {
       body: JSON.stringify({ mode }),
     });
   },
+  createConversation(ctx: ApiContext, payload: { name: string; flowKey?: string }) {
+    return apiFetch<FlowVersion>('/api/flows/conversations', ctx, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
   saveFlowDraft(
     ctx: ApiContext,
     payload: {
@@ -263,6 +272,7 @@ export const nalasApi = {
       outOfScriptRules: OutOfScriptRule[];
       humanHandoffConfig?: HumanHandoffConfig;
       name?: string;
+      flowKey?: string;
     }
   ) {
     return apiFetch<{ draft: FlowVersion; issues: Array<{ severity: string; message: string }> }>(
@@ -271,10 +281,28 @@ export const nalasApi = {
       { method: 'POST', body: JSON.stringify(payload) }
     );
   },
-  publishFlow(ctx: ApiContext) {
+  publishFlow(ctx: ApiContext, flowKey?: string) {
     return apiFetch<{ published: FlowVersion; nextDraft: FlowVersion }>('/api/flows/publish', ctx, {
       method: 'POST',
-      body: JSON.stringify({}),
+      body: JSON.stringify(flowKey ? { flowKey } : {}),
+    });
+  },
+  saveEntryMenuDraft(
+    ctx: ApiContext,
+    payload: { entryConfig: BusinessEntryConfig; products: BusinessProduct[] }
+  ) {
+    return apiFetch<{ entryDraft: BusinessEntryDraft }>('/api/entry-menu/draft', ctx, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+  publishEntryMenu(
+    ctx: ApiContext,
+    payload?: { entryConfig: BusinessEntryConfig; products: BusinessProduct[] }
+  ) {
+    return apiFetch<Business>('/api/entry-menu/publish', ctx, {
+      method: 'POST',
+      body: JSON.stringify(payload ?? {}),
     });
   },
   rollbackFlow(ctx: ApiContext, flowVersionId: string) {
@@ -551,6 +579,9 @@ export const nalasApi = {
       contactPhone?: string;
       forceNew?: boolean;
       useDraft?: boolean;
+      flowKey?: string;
+      skipEntryMenu?: boolean;
+      useEntryDraft?: boolean;
     }
   ) {
     return apiFetch<{ conversation: Conversation; session: Session; contact: Contact }>(

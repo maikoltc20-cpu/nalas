@@ -922,19 +922,26 @@ export async function processDueOutboxRetries(limit = 10): Promise<{
     });
   } else {
     const nowMs = Date.now();
+    const claimWindowIso = new Date(nowMs + 300_000).toISOString();
+    const nowIso = new Date(nowMs).toISOString();
     await withStoreTransaction((store) => {
-      dueIds = store.outboxEvents
+      const selected = store.outboxEvents
         .filter((o) => {
           if (!allowedConnectionIds.includes(o.connectionId)) return false;
           if (o.deliveryStatus !== 'pendiente' && o.deliveryStatus !== 'fallido') return false;
           const maxAtt = o.maxAttempts ?? 3;
           if (o.attempts >= maxAtt) return false;
           if (!o.nextRetryAt || new Date(o.nextRetryAt).getTime() > nowMs) return false;
-          if ((o.lastError ?? '').toLowerCase().includes('pausado')) return false;
+          const errLower = (o.lastError ?? '').toLowerCase();
+          if (errLower.includes('pausado') || errLower.includes('excluido')) return false;
           return true;
         })
-        .slice(0, limit)
-        .map((o) => o.id);
+        .slice(0, limit);
+      for (const o of selected) {
+        o.nextRetryAt = claimWindowIso;
+        o.updatedAt = nowIso;
+      }
+      dueIds = selected.map((o) => o.id);
     });
   }
 

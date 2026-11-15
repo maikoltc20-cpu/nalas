@@ -135,6 +135,7 @@ export function SimulatorWorkspace({
         externalUserId: `visitante_${Date.now().toString(36)}`,
         forceNew: true,
         useDraft,
+        useEntryDraft: useDraft,
       });
       setActiveConvId(started.conversation.id);
       setMultiSelectedIds([]);
@@ -261,6 +262,11 @@ export function SimulatorWorkspace({
               >
                 {isDraftSession ? 'Prueba de borrador' : 'Conversación publicada'}
               </span>
+              {pinnedFlow && (
+                <span className="inline-block rounded-md px-2.5 py-0.5 text-xs font-medium bg-[#EDF1F3] text-[#5A6877]">
+                  {pinnedFlow.name} · v{pinnedFlow.versionNumber}
+                </span>
+              )}
             </div>
 
             {scoped.conversations.length > 1 && (

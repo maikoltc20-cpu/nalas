@@ -2,9 +2,12 @@ import { useEffect, useState } from 'react';
 import { ArrowDown, ArrowUp, Play, Plus, RotateCcw, Save, Trash2 } from 'lucide-react';
 import type {
   Business,
+  BusinessEntryConfig,
+  BusinessProduct,
   CategorizationRule,
   ClassificationLevel,
   FlowStep,
+  FlowVersion,
   HumanHandoffConfig,
   OutOfScriptRule,
   RuleOperator,
@@ -21,6 +24,13 @@ const PRIORITY_LABELS: Record<ClassificationLevel, string> = {
   pendiente_clasificar: 'Pendiente de clasificar',
 };
 
+interface OpenSimulatorOpts {
+  flowKey?: string;
+  skipEntryMenu?: boolean;
+  useEntryDraft?: boolean;
+  useDraft?: boolean;
+}
+
 interface Props {
   data: BootstrapResponse;
   business: Business;
@@ -28,7 +38,24 @@ interface Props {
   onRefresh: () => Promise<void>;
   onError: (msg: string) => void;
   onNotice: (msg: string) => void;
-  onOpenDraftInSimulator: (connectionId: string) => Promise<void>;
+  onOpenDraftInSimulator: (connectionId: string, opts?: OpenSimulatorOpts) => Promise<void>;
+}
+
+function getClientFlowKey(flow: Pick<FlowVersion, 'businessId' | 'flowKey'>): string {
+  if (flow.flowKey && flow.flowKey.trim()) return flow.flowKey.trim();
+  return flow.businessId === 'biz_nexo' ? 'opting' : 'default';
+}
+
+function buildDefaultEntryConfig(business: Business): BusinessEntryConfig {
+  return {
+    enabled: business.entryConfig?.enabled ?? false,
+    greetingPrompt:
+      business.entryConfig?.greetingPrompt ??
+      `¡Hola! Gracias por escribir a ${business.name}. ¿Sobre qué tema te gustaría conversar?`,
+    unconfiguredProductPrompt:
+      business.entryConfig?.unconfiguredProductPrompt ??
+      'Con gusto te ayudamos con {{producto}}. ¿Querés hablar con una persona de nuestro equipo?',
+  };
 }
 
 const STEP_TYPE_LABELS: Record<StepType, string> = {
@@ -65,13 +92,65 @@ export function FlowAndRulesDesigner({
   onOpenDraftInSimulator,
 }: Props) {
   const scoped = data.scoped!;
-  const [subTab, setSubTab] = useState<'flujo' | 'reglas'>('flujo');
+  const [subTab, setSubTab] = useState<'inicio' | 'flujo' | 'reglas'>('flujo');
 
-  const draftFlow =
-    scoped.flowVersions.find((f) => f.status === 'borrador') ??
-    scoped.flowVersions.find((f) => f.id === business.activeFlowVersionId) ??
-    scoped.flowVersions[0];
+  // Agrupar conversaciones del negocio por identidad estable (flowKey)
+  const flowGroups = (() => {
+    const map = new Map<
+      string,
+      {
+        flowKey: string;
+        label: string;
+        draft?: FlowVersion;
+        latestPublished?: FlowVersion;
+        publishedVersions: FlowVersion[];
+      }
+    >();
+    for (const fv of scoped.flowVersions) {
+      const key = getClientFlowKey(fv);
+      let entry = map.get(key);
+      if (!entry) {
+        entry = {
+          flowKey: key,
+          label: fv.name,
+          publishedVersions: [],
+        };
+        map.set(key, entry);
+      }
+      if (fv.status === 'borrador') {
+        if (!entry.draft || fv.versionNumber > entry.draft.versionNumber) {
+          entry.draft = fv;
+        }
+      } else if (fv.status === 'publicada') {
+        entry.publishedVersions.push(fv);
+      }
+    }
+    for (const entry of map.values()) {
+      entry.publishedVersions.sort((a, b) => b.versionNumber - a.versionNumber);
+      entry.latestPublished = entry.publishedVersions[0];
+      entry.label = entry.draft?.name ?? entry.latestPublished?.name ?? entry.flowKey;
+    }
+    return Array.from(map.values());
+  })();
 
+  const defaultFlowKey = (() => {
+    const activeFlow = scoped.flowVersions.find((f) => f.id === business.activeFlowVersionId);
+    if (activeFlow) return getClientFlowKey(activeFlow);
+    return flowGroups[0]?.flowKey ?? (business.id === 'biz_nexo' ? 'opting' : 'default');
+  })();
+
+  const [selectedFlowKey, setSelectedFlowKey] = useState<string>(defaultFlowKey);
+  const [showNewConvForm, setShowNewConvForm] = useState(false);
+  const [newConvName, setNewConvName] = useState('');
+
+  const activeGroup =
+    flowGroups.find((g) => g.flowKey === selectedFlowKey) ??
+    flowGroups.find((g) => g.flowKey === defaultFlowKey) ??
+    flowGroups[0];
+  const effectiveFlowKey = activeGroup?.flowKey ?? defaultFlowKey;
+  const draftFlow = activeGroup?.draft ?? activeGroup?.latestPublished;
+
+  const [flowName, setFlowName] = useState<string>(() => draftFlow?.name ?? '');
   const [steps, setSteps] = useState<FlowStep[]>(() => structuredClone(draftFlow?.steps ?? []));
   const [oosRules, setOosRules] = useState<OutOfScriptRule[]>(() =>
     structuredClone(draftFlow?.outOfScriptRules ?? [])
@@ -85,6 +164,20 @@ export function FlowAndRulesDesigner({
     Array<{ severity: string; message: string }>
   >([]);
   const [busy, setBusy] = useState(false);
+
+  // Estado de Saludo y menú de entrada (borrador vs publicado)
+  const initialEntrySource = business.entryDraft ?? {
+    entryConfig: buildDefaultEntryConfig(business),
+    products: business.products ?? [],
+  };
+  const [entryConfig, setEntryConfig] = useState<BusinessEntryConfig>(() =>
+    structuredClone(initialEntrySource.entryConfig ?? buildDefaultEntryConfig(business))
+  );
+  const [entryProducts, setEntryProducts] = useState<BusinessProduct[]>(() =>
+    structuredClone(initialEntrySource.products ?? [])
+  );
+  const [entryDirty, setEntryDirty] = useState(false);
+  const [entryError, setEntryError] = useState<string | null>(null);
 
   const draftRuleset = scoped.rulesetVersions.find((r) => r.status === 'borrador');
   const activeRuleset =
@@ -113,36 +206,52 @@ export function FlowAndRulesDesigner({
   >([]);
 
   useEffect(() => {
+    setSelectedFlowKey(defaultFlowKey);
     setDraftDirty(false);
     setRulesDirty(false);
+    setEntryDirty(false);
+    setEntryError(null);
     setRulesValidationError(null);
+    setShowNewConvForm(false);
+    setNewConvName('');
   }, [business.id]);
 
   const draftSignature = draftFlow
-    ? `${draftFlow.id}:${draftFlow.versionNumber}:${draftFlow.steps.map((s) => `${s.id}:${s.prompt}`).join('|')}:${JSON.stringify(draftFlow.humanHandoffConfig ?? null)}`
-    : '';
+    ? `${effectiveFlowKey}:${draftFlow.id}:${draftFlow.name}:${draftFlow.versionNumber}:${draftFlow.steps.map((s) => `${s.id}:${s.prompt}`).join('|')}:${JSON.stringify(draftFlow.humanHandoffConfig ?? null)}`
+    : `${effectiveFlowKey}:empty`;
+
+  const entrySignature = JSON.stringify({
+    draft: business.entryDraft ?? null,
+    pubCfg: business.entryConfig ?? null,
+    pubProds: business.products ?? [],
+  });
 
   const rulesetSignature = editableRuleset
     ? `${editableRuleset.id}:${editableRuleset.versionNumber}:${editableRuleset.defaultPriority}:${editableRuleset.defaultReason}:${JSON.stringify(editableRuleset.rules)}`
     : '';
 
   useEffect(() => {
-    const nextDraft =
-      scoped.flowVersions.find((f) => f.status === 'borrador') ??
-      scoped.flowVersions.find((f) => f.id === business.activeFlowVersionId);
-    if (nextDraft && !draftDirty) {
-      setSteps(structuredClone(nextDraft.steps));
-      setOosRules(structuredClone(nextDraft.outOfScriptRules));
-      setHumanHandoffConfig(resolveHumanHandoffConfig(nextDraft.humanHandoffConfig));
-      if (!nextDraft.steps.some((s) => s.id === selectedStepId)) {
-        setSelectedStepId(nextDraft.steps[0]?.id ?? '');
+    if (draftFlow && !draftDirty) {
+      setFlowName(draftFlow.name);
+      setSteps(structuredClone(draftFlow.steps));
+      setOosRules(structuredClone(draftFlow.outOfScriptRules));
+      setHumanHandoffConfig(resolveHumanHandoffConfig(draftFlow.humanHandoffConfig));
+      if (!draftFlow.steps.some((s) => s.id === selectedStepId)) {
+        setSelectedStepId(draftFlow.steps[0]?.id ?? '');
       }
     }
-  }, [
-    business.id,
-    business.activeFlowVersionId,
-    draftSignature,
-  ]);
+  }, [business.id, effectiveFlowKey, draftSignature]);
+
+  useEffect(() => {
+    if (!entryDirty) {
+      const src = business.entryDraft ?? {
+        entryConfig: buildDefaultEntryConfig(business),
+        products: business.products ?? [],
+      };
+      setEntryConfig(structuredClone(src.entryConfig ?? buildDefaultEntryConfig(business)));
+      setEntryProducts(structuredClone(src.products ?? []));
+    }
+  }, [business.id, entrySignature]);
 
   useEffect(() => {
     const nextDraftRules = scoped.rulesetVersions.find((r) => r.status === 'borrador');
@@ -163,9 +272,7 @@ export function FlowAndRulesDesigner({
 
   const selectedStepIndex = steps.findIndex((s) => s.id === selectedStepId);
   const selectedStep = selectedStepIndex >= 0 ? steps[selectedStepIndex] : undefined;
-  const publishedFlows = scoped.flowVersions
-    .filter((f) => f.status === 'publicada')
-    .sort((a, b) => b.versionNumber - a.versionNumber);
+  const publishedFlows = activeGroup?.publishedVersions ?? [];
 
   function getStepTitle(step: FlowStep, fallbackIndex?: number): string {
     if (step.title && step.title.trim()) return step.title;
@@ -265,7 +372,176 @@ export function FlowAndRulesDesigner({
     }
   }
 
+  function handleSelectConversation(nextKey: string) {
+    if (nextKey === effectiveFlowKey) return;
+    setSelectedFlowKey(nextKey);
+    setDraftDirty(false);
+    setValidationMessages([]);
+    const grp = flowGroups.find((g) => g.flowKey === nextKey);
+    const fv = grp?.draft ?? grp?.latestPublished;
+    if (fv) {
+      setFlowName(fv.name);
+      setSteps(structuredClone(fv.steps));
+      setOosRules(structuredClone(fv.outOfScriptRules));
+      setHumanHandoffConfig(resolveHumanHandoffConfig(fv.humanHandoffConfig));
+      setSelectedStepId(fv.steps[0]?.id ?? '');
+    }
+  }
+
+  async function handleCreateConversation() {
+    const cleanName = newConvName.trim();
+    if (!cleanName) {
+      onError('Escribí un nombre para la nueva conversación.');
+      return;
+    }
+    setBusy(true);
+    try {
+      const created = await nalasApi.createConversation(ctx, { name: cleanName });
+      const createdKey = getClientFlowKey(created);
+      setNewConvName('');
+      setShowNewConvForm(false);
+      setDraftDirty(false);
+      setValidationMessages([]);
+      setSelectedFlowKey(createdKey);
+      setFlowName(created.name);
+      setSteps(structuredClone(created.steps));
+      setOosRules(structuredClone(created.outOfScriptRules));
+      setHumanHandoffConfig(resolveHumanHandoffConfig(created.humanHandoffConfig));
+      setSelectedStepId(created.steps[0]?.id ?? '');
+      await onRefresh();
+      onNotice(
+        `Conversación «${created.name}» (${createdKey}) creada en borrador. Editala y publicala cuando esté lista.`
+      );
+    } catch (e) {
+      onError(e instanceof Error ? e.message : 'No se pudo crear la conversación.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function addEntryMenuOption(preset?: {
+    id?: string;
+    name: string;
+    optionLabel: string;
+    targetType: 'flow' | 'handoff';
+    referencePrefix: string;
+  }) {
+    const idx = entryProducts.length + 1;
+    const baseName = preset?.name ?? `Opción ${idx}`;
+    const matchingGroup = flowGroups.find(
+      (g) => g.flowKey === baseName.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9_]+/g, '_')
+    );
+    const hasPublishedMatch = Boolean(matchingGroup?.latestPublished);
+    setEntryDirty(true);
+    setEntryError(null);
+    setEntryProducts((prev) => [
+      ...prev,
+      {
+        id: preset?.id ?? `prod_${Date.now().toString(36)}_${idx}`,
+        name: baseName,
+        optionLabel: preset?.optionLabel ?? baseName,
+        active: preset?.targetType === 'handoff' ? true : hasPublishedMatch,
+        targetType: preset?.targetType ?? 'flow',
+        flowKey: preset?.targetType === 'handoff' ? undefined : matchingGroup?.flowKey,
+        referencePrefix: preset?.referencePrefix ?? `opt_${idx}`,
+      },
+    ]);
+  }
+
+  function moveEntryOption(index: number, direction: -1 | 1) {
+    const target = index + direction;
+    if (target < 0 || target >= entryProducts.length) return;
+    setEntryDirty(true);
+    setEntryError(null);
+    setEntryProducts((prev) => {
+      const copy = [...prev];
+      const [item] = copy.splice(index, 1);
+      copy.splice(target, 0, item);
+      return copy;
+    });
+  }
+
+  async function handleSaveEntryDraft() {
+    setBusy(true);
+    setEntryError(null);
+    try {
+      await nalasApi.saveEntryMenuDraft(ctx, {
+        entryConfig,
+        products: entryProducts,
+      });
+      setEntryDirty(false);
+      await onRefresh();
+      onNotice(
+        'Borrador de saludo y menú guardado. WhatsApp sigue usando la versión publicada hasta que la publiques.'
+      );
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'No se pudo guardar el borrador del menú.';
+      setEntryError(msg);
+      onError(msg);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleTestEntryDraft() {
+    const testConn = scoped.channelConnections.find((c) => c.environment === 'prueba');
+    if (!testConn) {
+      onError('No hay un canal de prueba disponible para este negocio.');
+      return;
+    }
+    setBusy(true);
+    setEntryError(null);
+    try {
+      if (entryDirty) {
+        await nalasApi.saveEntryMenuDraft(ctx, {
+          entryConfig,
+          products: entryProducts,
+        });
+        setEntryDirty(false);
+      }
+      await onOpenDraftInSimulator(testConn.id, {
+        useDraft: true,
+        useEntryDraft: true,
+        skipEntryMenu: false,
+      });
+      onNotice('Prueba abierta con el borrador de saludo y menú de entrada.');
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'No se pudo probar el menú de entrada.';
+      setEntryError(msg);
+      onError(msg);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handlePublishEntryMenu() {
+    setBusy(true);
+    setEntryError(null);
+    try {
+      await nalasApi.publishEntryMenu(ctx, {
+        entryConfig,
+        products: entryProducts,
+      });
+      setEntryDirty(false);
+      await onRefresh();
+      onNotice(
+        'Saludo y menú de entrada publicados. WhatsApp y nuevas conversaciones aplican estos cambios.'
+      );
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'No se pudo publicar el saludo y menú.';
+      setEntryError(msg);
+      onError(msg);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function handleSaveDraft() {
+    if (subTab === 'inicio') {
+      await handleSaveEntryDraft();
+      return;
+    }
+
     if (subTab === 'reglas') {
       setBusy(true);
       setRulesValidationError(null);
@@ -275,7 +551,8 @@ export function FlowAndRulesDesigner({
             steps,
             outOfScriptRules: oosRules,
             humanHandoffConfig,
-            name: draftFlow?.name,
+            name: flowName.trim() || draftFlow?.name,
+            flowKey: effectiveFlowKey,
           });
           setDraftDirty(false);
           setValidationMessages(flowRes.issues);
@@ -307,7 +584,8 @@ export function FlowAndRulesDesigner({
         steps,
         outOfScriptRules: oosRules,
         humanHandoffConfig,
-        name: draftFlow?.name,
+        name: flowName.trim() || draftFlow?.name,
+        flowKey: effectiveFlowKey,
       });
       setDraftDirty(false);
       setValidationMessages(res.issues);
@@ -330,6 +608,11 @@ export function FlowAndRulesDesigner({
   }
 
   async function handleTestDraft() {
+    if (subTab === 'inicio') {
+      await handleTestEntryDraft();
+      return;
+    }
+
     const testConn = scoped.channelConnections.find((c) => c.environment === 'prueba');
     if (!testConn) {
       onError('No hay un canal de prueba disponible para este negocio.');
@@ -342,7 +625,8 @@ export function FlowAndRulesDesigner({
           steps,
           outOfScriptRules: oosRules,
           humanHandoffConfig,
-          name: draftFlow?.name,
+          name: flowName.trim() || draftFlow?.name,
+          flowKey: effectiveFlowKey,
         });
         setValidationMessages(res.issues);
         if (res.issues.some((i) => i.severity === 'error')) {
@@ -351,8 +635,13 @@ export function FlowAndRulesDesigner({
         }
         setDraftDirty(false);
       }
-      await onOpenDraftInSimulator(testConn.id);
-      onNotice('Conversación de prueba abierta con tu borrador.');
+      await onOpenDraftInSimulator(testConn.id, {
+        flowKey: effectiveFlowKey,
+        useDraft: true,
+        skipEntryMenu: true,
+        useEntryDraft: false,
+      });
+      onNotice(`Conversación de prueba abierta con el borrador de «${flowName || effectiveFlowKey}».`);
     } catch (e) {
       onError(e instanceof Error ? e.message : 'No se pudo abrir la prueba.');
     } finally {
@@ -367,13 +656,16 @@ export function FlowAndRulesDesigner({
         steps,
         outOfScriptRules: oosRules,
         humanHandoffConfig,
-        name: draftFlow?.name,
+        name: flowName.trim() || draftFlow?.name,
+        flowKey: effectiveFlowKey,
       });
-      const res = await nalasApi.publishFlow(ctx);
+      const res = await nalasApi.publishFlow(ctx, effectiveFlowKey);
       setDraftDirty(false);
       setValidationMessages([]);
       await onRefresh();
-      onNotice(`Conversación publicada (versión ${res.published.versionNumber}) para nuevas personas.`);
+      onNotice(
+        `Conversación «${res.published.name}» publicada (versión ${res.published.versionNumber}) para nuevas personas. Las conversaciones ya iniciadas conservan su versión.`
+      );
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'No se pudo publicar la conversación.';
       setValidationMessages([{ severity: 'error', message: msg }]);
@@ -497,7 +789,19 @@ export function FlowAndRulesDesigner({
           <span className="inline-block rounded-md px-2.5 py-1 bg-[#EAF5F2] text-[#116B70] text-xs font-semibold">
             Asistente básico
           </span>
-          {subTab === 'flujo' ? (
+          {subTab === 'inicio' ? (
+            <span
+              className={`text-sm font-medium ${
+                entryDirty || Boolean(business.entryDraft) ? 'text-[#8C542C]' : 'text-[#116B70]'
+              }`}
+            >
+              {entryDirty
+                ? 'Borrador · Tenés cambios sin guardar en el menú'
+                : business.entryDraft
+                  ? 'Borrador · Menú pendiente de publicar'
+                  : 'Publicado · Menú de entrada activo'}
+            </span>
+          ) : subTab === 'flujo' ? (
             <span
               className={`text-sm font-medium ${
                 hasFlowDraft ? 'text-[#8C542C]' : 'text-[#116B70]'
@@ -531,7 +835,18 @@ export function FlowAndRulesDesigner({
           )}
         </div>
 
-        <div className="inline-flex items-center gap-1 p-1 bg-[#EDF1F3] rounded-[10px]">
+        <div className="inline-flex flex-wrap items-center gap-1 p-1 bg-[#EDF1F3] rounded-[10px]">
+          <button
+            type="button"
+            onClick={() => setSubTab('inicio')}
+            className={`min-h-[40px] px-4 py-1.5 text-sm font-medium rounded-[8px] transition-colors whitespace-nowrap ${
+              subTab === 'inicio'
+                ? 'bg-white text-[#25364A] shadow-xs'
+                : 'text-[#5A6877] hover:text-[#25364A]'
+            }`}
+          >
+            Saludo y menú
+          </button>
           <button
             type="button"
             onClick={() => setSubTab('flujo')}
@@ -541,7 +856,7 @@ export function FlowAndRulesDesigner({
                 : 'text-[#5A6877] hover:text-[#25364A]'
             }`}
           >
-            La conversación
+            Conversaciones ({flowGroups.length})
           </button>
           <button
             type="button"
@@ -557,9 +872,419 @@ export function FlowAndRulesDesigner({
         </div>
       </div>
 
-      {/* Sub-tab 1: Conversation Builder */}
+      {/* Sub-tab 0: Saludo inicial y menú de entrada */}
+      {subTab === 'inicio' && (
+        <div className="space-y-6">
+          {entryError && (
+            <div className="bg-red-50 border border-red-200 rounded-[12px] p-4 text-sm text-red-800">
+              <div className="font-semibold mb-0.5">No se pudo publicar el saludo y menú</div>
+              <div>{entryError}</div>
+            </div>
+          )}
+
+          <section className="bg-white border border-[#E2E7EB] rounded-[13px] p-6 space-y-5">
+            <div className="flex flex-wrap items-start justify-between gap-4 border-b border-[#EDF0F2] pb-4">
+              <div>
+                <h2 className="text-lg font-semibold text-[#25364A]">
+                  Saludo inicial y menú de entrada ({business.name})
+                </h2>
+                <p className="text-sm text-[#5A6877] mt-0.5">
+                  Todo texto que envía Nala al recibir un contacto nuevo se edita acá. WhatsApp solo ejecuta la versión publicada.
+                </p>
+              </div>
+              <label className="inline-flex items-center gap-2.5 text-sm font-medium text-[#25364A] cursor-pointer min-h-[40px]">
+                <input
+                  type="checkbox"
+                  checked={entryConfig.enabled}
+                  onChange={(e) => {
+                    setEntryDirty(true);
+                    setEntryError(null);
+                    setEntryConfig((prev) => ({ ...prev, enabled: e.target.checked }));
+                  }}
+                  className="w-4 h-4 accent-[#167D83]"
+                />
+                <span>Mostrar menú antes de iniciar conversación</span>
+              </label>
+            </div>
+
+            <div className="grid grid-cols-1 gap-4">
+              <div>
+                <label className="block text-[13px] font-semibold text-[#25364A] mb-1.5">
+                  Saludo general de entrada
+                </label>
+                <textarea
+                  rows={3}
+                  value={entryConfig.greetingPrompt}
+                  onChange={(e) => {
+                    setEntryDirty(true);
+                    setEntryError(null);
+                    setEntryConfig((prev) => ({ ...prev, greetingPrompt: e.target.value }));
+                  }}
+                  className="w-full text-[15px] border border-[#DCE3E8] rounded-[9px] px-3.5 py-2.5 leading-relaxed"
+                />
+              </div>
+
+              <div>
+                <label className="block text-[13px] font-semibold text-[#25364A] mb-1.5">
+                  Mensaje si una opción activa aún no tiene conversación publicada
+                </label>
+                <input
+                  type="text"
+                  value={entryConfig.unconfiguredProductPrompt ?? ''}
+                  onChange={(e) => {
+                    setEntryDirty(true);
+                    setEntryError(null);
+                    setEntryConfig((prev) => ({
+                      ...prev,
+                      unconfiguredProductPrompt: e.target.value,
+                    }));
+                  }}
+                  className="w-full min-h-[42px] text-sm border border-[#DCE3E8] rounded-[9px] px-3.5 py-2"
+                />
+              </div>
+            </div>
+
+            <div className="border-t border-[#EDF0F2] pt-5 space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <h3 className="text-base font-semibold text-[#25364A]">Opciones del menú</h3>
+                  <p className="text-xs text-[#5A6877] mt-0.5">
+                    Vinculá cada opción activa a una conversación publicada de {business.name} o a atención humana. No podés publicar opciones activas sin destino válido.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => addEntryMenuOption()}
+                  className="inline-flex items-center gap-1.5 min-h-[40px] px-3.5 py-1.5 text-sm font-medium text-[#116B70] bg-[#EAF5F2] border border-[#D4EAE4] rounded-[9px] hover:bg-[#DCEFE9]"
+                >
+                  <Plus className="w-4 h-4" />
+                  <span>Agregar opción</span>
+                </button>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                <span className="text-[#5A6877] font-medium">Plantillas rápidas:</span>
+                {[
+                  { id: 'prod_nexo_nala', name: 'Nala', optionLabel: 'Nala', targetType: 'flow' as const, referencePrefix: 'nala' },
+                  { id: 'prod_nexo_opting', name: 'Opting', optionLabel: 'Opting', targetType: 'flow' as const, referencePrefix: 'opt' },
+                  { id: 'prod_nexo_volve', name: 'VOLVÉ', optionLabel: 'VOLVÉ', targetType: 'flow' as const, referencePrefix: 'vol' },
+                  { id: 'prod_nexo_benefitos', name: 'BenefitOS', optionLabel: 'BenefitOS', targetType: 'flow' as const, referencePrefix: 'ben' },
+                  { id: 'prod_nexo_humano', name: 'Consulta general / Hablar con una persona', optionLabel: 'Consulta general / Hablar con una persona', targetType: 'handoff' as const, referencePrefix: 'hum' },
+                ]
+                  .filter(
+                    (preset) =>
+                      !entryProducts.some(
+                        (p) =>
+                          p.id === preset.id ||
+                          p.name.trim().toLowerCase() === preset.name.toLowerCase()
+                      )
+                  )
+                  .map((preset) => (
+                    <button
+                      key={preset.id}
+                      type="button"
+                      onClick={() => addEntryMenuOption(preset)}
+                      className="px-2.5 py-1 border border-[#DCE3E8] rounded-md text-[#25364A] bg-[#F7F8FA] hover:bg-[#EAF5F2]"
+                    >
+                      + {preset.name}
+                    </button>
+                  ))}
+              </div>
+
+              <div className="space-y-3">
+                {entryProducts.map((prod, idx) => {
+                  const targetType = prod.targetType === 'handoff' ? 'handoff' : 'flow';
+                  const linkedGroup = flowGroups.find((g) => g.flowKey === prod.flowKey);
+                  const missingPublishedTarget =
+                    prod.active && targetType === 'flow' && !linkedGroup?.latestPublished;
+                  return (
+                    <div
+                      key={prod.id}
+                      className="p-4 border border-[#E2E7EB] rounded-[11px] bg-[#F7F8FA]/60 space-y-3"
+                    >
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="flex items-center gap-2">
+                          <span className="text-xs font-semibold text-[#5A6877]">
+                            #{idx + 1}
+                          </span>
+                          <label className="inline-flex items-center gap-2 text-sm font-medium text-[#25364A] cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={prod.active}
+                              onChange={(e) => {
+                                const checked = e.target.checked;
+                                setEntryDirty(true);
+                                setEntryError(null);
+                                setEntryProducts((prev) =>
+                                  prev.map((p, i) => (i === idx ? { ...p, active: checked } : p))
+                                );
+                              }}
+                              className="w-4 h-4 accent-[#167D83]"
+                            />
+                            <span>{prod.active ? 'Visible en menú' : 'Pausada / En preparación'}</span>
+                          </label>
+                          {missingPublishedTarget && (
+                            <span className="text-xs font-medium text-[#8C542C] bg-[#FFF0E3] px-2 py-0.5 rounded">
+                              Requiere conversación publicada en {business.name}
+                            </span>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-1">
+                          <button
+                            type="button"
+                            aria-label="Subir opción"
+                            onClick={() => moveEntryOption(idx, -1)}
+                            className="p-2 text-[#5A6877] hover:text-[#25364A] bg-white border border-[#E2E7EB] rounded"
+                          >
+                            <ArrowUp className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            type="button"
+                            aria-label="Bajar opción"
+                            onClick={() => moveEntryOption(idx, 1)}
+                            className="p-2 text-[#5A6877] hover:text-[#25364A] bg-white border border-[#E2E7EB] rounded"
+                          >
+                            <ArrowDown className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            type="button"
+                            aria-label="Eliminar opción"
+                            onClick={() => {
+                              setEntryDirty(true);
+                              setEntryError(null);
+                              setEntryProducts((prev) => prev.filter((_, i) => i !== idx));
+                            }}
+                            className="p-2 text-[#5A6877] hover:text-red-700 bg-white border border-[#E2E7EB] rounded"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                        <div>
+                          <label className="block text-xs font-semibold text-[#5A6877] mb-1">
+                            Texto de la opción en WhatsApp
+                          </label>
+                          <input
+                            type="text"
+                            value={prod.optionLabel}
+                            onChange={(e) => {
+                              const val = e.target.value;
+                              setEntryDirty(true);
+                              setEntryError(null);
+                              setEntryProducts((prev) =>
+                                prev.map((p, i) =>
+                                  i === idx ? { ...p, optionLabel: val, name: val || p.name } : p
+                                )
+                              );
+                            }}
+                            className="w-full min-h-[40px] text-sm border border-[#DCE3E8] rounded-[8px] px-3 py-1.5 bg-white"
+                          />
+                        </div>
+
+                        <div>
+                          <label className="block text-xs font-semibold text-[#5A6877] mb-1">
+                            Tipo de destino
+                          </label>
+                          <select
+                            value={targetType}
+                            onChange={(e) => {
+                              const nextType = e.target.value === 'handoff' ? 'handoff' : 'flow';
+                              setEntryDirty(true);
+                              setEntryError(null);
+                              setEntryProducts((prev) =>
+                                prev.map((p, i) =>
+                                  i === idx
+                                    ? {
+                                        ...p,
+                                        targetType: nextType,
+                                        flowKey: nextType === 'handoff' ? undefined : p.flowKey,
+                                      }
+                                    : p
+                                )
+                              );
+                            }}
+                            className="w-full min-h-[40px] text-sm border border-[#DCE3E8] rounded-[8px] px-3 py-1.5 bg-white"
+                          >
+                            <option value="flow">Conversación de este negocio</option>
+                            <option value="handoff">Atención humana (pausa el bot)</option>
+                          </select>
+                        </div>
+
+                        <div>
+                          <label className="block text-xs font-semibold text-[#5A6877] mb-1">
+                            {targetType === 'handoff' ? 'Motivo de derivación' : 'Conversación destino'}
+                          </label>
+                          {targetType === 'handoff' ? (
+                            <input
+                              type="text"
+                              value={prod.handoffLabel ?? 'Solicitud de atención humana desde menú'}
+                              onChange={(e) => {
+                                const val = e.target.value;
+                                setEntryDirty(true);
+                                setEntryProducts((prev) =>
+                                  prev.map((p, i) => (i === idx ? { ...p, handoffLabel: val } : p))
+                                );
+                              }}
+                              className="w-full min-h-[40px] text-sm border border-[#DCE3E8] rounded-[8px] px-3 py-1.5 bg-white"
+                            />
+                          ) : (
+                            <select
+                              value={prod.flowKey ?? ''}
+                              onChange={(e) => {
+                                const val = e.target.value || undefined;
+                                setEntryDirty(true);
+                                setEntryError(null);
+                                setEntryProducts((prev) =>
+                                  prev.map((p, i) => (i === idx ? { ...p, flowKey: val } : p))
+                                );
+                              }}
+                              className="w-full min-h-[40px] text-sm border border-[#DCE3E8] rounded-[8px] px-3 py-1.5 bg-white"
+                            >
+                              <option value="">Sin conversación vinculada...</option>
+                              {flowGroups.map((g) => (
+                                <option key={g.flowKey} value={g.flowKey}>
+                                  {g.label} ({g.latestPublished ? `v${g.latestPublished.versionNumber} publicada` : 'solo borrador'})
+                                </option>
+                              ))}
+                            </select>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div className="border-t border-[#EDF0F2] pt-4 flex flex-wrap items-center justify-between gap-3">
+              <div className="flex flex-wrap items-center gap-2.5">
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={handleSaveEntryDraft}
+                  className="min-h-[44px] px-4 py-2 text-sm font-medium text-[#25364A] bg-white border border-[#DCE3E8] rounded-[10px] hover:bg-[#F7F8FA]"
+                >
+                  Guardar borrador del menú
+                </button>
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={handleTestEntryDraft}
+                  className="min-h-[44px] px-4 py-2 text-sm font-medium text-[#25364A] bg-white border border-[#DCE3E8] rounded-[10px] hover:bg-[#F7F8FA]"
+                >
+                  Probar menú (borrador)
+                </button>
+              </div>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={handlePublishEntryMenu}
+                className="min-h-[44px] px-5 py-2 text-sm font-semibold text-white bg-[#167D83] rounded-[10px] hover:bg-[#116B70]"
+              >
+                Publicar saludo y menú
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
+
+      {/* Sub-tab 1: Conversation Builder (multi-conversación por negocio) */}
       {subTab === 'flujo' && (
         <div className="space-y-6">
+          <section className="bg-white border border-[#E2E7EB] rounded-[13px] p-5 space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h2 className="text-base font-semibold text-[#25364A]">
+                  Conversaciones de {business.name}
+                </h2>
+                <p className="text-xs text-[#5A6877] mt-0.5">
+                  Cada conversación tiene identidad estable ({effectiveFlowKey}) y versiones independientes. Publicar aplica a nuevas conversaciones.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowNewConvForm((v) => !v)}
+                className="inline-flex items-center gap-1.5 min-h-[40px] px-3.5 py-1.5 text-sm font-medium text-[#116B70] bg-[#EAF5F2] border border-[#D4EAE4] rounded-[9px] hover:bg-[#DCEFE9]"
+              >
+                <Plus className="w-4 h-4" />
+                <span>Nueva conversación</span>
+              </button>
+            </div>
+
+            {showNewConvForm && (
+              <div className="flex flex-wrap items-center gap-2.5 p-3.5 bg-[#F7F8FA] border border-[#E2E7EB] rounded-[10px]">
+                <input
+                  type="text"
+                  value={newConvName}
+                  onChange={(e) => setNewConvName(e.target.value)}
+                  placeholder="Nombre de la conversación (ej: Nala, BenefitOS)"
+                  className="flex-1 min-w-[220px] min-h-[40px] text-sm border border-[#DCE3E8] rounded-[8px] px-3 py-1.5 bg-white"
+                />
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={handleCreateConversation}
+                  className="min-h-[40px] px-4 py-1.5 text-sm font-semibold text-white bg-[#167D83] rounded-[8px] hover:bg-[#116B70]"
+                >
+                  Crear borrador
+                </button>
+              </div>
+            )}
+
+            <div className="flex flex-wrap items-center gap-2">
+              {flowGroups.map((g) => {
+                const isSelected = g.flowKey === effectiveFlowKey;
+                return (
+                  <button
+                    key={g.flowKey}
+                    type="button"
+                    onClick={() => handleSelectConversation(g.flowKey)}
+                    className={`min-h-[40px] px-3.5 py-1.5 text-sm rounded-[9px] border text-left transition-colors ${
+                      isSelected
+                        ? 'bg-[#EAF5F2] border-[#167D83] text-[#116B70] font-semibold'
+                        : 'bg-white border-[#DCE3E8] text-[#25364A] hover:bg-[#F7F8FA]'
+                    }`}
+                  >
+                    <span>{g.label}</span>
+                    <span className="ml-2 text-xs text-[#5A6877]">
+                      {g.latestPublished ? `v${g.latestPublished.versionNumber}` : 'borrador'}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+              <div>
+                <label className="block text-xs font-semibold text-[#5A6877] mb-1">
+                  Nombre de esta conversación
+                </label>
+                <input
+                  type="text"
+                  value={flowName}
+                  onChange={(e) => {
+                    setDraftDirty(true);
+                    setFlowName(e.target.value);
+                  }}
+                  className="w-full min-h-[40px] text-sm border border-[#DCE3E8] rounded-[8px] px-3 py-1.5 bg-white"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-semibold text-[#5A6877] mb-1">
+                  Identidad estable (flowKey)
+                </label>
+                <input
+                  type="text"
+                  readOnly
+                  value={effectiveFlowKey}
+                  className="w-full min-h-[40px] text-sm font-mono border border-[#E2E7EB] rounded-[8px] px-3 py-1.5 bg-[#F7F8FA] text-[#5A6877]"
+                />
+              </div>
+            </div>
+          </section>
+
           {validationMessages.length > 0 && (
             <div className="bg-[#FFF0E3] border border-[#F2D7BF] rounded-[12px] p-4 space-y-1">
               <div className="text-sm font-semibold text-[#8C542C]">
@@ -580,9 +1305,9 @@ export function FlowAndRulesDesigner({
             {/* Left: Ordered steps */}
             <section className="lg:col-span-4 bg-white border border-[#E2E7EB] rounded-[13px] p-5 space-y-4">
               <div>
-                <h2 className="text-lg font-semibold text-[#25364A]">La conversación</h2>
+                <h2 className="text-lg font-semibold text-[#25364A]">Preguntas del flujo</h2>
                 <p className="text-sm text-[#5A6877] mt-0.5">
-                  Elegí una pregunta para editarla.
+                  Elegí una pregunta para editarla. Todos los mensajes que envía el bot son visibles aquí.
                 </p>
               </div>
 
@@ -1060,11 +1785,14 @@ export function FlowAndRulesDesigner({
               {/* Published version history */}
               <section className="bg-white border border-[#E2E7EB] rounded-[13px] p-6 space-y-3">
                 <h3 className="text-base font-semibold text-[#25364A]">
-                  Conversaciones publicadas
+                  Ediciones publicadas ({activeGroup?.label ?? effectiveFlowKey})
                 </h3>
                 <div className="divide-y divide-[#EDF0F2]">
-                  {publishedFlows.map((fv) => {
-                    const isActive = fv.id === business.activeFlowVersionId;
+                  {publishedFlows.map((fv, idx) => {
+                    const isActive =
+                      fv.id === business.activeFlowVersionId ||
+                      (!publishedFlows.some((x) => x.id === business.activeFlowVersionId) &&
+                        idx === 0);
                     return (
                       <div
                         key={fv.id}

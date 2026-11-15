@@ -15,6 +15,7 @@ import type {
   Task,
 } from '../../shared/types.ts';
 import { runBasicEngine } from './basicEngine.ts';
+import { getFlowKey, resolvePublishedFlowForKey } from './config.ts';
 import { appendAudit } from './consumptionAndAudit.ts';
 import { normalizeAndQueueOutgoingMessage } from './integrations.ts';
 import { runProEngine } from './proEngine.ts';
@@ -184,6 +185,9 @@ export function startOrGetSimulatorConversation(
     contactPhone?: string;
     forceNew?: boolean;
     useDraft?: boolean;
+    flowKey?: string;
+    skipEntryMenu?: boolean;
+    useEntryDraft?: boolean;
   }
 ): { conversation: Conversation; session: Session; contact: Contact } {
   const biz = store.businesses.find((b) => b.id === params.businessId);
@@ -237,7 +241,7 @@ export function startOrGetSimulatorConversation(
     store.channelIdentities.push(identity);
   }
 
-  if (!params.forceNew && !params.useDraft) {
+  if (!params.forceNew && !params.useDraft && !params.useEntryDraft && !params.flowKey) {
     const existingConv = store.conversations.find(
       (c) =>
         c.businessId === biz.id &&
@@ -257,23 +261,69 @@ export function startOrGetSimulatorConversation(
   // Only allow testing draft in isolated prueba environment without publishing/activating
   let pinnedFlowId = biz.activeFlowVersionId;
   let pinnedRulesetId = biz.activeRulesetVersionId;
-  if (params.useDraft) {
+  const targetFlowKey = params.flowKey?.trim();
+  if (params.useDraft || params.useEntryDraft) {
     if (env !== 'prueba') {
       throw new Error('Probar borrador solo está permitido en el entorno Prueba.');
     }
-    const draft = store.flowVersions
-      .filter((f) => f.businessId === biz.id && f.status === 'borrador')
-      .sort((a, b) => b.versionNumber - a.versionNumber)[0];
-    if (draft) {
-      pinnedFlowId = draft.id;
+    if (params.useDraft) {
+      const draft = targetFlowKey
+        ? store.flowVersions
+            .filter(
+              (f) =>
+                f.businessId === biz.id &&
+                f.status === 'borrador' &&
+                getFlowKey(f) === targetFlowKey
+            )
+            .sort((a, b) => b.versionNumber - a.versionNumber)[0]
+        : store.flowVersions
+            .filter((f) => f.businessId === biz.id && f.status === 'borrador')
+            .sort((a, b) => b.versionNumber - a.versionNumber)[0];
+      if (draft) {
+        pinnedFlowId = draft.id;
+      } else if (targetFlowKey) {
+        const pub = resolvePublishedFlowForKey(
+          store,
+          biz.id,
+          targetFlowKey,
+          biz.activeFlowVersionId
+        );
+        if (pub) pinnedFlowId = pub.id;
+      }
+    } else if (targetFlowKey) {
+      const pub = resolvePublishedFlowForKey(
+        store,
+        biz.id,
+        targetFlowKey,
+        biz.activeFlowVersionId
+      );
+      if (pub) pinnedFlowId = pub.id;
     }
+
     const draftRules = store.rulesetVersions
       .filter((r) => r.businessId === biz.id && r.status === 'borrador')
       .sort((a, b) => b.versionNumber - a.versionNumber)[0];
     if (draftRules) {
       pinnedRulesetId = draftRules.id;
     }
+  } else if (targetFlowKey) {
+    const pub = resolvePublishedFlowForKey(
+      store,
+      biz.id,
+      targetFlowKey,
+      biz.activeFlowVersionId
+    );
+    if (pub) {
+      pinnedFlowId = pub.id;
+    }
   }
+
+  const pinnedFlowObj = store.flowVersions.find((f) => f.id === pinnedFlowId);
+  const directProductId = params.skipEntryMenu
+    ? targetFlowKey
+      ? `direct_${targetFlowKey}`
+      : 'direct'
+    : undefined;
 
   // Create new conversation pinning active published versions (or draft in isolated test)
   const convId = `conv_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
@@ -284,6 +334,8 @@ export function startOrGetSimulatorConversation(
     assistantId: assistant.id,
     connectionId: conn.id,
     contactId: contact.id,
+    productId: directProductId,
+    productName: params.skipEntryMenu ? pinnedFlowObj?.name : undefined,
     status: 'abierta',
     control: 'bot',
     pinnedFlowVersionId: pinnedFlowId,
@@ -300,6 +352,13 @@ export function startOrGetSimulatorConversation(
     businessId: biz.id,
     environment: env,
     conversationId: convId,
+    productId: directProductId,
+    productName: params.skipEntryMenu ? pinnedFlowObj?.name : undefined,
+    enteredViaEntryMenu: false,
+    useEntryDraft:
+      env === 'prueba'
+        ? Boolean(params.useEntryDraft ?? (params.useDraft && !params.skipEntryMenu))
+        : false,
     pinnedFlowVersionId: pinnedFlowId,
     pinnedRulesetVersionId: pinnedRulesetId,
     pinnedProPolicyVersionId: biz.activeProPolicyVersionId,
@@ -352,6 +411,7 @@ export function sendInitialBasicGreeting(
     sender: 'bot_basica',
     text: basicOut.replyText,
     options: basicOut.options,
+    allowMultiple: basicOut.allowMultiple,
     deliveryStatus: 'pendiente',
     createdAt: new Date().toISOString(),
   };
@@ -822,6 +882,7 @@ export async function processInboundMessage(
     sender: 'bot_basica',
     text: finalReplyText,
     options: basicOut.options,
+    allowMultiple: basicOut.allowMultiple,
     deliveryStatus: 'pendiente',
     createdAt: new Date().toISOString(),
   };

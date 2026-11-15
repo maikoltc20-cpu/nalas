@@ -141,12 +141,13 @@ export function normalizeAndQueueOutgoingMessage(params: {
 }): OutboxEvent {
   const { store, connection, message, simulateOutboxFailure, deferRemoteDispatch } = params;
   const adapter = getAdapter(connection.adapterId);
-  const effectiveButtons = connection.supportsButtons
-    ? adapter.formatOutgoing(message.text, message.options)
-    : ADAPTER_REGISTRY.adapter_wa_sandbox.formatOutgoing(message.text, message.options);
+  const effectiveButtons =
+    !connection.supportsButtons || (message.allowMultiple && (message.options?.length ?? 0) > 0)
+      ? ADAPTER_REGISTRY.adapter_wa_sandbox.formatOutgoing(message.text, message.options)
+      : adapter.formatOutgoing(message.text, message.options);
 
   message.renderedChannelText = effectiveButtons.renderedText;
-  message.options = effectiveButtons.buttons.length > 0 ? effectiveButtons.buttons : message.options;
+  // Conservar intactas todas las opciones estructuradas (incluidas >3 opciones y selección múltiple)
 
   const now = new Date().toISOString();
   const outbox: OutboxEvent = {
@@ -160,7 +161,7 @@ export function normalizeAndQueueOutgoingMessage(params: {
     deliveryStatus: 'pendiente',
     attempts: 0,
     maxAttempts: 3,
-    nextRetryAt: now,
+    nextRetryAt: deferRemoteDispatch ? undefined : now,
     createdAt: now,
     updatedAt: now,
   };

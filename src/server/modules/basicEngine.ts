@@ -2,6 +2,8 @@ import { hasValidContactName, normalizeInternationalPhone } from '../../shared/h
 import type {
   AnswerRecord,
   Business,
+  BusinessEntryConfig,
+  BusinessProduct,
   CategorizationResult,
   CategorizationRule,
   ClassificationLevel,
@@ -16,12 +18,14 @@ import type {
   Session,
   StructuredOption,
 } from '../../shared/types.ts';
+import { getFlowKey, resolvePublishedFlowForKey } from './config.ts';
 import { appendAudit } from './consumptionAndAudit.ts';
 
 export interface BasicEngineOutput {
   replyText: string;
   separateMessages?: string[];
   options?: StructuredOption[];
+  allowMultiple?: boolean;
   requestHumanHandoff?: boolean;
   handoffReason?: string;
   confirmedLead?: Lead;
@@ -170,7 +174,21 @@ function buildSummaryText(
   session: Session
 ): string {
   if (flow.summaryTemplate) {
-    return interpolateTemplate(flow.summaryTemplate, session);
+    const rendered = interpolateTemplate(flow.summaryTemplate, session);
+    const extraLines: string[] = [];
+    for (const step of flow.steps) {
+      const ans = session.answers[step.id];
+      if (!ans) continue;
+      const keyById = `{{${step.id}}}`;
+      const keyByField = step.targetField ? `{{${step.targetField}}}` : '';
+      const alreadyIncluded =
+        flow.summaryTemplate.includes(keyById) ||
+        (keyByField ? flow.summaryTemplate.includes(keyByField) : false);
+      if (!alreadyIncluded) {
+        extraLines.push(`• ${step.title ?? step.prompt}: ${ans.displayValue}`);
+      }
+    }
+    return extraLines.length > 0 ? `${rendered}\n${extraLines.join('\n')}` : rendered;
   }
   const lines: string[] = [];
   for (const step of flow.steps) {
@@ -207,9 +225,6 @@ function getEffectiveStepPrompt(step: FlowStep, session: Session): string {
   }
   if (session.correctionReturnToStepId && step.correctionPrompt) {
     return interpolateTemplate(step.correctionPrompt, session);
-  }
-  if (session.enteredViaEntryMenu && step.entryPrompt) {
-    return interpolateTemplate(step.entryPrompt, session);
   }
   return interpolateTemplate(step.prompt, session);
 }
@@ -282,10 +297,116 @@ function allocateCommercialReference(
   return `${prefix}_${nextNumber}`;
 }
 
-function buildEntryMenuOutput(business: Business): BasicEngineOutput {
-  const activeProducts = (business.products ?? []).filter((p) => p.active);
+function isEntryDraftMode(business: Business, session?: Session, flow?: FlowVersion): boolean {
+  return Boolean(
+    session?.environment === 'prueba' &&
+      (session?.useEntryDraft || flow?.status === 'borrador') &&
+      business.entryDraft
+  );
+}
+
+function getEffectiveEntrySettings(
+  business: Business,
+  session?: Session,
+  flow?: FlowVersion
+): { entryConfig?: BusinessEntryConfig; products: BusinessProduct[]; isDraft: boolean } {
+  if (isEntryDraftMode(business, session, flow) && business.entryDraft) {
+    return {
+      entryConfig: business.entryDraft.entryConfig,
+      products: business.entryDraft.products ?? [],
+      isDraft: true,
+    };
+  }
   return {
-    replyText: business.entryConfig!.greetingPrompt,
+    entryConfig: business.entryConfig,
+    products: business.products ?? [],
+    isDraft: false,
+  };
+}
+
+function resolveTargetFlowForProduct(
+  store: NalasStore,
+  business: Business,
+  product: BusinessProduct,
+  preferDraft: boolean
+): FlowVersion | undefined {
+  if (product.targetType === 'handoff') return undefined;
+
+  const explicitLinked = product.flowVersionId
+    ? store.flowVersions.find((f) => f.id === product.flowVersionId && f.businessId === business.id)
+    : undefined;
+  const flowKey =
+    product.flowKey?.trim() || (explicitLinked ? getFlowKey(explicitLinked) : undefined);
+
+  if (flowKey) {
+    if (preferDraft) {
+      const draftMatch = store.flowVersions
+        .filter(
+          (f) =>
+            f.businessId === business.id &&
+            f.status === 'borrador' &&
+            getFlowKey(f) === flowKey
+        )
+        .sort((a, b) => b.versionNumber - a.versionNumber)[0];
+      if (draftMatch) return draftMatch;
+    }
+
+    // Legacy unmigrated product without explicit flowKey (e.g. prod_nexo_opting before first menu publish):
+    // honor the business's latest active published flow for that flowKey so user edits remain active.
+    const activeBizFlow = store.flowVersions.find(
+      (f) =>
+        f.id === business.activeFlowVersionId &&
+        f.businessId === business.id &&
+        f.status === 'publicada' &&
+        getFlowKey(f) === flowKey
+    );
+    const preferredPubId = product.flowKey
+      ? product.flowVersionId
+      : activeBizFlow?.id;
+
+    const pub = resolvePublishedFlowForKey(store, business.id, flowKey, preferredPubId);
+    if (pub && pub.steps.length > 0) return pub;
+    return undefined;
+  }
+
+  if (preferDraft && product.draftFlowVersionId) {
+    const draftFlow = store.flowVersions.find(
+      (f) => f.id === product.draftFlowVersionId && f.businessId === business.id
+    );
+    if (draftFlow && draftFlow.steps.length > 0) return draftFlow;
+  }
+
+  if (explicitLinked && explicitLinked.status === 'publicada' && explicitLinked.steps.length > 0) {
+    return explicitLinked;
+  }
+
+  return undefined;
+}
+
+function getPlayableEntryProducts(
+  store: NalasStore,
+  business: Business,
+  session?: Session,
+  flow?: FlowVersion
+): BusinessProduct[] {
+  const { products, isDraft } = getEffectiveEntrySettings(business, session, flow);
+  return products.filter((p) => {
+    if (!p.active) return false;
+    if (p.targetType === 'handoff') return true;
+    return Boolean(resolveTargetFlowForProduct(store, business, p, isDraft));
+  });
+}
+
+function buildEntryMenuOutput(
+  store: NalasStore,
+  business: Business,
+  session?: Session,
+  flow?: FlowVersion
+): BasicEngineOutput {
+  const { entryConfig } = getEffectiveEntrySettings(business, session, flow);
+  const activeProducts = getPlayableEntryProducts(store, business, session, flow);
+  return {
+    replyText: entryConfig?.greetingPrompt ?? `¡Hola! Gracias por escribir a ${business.name}.`,
     options: activeProducts.map((p) => ({
       id: `prod:${p.id}`,
       label: p.optionLabel,
@@ -293,9 +414,15 @@ function buildEntryMenuOutput(business: Business): BasicEngineOutput {
   };
 }
 
-function renderUnconfiguredProductOutput(business: Business, productName: string): BasicEngineOutput {
+function renderUnconfiguredProductOutput(
+  business: Business,
+  productName: string,
+  session?: Session,
+  flow?: FlowVersion
+): BasicEngineOutput {
+  const { entryConfig } = getEffectiveEntrySettings(business, session, flow);
   const template =
-    business.entryConfig?.unconfiguredProductPrompt ??
+    entryConfig?.unconfiguredProductPrompt ??
     'Podemos derivar tu consulta sobre {{producto}} al equipo. ¿Querés solicitar atención humana?';
   return {
     replyText: template.replace(/\{\{producto\}\}/g, productName),
@@ -435,23 +562,32 @@ function validateAndParseStepAnswer(
   if (step.type === 'seleccion_multiple') {
     const opts = step.options ?? [];
     const tokens = trimmed
-      .split(/[,;]+/)
-      .map((t) => t.trim())
+      .split(/[,;\n]+|\s+(?:y|e|&)\s+/i)
+      .map((t) => t.replace(/\.$/, '').trim())
       .filter(Boolean);
-    const matchedOpts = tokens
-      .map((tok) => {
-        if (selectedOptionId && tok === trimmed) {
-          return opts.find((o) => o.id === selectedOptionId);
-        }
-        if (/^\d+$/.test(tok)) return opts[Number(tok) - 1];
-        return opts.find(
+    const seenIds = new Set<string>();
+    const matchedOpts: NonNullable<FlowStep['options']> = [];
+    for (const tok of tokens) {
+      let found: NonNullable<FlowStep['options']>[number] | undefined;
+      if (selectedOptionId && tok === trimmed.replace(/\.$/, '').trim()) {
+        found = opts.find((o) => o.id === selectedOptionId);
+      }
+      if (!found && /^\d+$/.test(tok)) {
+        found = opts[Number(tok) - 1];
+      }
+      if (!found) {
+        found = opts.find(
           (o) =>
             o.id.toLowerCase() === tok.toLowerCase() ||
             o.label.toLowerCase() === tok.toLowerCase() ||
-            o.label.replace(/\.$/, '').toLowerCase() === tok.replace(/\.$/, '').toLowerCase()
+            o.label.replace(/\.$/, '').toLowerCase() === tok.toLowerCase()
         );
-      })
-      .filter((x): x is NonNullable<typeof x> => Boolean(x));
+      }
+      if (found && !seenIds.has(found.id)) {
+        seenIds.add(found.id);
+        matchedOpts.push(found);
+      }
+    }
 
     if (matchedOpts.length === 0 && selectedOptionId) {
       const direct = opts.find((o) => o.id === selectedOptionId);
@@ -786,6 +922,7 @@ function advanceFromStep(
     return {
       replyText: replyChunks.join('\n\n'),
       options: getStepOptions(nextStep),
+      allowMultiple: nextStep.type === 'seleccion_multiple',
     };
   }
 
@@ -913,21 +1050,25 @@ export function runBasicEngine(params: {
     normalized === 'elegir otro producto' ||
     normalized === 'elegir otro producto.'
   ) {
-    if (business?.entryConfig?.enabled && (business.products ?? []).some((p) => p.active)) {
-      session.productId = undefined;
-      session.productName = undefined;
-      session.awaitingUnconfiguredProductAction = false;
-      session.awaitingEntryProductSelection = true;
-      session.enteredViaEntryMenu = false;
-      session.currentStepId = null;
-      session.stepHistory = [];
-      session.updatedAt = new Date().toISOString();
-      if (conversation) {
-        conversation.productId = undefined;
-        conversation.productName = undefined;
-        conversation.updatedAt = session.updatedAt;
+    if (business) {
+      const { entryConfig } = getEffectiveEntrySettings(business, session, flow);
+      const playableProducts = getPlayableEntryProducts(store, business, session, flow);
+      if (entryConfig?.enabled && playableProducts.length > 0) {
+        session.productId = undefined;
+        session.productName = undefined;
+        session.awaitingUnconfiguredProductAction = false;
+        session.awaitingEntryProductSelection = true;
+        session.enteredViaEntryMenu = false;
+        session.currentStepId = null;
+        session.stepHistory = [];
+        session.updatedAt = new Date().toISOString();
+        if (conversation) {
+          conversation.productId = undefined;
+          conversation.productName = undefined;
+          conversation.updatedAt = session.updatedAt;
+        }
+        return buildEntryMenuOutput(store, business, session, flow);
       }
-      return buildEntryMenuOutput(business);
     }
   }
 
@@ -935,7 +1076,8 @@ export function runBasicEngine(params: {
     session.awaitingContextSubmode = null;
     session.awaitingCorrectionFieldSelection = false;
     session.awaitingOutOfScriptChoice = false;
-    if (session.awaitingUnconfiguredProductAction && business?.entryConfig?.enabled) {
+    const entryMeta = business ? getEffectiveEntrySettings(business, session, flow) : undefined;
+    if (session.awaitingUnconfiguredProductAction && business && entryMeta?.entryConfig?.enabled) {
       session.productId = undefined;
       session.productName = undefined;
       session.awaitingUnconfiguredProductAction = false;
@@ -946,7 +1088,7 @@ export function runBasicEngine(params: {
         conversation.productName = undefined;
         conversation.updatedAt = session.updatedAt;
       }
-      return buildEntryMenuOutput(business);
+      return buildEntryMenuOutput(store, business, session, flow);
     }
     if (session.stepHistory.length > 0) {
       const prevStepId = session.stepHistory.pop()!;
@@ -959,10 +1101,11 @@ export function runBasicEngine(params: {
         return {
           replyText: `${getEffectiveStepPrompt(prevStep, session)}${hint}`,
           options: getStepOptions(prevStep),
+          allowMultiple: prevStep.type === 'seleccion_multiple',
         };
       }
     }
-    if (session.enteredViaEntryMenu && business?.entryConfig?.enabled) {
+    if (session.enteredViaEntryMenu && business && entryMeta?.entryConfig?.enabled) {
       session.currentStepId = null;
       session.productId = undefined;
       session.productName = undefined;
@@ -974,7 +1117,7 @@ export function runBasicEngine(params: {
         conversation.productName = undefined;
         conversation.updatedAt = session.updatedAt;
       }
-      return buildEntryMenuOutput(business);
+      return buildEntryMenuOutput(store, business, session, flow);
     }
     return {
       replyText: 'Estás en el inicio del cuestionario. Puedes continuar o solicitar atención humana.',
@@ -994,17 +1137,18 @@ export function runBasicEngine(params: {
         handoffReason: `Solicitado explícitamente por el usuario para ${session.productName ?? 'producto sin flujo configurado'}.`,
       };
     }
-    return renderUnconfiguredProductOutput(business, session.productName ?? 'este producto');
+    return renderUnconfiguredProductOutput(business, session.productName ?? 'este producto', session, flow);
   }
 
   // First turn initialization & optional business common entry menu
   if (!session.currentStepId) {
-    const activeProducts = (business?.products ?? []).filter((p) => p.active);
-    if (business?.entryConfig?.enabled && activeProducts.length > 0 && !session.productId) {
+    const entryMeta = business ? getEffectiveEntrySettings(business, session, flow) : undefined;
+    const activeProducts = business ? getPlayableEntryProducts(store, business, session, flow) : [];
+    if (business && entryMeta?.entryConfig?.enabled && activeProducts.length > 0 && !session.productId) {
       if (!session.awaitingEntryProductSelection) {
         session.awaitingEntryProductSelection = true;
         session.updatedAt = new Date().toISOString();
-        return buildEntryMenuOutput(business);
+        return buildEntryMenuOutput(store, business, session, flow);
       }
 
       const trimmedNorm = normalized.replace(/\.$/, '');
@@ -1021,7 +1165,7 @@ export function runBasicEngine(params: {
         (/^\d+$/.test(trimmedNorm) ? activeProducts[Number(trimmedNorm) - 1] : undefined);
 
       if (!matchedProduct) {
-        return buildEntryMenuOutput(business);
+        return buildEntryMenuOutput(store, business, session, flow);
       }
 
       session.awaitingEntryProductSelection = false;
@@ -1033,24 +1177,34 @@ export function runBasicEngine(params: {
         conversation.updatedAt = new Date().toISOString();
       }
 
-      const candidateFlowId =
-        flow.status === 'borrador'
-          ? matchedProduct.draftFlowVersionId ?? matchedProduct.flowVersionId
-          : matchedProduct.flowVersionId;
-      const targetFlow = candidateFlowId
-        ? store.flowVersions.find(
-            (f) => f.id === candidateFlowId && f.businessId === business.id
-          )
-        : undefined;
+      if (matchedProduct.targetType === 'handoff') {
+        session.enteredViaEntryMenu = true;
+        session.updatedAt = new Date().toISOString();
+        const baseMsg =
+          flow.handoffMessage ??
+          'Dejamos registrada tu solicitud de atención con nuestro equipo. El asistente automático quedará en pausa en esta conversación.';
+        return {
+          replyText: baseMsg,
+          requestHumanHandoff: true,
+          handoffReason: `Seleccionó "${matchedProduct.name}" desde el menú inicial.`,
+        };
+      }
+
+      const targetFlow = resolveTargetFlowForProduct(
+        store,
+        business,
+        matchedProduct,
+        entryMeta.isDraft
+      );
 
       if (!targetFlow || targetFlow.steps.length === 0) {
         session.awaitingUnconfiguredProductAction = true;
         session.updatedAt = new Date().toISOString();
-        return renderUnconfiguredProductOutput(business, matchedProduct.name);
+        return renderUnconfiguredProductOutput(business, matchedProduct.name, session, flow);
       }
 
       const candidateRulesetId =
-        flow.status === 'borrador'
+        entryMeta.isDraft
           ? matchedProduct.draftRulesetVersionId ?? matchedProduct.rulesetVersionId
           : matchedProduct.rulesetVersionId;
       const targetRuleset = candidateRulesetId
@@ -1448,6 +1602,7 @@ export function runBasicEngine(params: {
     return {
       replyText: validation.errorText,
       options: getStepOptions(currentStep),
+      allowMultiple: currentStep.type === 'seleccion_multiple',
     };
   }
 
@@ -1495,6 +1650,7 @@ export function runBasicEngine(params: {
         return {
           replyText: getEffectiveStepPrompt(maybeFollowUp, session),
           options: getStepOptions(maybeFollowUp),
+          allowMultiple: maybeFollowUp.type === 'seleccion_multiple',
         };
       }
     }
@@ -1507,6 +1663,7 @@ export function runBasicEngine(params: {
         return {
           replyText: getEffectiveStepPrompt(nextFixStep, session),
           options: getStepOptions(nextFixStep),
+          allowMultiple: nextFixStep.type === 'seleccion_multiple',
         };
       }
     }

@@ -78,10 +78,20 @@ export function createInitialStore(): NalasStore {
         },
         products: [
           {
+            id: 'prod_nexo_nala',
+            name: 'Nala',
+            optionLabel: 'Nala.',
+            referencePrefix: 'nala',
+            targetType: 'flow',
+            active: false,
+          },
+          {
             id: 'prod_nexo_opting',
             name: 'Opting',
             optionLabel: 'Opting.',
             referencePrefix: 'opting',
+            targetType: 'flow',
+            flowKey: 'opting',
             flowVersionId: 'flow_nexo_opting_v1',
             rulesetVersionId: 'rules_nexo_opting_v1',
             active: true,
@@ -91,20 +101,24 @@ export function createInitialStore(): NalasStore {
             name: 'VOLVÉ',
             optionLabel: 'VOLVÉ.',
             referencePrefix: 'volve',
-            active: true,
+            targetType: 'flow',
+            active: false,
           },
           {
             id: 'prod_nexo_benefitos',
             name: 'BenefitOS',
             optionLabel: 'BenefitOS.',
             referencePrefix: 'benefitos',
-            active: true,
+            targetType: 'flow',
+            active: false,
           },
           {
-            id: 'prod_nexo_giro',
-            name: 'GIRO',
-            optionLabel: 'GIRO.',
-            referencePrefix: 'giro',
+            id: 'prod_nexo_humano',
+            name: 'Consulta general / Hablar con una persona',
+            optionLabel: 'Consulta general / Hablar con una persona.',
+            referencePrefix: 'nexo',
+            targetType: 'handoff',
+            handoffLabel: 'Consulta general / Hablar con una persona',
             active: true,
           },
         ],
@@ -857,6 +871,7 @@ export function createInitialStore(): NalasStore {
       {
         id: 'flow_nexo_opting_v1',
         businessId: 'biz_nexo',
+        flowKey: 'opting',
         versionNumber: 1,
         name: 'Guion Opting — Canal compartido NEXO v1',
         status: 'publicada',
@@ -883,8 +898,6 @@ export function createInitialStore(): NalasStore {
             type: 'seleccion_multiple',
             prompt:
               '¡Hola! Gracias por escribir a Opting. Soy el asistente virtual y te voy a acompañar con unas preguntas breves para que nuestro equipo conozca lo que necesitás.\n\n¿En qué te gustaría que te apoyemos? Podés elegir más de una opción.',
-            entryPrompt:
-              'Claro. En Opting aplicamos ingeniería para mejorar los procesos, la productividad y la gestión de tu negocio.\n\n¿En qué te gustaría que te apoyemos? Podés elegir más de una opción.',
             targetField: 'areas',
             required: true,
             options: [

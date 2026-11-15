@@ -1,6 +1,9 @@
 import { resolveHumanHandoffConfig } from '../../shared/humanHandoff.ts';
 import type {
   Business,
+  BusinessEntryConfig,
+  BusinessEntryDraft,
+  BusinessProduct,
   FlowStep,
   FlowVersion,
   HumanHandoffConfig,
@@ -238,6 +241,136 @@ export function validateRulesetDependencies(
   return validateFlowAndDependencies(publishedFlow, ruleset).filter((i) => i.ruleId !== undefined);
 }
 
+export function normalizeFlowKey(raw: string): string {
+  const cleaned = raw
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9_]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+  return cleaned || 'conversacion';
+}
+
+export function getFlowKey(flow: Pick<FlowVersion, 'businessId' | 'flowKey'>): string {
+  if (flow.flowKey && flow.flowKey.trim()) {
+    return flow.flowKey.trim();
+  }
+  return flow.businessId === 'biz_nexo' ? 'opting' : 'default';
+}
+
+export function resolvePublishedFlowForKey(
+  store: NalasStore,
+  businessId: string,
+  flowKey: string,
+  preferredPublishedId?: string
+): FlowVersion | undefined {
+  const published = store.flowVersions
+    .filter(
+      (f) =>
+        f.businessId === businessId &&
+        f.status === 'publicada' &&
+        getFlowKey(f) === flowKey
+    )
+    .sort((a, b) => b.versionNumber - a.versionNumber);
+  if (published.length === 0) return undefined;
+  if (preferredPublishedId) {
+    const exact = published.find((f) => f.id === preferredPublishedId);
+    if (exact) return exact;
+  }
+  return published[0];
+}
+
+export function createFlowConversation(
+  store: NalasStore,
+  businessId: string,
+  actorUserId: string,
+  payload: { name: string; flowKey?: string }
+): FlowVersion {
+  const biz = store.businesses.find((b) => b.id === businessId);
+  if (!biz) throw new Error('Negocio no encontrado.');
+
+  const cleanName = String(payload.name ?? '').trim();
+  if (!cleanName) {
+    const err = new Error('El nombre de la conversación es obligatorio.');
+    (err as Error & { statusCode?: number }).statusCode = 400;
+    throw err;
+  }
+
+  const baseKey = normalizeFlowKey(payload.flowKey || cleanName);
+  const existingKeys = new Set(
+    store.flowVersions.filter((f) => f.businessId === businessId).map((f) => getFlowKey(f))
+  );
+  let resolvedKey = baseKey;
+  let suffix = 2;
+  while (existingKeys.has(resolvedKey)) {
+    resolvedKey = `${baseKey}_${suffix}`;
+    suffix += 1;
+  }
+
+  const now = new Date().toISOString();
+  const baseStepPrefix = `${resolvedKey}_paso`;
+  const templateFlow = store.flowVersions.find((f) => f.id === biz.activeFlowVersionId);
+
+  const starterSteps: FlowStep[] = [
+    {
+      id: `${baseStepPrefix}_1`,
+      title: '1. Consulta inicial',
+      type: 'texto',
+      prompt: `¡Hola! Gracias por escribir sobre ${cleanName}. ¿En qué te podemos ayudar hoy?`,
+      targetField: 'consulta',
+      required: true,
+      nextStepId: `${baseStepPrefix}_cierre`,
+    },
+    {
+      id: `${baseStepPrefix}_cierre`,
+      title: '2. Cierre',
+      type: 'cierre',
+      prompt: '¡Gracias por tu mensaje! Nuestro equipo revisará tu consulta y te responderá pronto.',
+      required: false,
+      nextStepId: null,
+    },
+  ];
+
+  const draft: FlowVersion = {
+    id: `flow_${businessId}_${resolvedKey}_draft_${Date.now().toString(36)}`,
+    businessId,
+    flowKey: resolvedKey,
+    versionNumber: 1,
+    name: cleanName,
+    status: 'borrador',
+    steps: starterSteps,
+    outOfScriptRules: [],
+    humanHandoffConfig: resolveHumanHandoffConfig(templateFlow?.humanHandoffConfig),
+    handoffMessage: templateFlow?.handoffMessage,
+    handoffNoContactMessage: templateFlow?.handoffNoContactMessage,
+    cancelMessage: templateFlow?.cancelMessage,
+    outOfScriptPrompt: templateFlow?.outOfScriptPrompt,
+    hideInternalCategorizationInClosure: true,
+    createdAt: now,
+  };
+
+  store.flowVersions.push(draft);
+
+  appendAudit(store, {
+    businessId,
+    actorUserId,
+    module: 'configuracion',
+    action: 'crear_conversacion_flujo',
+    detail: `Conversación "${cleanName}" (${resolvedKey}) creada en borrador dentro de ${biz.name}.`,
+  });
+
+  return draft;
+}
+
+function stripHiddenStepPrompts(steps: FlowStep[]): FlowStep[] {
+  return steps.map((step) => {
+    const clean = structuredClone(step);
+    delete clean.entryPrompt;
+    return clean;
+  });
+}
+
 export function saveFlowDraft(
   store: NalasStore,
   businessId: string,
@@ -245,10 +378,25 @@ export function saveFlowDraft(
   steps: FlowStep[],
   outOfScriptRules: OutOfScriptRule[],
   name?: string,
-  humanHandoffConfig?: Partial<HumanHandoffConfig> | null
+  humanHandoffConfig?: Partial<HumanHandoffConfig> | null,
+  flowKey?: string
 ): FlowVersion {
+  const biz = store.businesses.find((b) => b.id === businessId);
+  const activeFlow = biz
+    ? store.flowVersions.find((f) => f.id === biz.activeFlowVersionId && f.businessId === businessId)
+    : undefined;
+  const resolvedFlowKey =
+    (flowKey && flowKey.trim()) ||
+    (activeFlow ? getFlowKey(activeFlow) : undefined) ||
+    (businessId === 'biz_nexo' ? 'opting' : 'default');
+
+  const cleanedSteps = stripHiddenStepPrompts(steps);
+
   let draft = store.flowVersions.find(
-    (f) => f.businessId === businessId && f.status === 'borrador'
+    (f) =>
+      f.businessId === businessId &&
+      f.status === 'borrador' &&
+      getFlowKey(f) === resolvedFlowKey
   );
   const now = new Date().toISOString();
   const normalizedHandoff =
@@ -257,41 +405,45 @@ export function saveFlowDraft(
       : undefined;
 
   if (!draft) {
-    const biz = store.businesses.find((b) => b.id === businessId);
-    const activeFlow = biz
-      ? store.flowVersions.find((f) => f.id === biz.activeFlowVersionId && f.businessId === businessId)
-      : undefined;
+    const sameKeyFlows = store.flowVersions.filter(
+      (f) => f.businessId === businessId && getFlowKey(f) === resolvedFlowKey
+    );
+    const sameKeyActive = sameKeyFlows
+      .filter((f) => f.status === 'publicada')
+      .sort((a, b) => b.versionNumber - a.versionNumber)[0] ?? activeFlow;
     const maxVer = Math.max(
       0,
-      ...store.flowVersions.filter((f) => f.businessId === businessId).map((f) => f.versionNumber)
+      ...sameKeyFlows.map((f) => f.versionNumber)
     );
     draft = {
-      id: `flow_${businessId}_draft_${Date.now()}`,
+      id: `flow_${businessId}_${resolvedFlowKey}_draft_${Date.now()}`,
       businessId,
+      flowKey: resolvedFlowKey,
       versionNumber: maxVer + 1,
-      name: name ?? `Flujo (Borrador v${maxVer + 1})`,
+      name: name ?? sameKeyActive?.name.replace(/\s+v\d+$/i, '') ?? `Conversación ${resolvedFlowKey}`,
       status: 'borrador',
-      steps,
+      steps: cleanedSteps,
       outOfScriptRules,
-      summaryTemplate: activeFlow?.summaryTemplate,
-      closureTemplate: activeFlow?.closureTemplate,
-      referenceTemplate: activeFlow?.referenceTemplate,
-      alreadyRegisteredTemplate: activeFlow?.alreadyRegisteredTemplate,
-      cancelMessage: activeFlow?.cancelMessage,
-      handoffMessage: activeFlow?.handoffMessage,
-      handoffNoContactMessage: activeFlow?.handoffNoContactMessage,
-      outOfScriptPrompt: activeFlow?.outOfScriptPrompt,
-      hideInternalCategorizationInClosure: activeFlow?.hideInternalCategorizationInClosure,
+      summaryTemplate: sameKeyActive?.summaryTemplate,
+      closureTemplate: sameKeyActive?.closureTemplate,
+      referenceTemplate: sameKeyActive?.referenceTemplate,
+      alreadyRegisteredTemplate: sameKeyActive?.alreadyRegisteredTemplate,
+      cancelMessage: sameKeyActive?.cancelMessage,
+      handoffMessage: sameKeyActive?.handoffMessage,
+      handoffNoContactMessage: sameKeyActive?.handoffNoContactMessage,
+      outOfScriptPrompt: sameKeyActive?.outOfScriptPrompt,
+      hideInternalCategorizationInClosure: sameKeyActive?.hideInternalCategorizationInClosure,
       humanHandoffConfig:
         normalizedHandoff ??
-        (activeFlow?.humanHandoffConfig
-          ? resolveHumanHandoffConfig(activeFlow.humanHandoffConfig)
+        (sameKeyActive?.humanHandoffConfig
+          ? resolveHumanHandoffConfig(sameKeyActive.humanHandoffConfig)
           : undefined),
       createdAt: now,
     };
     store.flowVersions.push(draft);
   } else {
-    draft.steps = steps;
+    draft.flowKey = resolvedFlowKey;
+    draft.steps = cleanedSteps;
     draft.outOfScriptRules = outOfScriptRules;
     if (name) draft.name = name;
     if (normalizedHandoff !== undefined) {
@@ -304,7 +456,7 @@ export function saveFlowDraft(
     actorUserId,
     module: 'configuracion',
     action: 'guardar_borrador_flujo',
-    detail: `Borrador guardado (${steps.length} pasos). No afecta sesiones activas ni publicadas.`,
+    detail: `Borrador guardado en conversación "${resolvedFlowKey}" (${cleanedSteps.length} pasos). No afecta sesiones activas ni publicadas.`,
   });
 
   return draft;
@@ -313,18 +465,41 @@ export function saveFlowDraft(
 export function publishFlowDraft(
   store: NalasStore,
   businessId: string,
-  actorUserId: string
+  actorUserId: string,
+  flowKey?: string
 ): { published: FlowVersion; nextDraft: FlowVersion } {
   const biz = store.businesses.find((b) => b.id === businessId);
   if (!biz) throw new Error('Negocio no encontrado.');
 
-  const draft = store.flowVersions.find(
-    (f) => f.businessId === businessId && f.status === 'borrador'
+  const activeFlow = store.flowVersions.find(
+    (f) => f.id === biz.activeFlowVersionId && f.businessId === businessId
   );
+  const resolvedFlowKey =
+    (flowKey && flowKey.trim()) ||
+    (activeFlow ? getFlowKey(activeFlow) : undefined);
+
+  const draft =
+    (resolvedFlowKey
+      ? store.flowVersions.find(
+          (f) =>
+            f.businessId === businessId &&
+            f.status === 'borrador' &&
+            getFlowKey(f) === resolvedFlowKey
+        )
+      : undefined) ??
+    store.flowVersions.find((f) => f.businessId === businessId && f.status === 'borrador');
   if (!draft) {
     throw new Error('No hay borrador de flujo para publicar.');
   }
+  const targetKey = getFlowKey(draft);
+  draft.flowKey = targetKey;
+  draft.steps = stripHiddenStepPrompts(draft.steps);
 
+  const primaryFlowKey = activeFlow
+    ? getFlowKey(activeFlow)
+    : businessId === 'biz_nexo'
+      ? 'opting'
+      : 'default';
   const activeRuleset = store.rulesetVersions.find(
     (r) => r.id === biz.activeRulesetVersionId && r.businessId === businessId
   );
@@ -332,8 +507,9 @@ export function publishFlowDraft(
     (r) => r.businessId === businessId && r.status === 'borrador'
   );
   const targetRuleset = draftRuleset ?? activeRuleset;
+  const rulesetToValidate = targetKey === primaryFlowKey ? targetRuleset : undefined;
 
-  const issues = validateFlowAndDependencies(draft, targetRuleset);
+  const issues = validateFlowAndDependencies(draft, rulesetToValidate);
   const errors = issues.filter((i) => i.severity === 'error');
   if (errors.length > 0) {
     const err = new Error(
@@ -348,21 +524,45 @@ export function publishFlowDraft(
   const maxPublishedVer = Math.max(
     0,
     ...store.flowVersions
-      .filter((f) => f.businessId === businessId && f.status === 'publicada')
+      .filter(
+        (f) =>
+          f.businessId === businessId &&
+          f.status === 'publicada' &&
+          getFlowKey(f) === targetKey
+      )
       .map((f) => f.versionNumber)
   );
   const newVersionNumber = maxPublishedVer + 1;
 
   const published: FlowVersion = {
     ...structuredClone(draft),
-    id: `flow_${businessId}_v${newVersionNumber}_${Date.now().toString(36)}`,
+    id: `flow_${businessId}_${targetKey}_v${newVersionNumber}_${Date.now().toString(36)}`,
+    flowKey: targetKey,
     versionNumber: newVersionNumber,
-    name: draft.name.replace(/\s*\(Borrador.*\)/i, '') + ` v${newVersionNumber}`,
+    name: draft.name.replace(/\s*\(Borrador.*\)/i, '').replace(/\s+v\d+$/i, '') + ` v${newVersionNumber}`,
     status: 'publicada',
     publishedAt: now,
   };
   store.flowVersions.push(published);
-  biz.activeFlowVersionId = published.id;
+
+  if (!activeFlow || getFlowKey(activeFlow) === targetKey) {
+    biz.activeFlowVersionId = published.id;
+  }
+
+  // Sincronizar opciones del menú vinculadas por identidad estable (flowKey) para nuevas conversaciones
+  for (const prod of biz.products ?? []) {
+    if (prod.flowKey === targetKey || (!prod.flowKey && prod.flowVersionId && getFlowKey(store.flowVersions.find((f) => f.id === prod.flowVersionId) ?? { businessId, flowKey: targetKey }) === targetKey)) {
+      prod.flowKey = targetKey;
+      prod.flowVersionId = published.id;
+    }
+  }
+  if (biz.entryDraft?.products) {
+    for (const prod of biz.entryDraft.products) {
+      if (prod.flowKey === targetKey) {
+        prod.flowVersionId = published.id;
+      }
+    }
+  }
 
   const rulesetDraftDiffers =
     draftRuleset &&
@@ -398,7 +598,7 @@ export function publishFlowDraft(
     actorUserId,
     module: 'configuracion',
     action: 'publicar_flujo',
-    detail: `Publicada versión inmutable v${newVersionNumber} (${published.id}). Las sesiones existentes conservan su versión fijada.`,
+    detail: `Publicada versión inmutable v${newVersionNumber} de "${targetKey}" (${published.id}). Las sesiones existentes conservan su versión fijada.`,
   });
 
   return { published, nextDraft: draft };
@@ -580,14 +780,167 @@ export function rollbackFlowVersion(
   if (!target) {
     throw new Error('Versión publicada de flujo no encontrada en este negocio.');
   }
-  biz.activeFlowVersionId = target.id;
+  const targetKey = getFlowKey(target);
+  const currentActive = store.flowVersions.find((f) => f.id === biz.activeFlowVersionId);
+  if (!currentActive || getFlowKey(currentActive) === targetKey) {
+    biz.activeFlowVersionId = target.id;
+  }
+  for (const prod of biz.products ?? []) {
+    if (prod.flowKey === targetKey) {
+      prod.flowVersionId = target.id;
+    }
+  }
+  if (biz.entryDraft?.products) {
+    for (const prod of biz.entryDraft.products) {
+      if (prod.flowKey === targetKey) {
+        prod.flowVersionId = target.id;
+      }
+    }
+  }
   appendAudit(store, {
     businessId,
     actorUserId,
     module: 'configuracion',
     action: 'revertir_version_flujo',
-    detail: `Versión activa para nuevas sesiones cambiada a v${target.versionNumber} (${target.id}). Datos históricos intactos.`,
+    detail: `Versión activa de "${targetKey}" para nuevas sesiones cambiada a v${target.versionNumber} (${target.id}). Datos históricos intactos.`,
   });
+  return biz;
+}
+
+function sanitizeEntryMenuInput(
+  business: Business,
+  input: { entryConfig?: Partial<BusinessEntryConfig>; products?: BusinessProduct[] }
+): { entryConfig: BusinessEntryConfig; products: BusinessProduct[] } {
+  const baseCfg = business.entryDraft?.entryConfig ??
+    business.entryConfig ?? {
+      enabled: true,
+      greetingPrompt: `¡Hola! Gracias por escribir a ${business.name}. ¿Sobre cuál opción querés conversar?`,
+      unconfiguredProductPrompt:
+        'Podemos derivar tu consulta sobre {{producto}} al equipo. ¿Querés solicitar atención humana?',
+    };
+  const entryConfig: BusinessEntryConfig = {
+    enabled: Boolean(input.entryConfig?.enabled ?? baseCfg.enabled),
+    greetingPrompt: String(input.entryConfig?.greetingPrompt ?? baseCfg.greetingPrompt).trim(),
+    unconfiguredProductPrompt: String(
+      input.entryConfig?.unconfiguredProductPrompt ?? baseCfg.unconfiguredProductPrompt
+    ).trim(),
+  };
+
+  const products: BusinessProduct[] = (input.products ?? []).map((p, idx) => {
+    const cleanName = String(p.name ?? '').trim() || `Opción ${idx + 1}`;
+    const cleanLabel = String(p.optionLabel ?? '').trim() || cleanName;
+    const cleanPrefix = normalizeFlowKey(p.referencePrefix || cleanName);
+    const targetType = p.targetType === 'handoff' ? 'handoff' : 'flow';
+    return {
+      id: String(p.id || `prod_${business.slug}_${cleanPrefix}_${idx + 1}`).trim(),
+      name: cleanName,
+      optionLabel: cleanLabel,
+      referencePrefix: cleanPrefix,
+      targetType,
+      flowKey: targetType === 'flow' ? (p.flowKey?.trim() || undefined) : undefined,
+      handoffLabel: targetType === 'handoff' ? (p.handoffLabel?.trim() || cleanName) : undefined,
+      flowVersionId: targetType === 'flow' ? p.flowVersionId : undefined,
+      draftFlowVersionId: targetType === 'flow' ? p.draftFlowVersionId : undefined,
+      rulesetVersionId: p.rulesetVersionId,
+      draftRulesetVersionId: p.draftRulesetVersionId,
+      active: Boolean(p.active),
+    };
+  });
+
+  return { entryConfig, products };
+}
+
+export function saveEntryMenuDraft(
+  store: NalasStore,
+  businessId: string,
+  actorUserId: string,
+  payload: { entryConfig?: Partial<BusinessEntryConfig>; products?: BusinessProduct[] }
+): BusinessEntryDraft {
+  const biz = store.businesses.find((b) => b.id === businessId);
+  if (!biz) throw new Error('Negocio no encontrado.');
+
+  const sanitized = sanitizeEntryMenuInput(biz, payload);
+  const now = new Date().toISOString();
+  const draft: BusinessEntryDraft = {
+    entryConfig: sanitized.entryConfig,
+    products: sanitized.products,
+    updatedAt: now,
+  };
+  biz.entryDraft = draft;
+
+  appendAudit(store, {
+    businessId,
+    actorUserId,
+    module: 'configuracion',
+    action: 'guardar_borrador_menu_entrada',
+    detail: `Borrador de saludo y menú general guardado (${draft.products.length} opciones). No altera el menú publicado.`,
+  });
+
+  return draft;
+}
+
+export function publishEntryMenu(
+  store: NalasStore,
+  businessId: string,
+  actorUserId: string,
+  payload?: { entryConfig?: Partial<BusinessEntryConfig>; products?: BusinessProduct[] }
+): Business {
+  const biz = store.businesses.find((b) => b.id === businessId);
+  if (!biz) throw new Error('Negocio no encontrado.');
+
+  const source = payload
+    ? sanitizeEntryMenuInput(biz, payload)
+    : sanitizeEntryMenuInput(biz, {
+        entryConfig: biz.entryDraft?.entryConfig ?? biz.entryConfig,
+        products: biz.entryDraft?.products ?? biz.products ?? [],
+      });
+
+  if (source.entryConfig.enabled && !source.entryConfig.greetingPrompt) {
+    const err = new Error('El saludo inicial del menú general no puede estar vacío.');
+    (err as Error & { statusCode?: number }).statusCode = 400;
+    throw err;
+  }
+
+  for (const prod of source.products) {
+    if (!prod.active) continue;
+    if (prod.targetType === 'handoff') continue;
+
+    if (!prod.flowKey) {
+      const err = new Error(
+        `La opción activa "${prod.name}" no tiene una conversación vinculada. Vinculá una conversación publicada de este negocio, elegí "Atención humana" o dejala inactiva.`
+      );
+      (err as Error & { statusCode?: number }).statusCode = 400;
+      throw err;
+    }
+
+    const publishedTarget = resolvePublishedFlowForKey(store, businessId, prod.flowKey);
+    if (!publishedTarget || publishedTarget.steps.length === 0) {
+      const err = new Error(
+        `La opción activa "${prod.name}" apunta a "${prod.flowKey}", que aún no tiene una versión publicada en ${biz.name}. Publicala primero o dejá la opción inactiva.`
+      );
+      (err as Error & { statusCode?: number }).statusCode = 400;
+      throw err;
+    }
+    prod.flowVersionId = publishedTarget.id;
+  }
+
+  const now = new Date().toISOString();
+  biz.entryConfig = structuredClone(source.entryConfig);
+  biz.products = structuredClone(source.products);
+  biz.entryDraft = {
+    entryConfig: structuredClone(source.entryConfig),
+    products: structuredClone(source.products),
+    updatedAt: now,
+  };
+
+  appendAudit(store, {
+    businessId,
+    actorUserId,
+    module: 'configuracion',
+    action: 'publicar_menu_entrada',
+    detail: `Saludo y menú general publicados (${biz.products.filter((p) => p.active).length} opciones activas).`,
+  });
+
   return biz;
 }
 

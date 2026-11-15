@@ -10,8 +10,9 @@ import { createInitialStore } from './seed.ts';
 export async function runAcceptanceSuite(): Promise<AcceptanceCriterionResult[]> {
   const results: AcceptanceCriterionResult[] = [];
   const store = createInitialStore();
+  const initialBusinessCount = store.businesses.length;
 
-  // 1. Incorporar un tercer negocio mediante administración, sin editar el código.
+  // 1. Incorporar un nuevo negocio mediante administración, sin editar el código.
   try {
     const created = createBusinessAccount(store, 'user_michael', {
       name: 'Kora Studio',
@@ -25,7 +26,7 @@ export async function runAcceptanceSuite(): Promise<AcceptanceCriterionResult[]>
     results.push({
       id: 1,
       title: 'Incorporar un tercer negocio sin editar el código',
-      passed: exists && store.businesses.length === 3,
+      passed: exists && store.businesses.length === initialBusinessCount + 1,
       evidence: `Creado "${created.business.name}" (${created.business.id}) con flujo, reglas y conexiones propias.`,
     });
   } catch (e) {

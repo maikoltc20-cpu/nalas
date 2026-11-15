@@ -1,5 +1,7 @@
 import { Hono } from 'hono';
 import type {
+  BusinessEntryConfig,
+  BusinessProduct,
   CommercialStatus,
   Edition,
   Environment,
@@ -39,9 +41,13 @@ import {
   updateOpportunityStatus,
 } from './modules/commercial.ts';
 import {
+  createFlowConversation,
+  getFlowKey,
+  publishEntryMenu,
   publishFlowDraft,
   publishRuleset,
   rollbackFlowVersion,
+  saveEntryMenuDraft,
   saveFlowDraft,
   saveRulesetDraft,
   updateProPolicy,
@@ -1082,6 +1088,27 @@ webApp.post('/api/assistants/:assistantId/mode', async (c) => {
   }
 });
 
+webApp.post('/api/flows/conversations', async (c) => {
+  try {
+    const { userId, businessId } = getActorContext(c);
+    const body = (await c.req.json().catch(() => ({}))) as {
+      name?: string;
+      flowKey?: string;
+    };
+    const created = await withStoreTransaction((store) => {
+      const ctx = resolveActorContext(store, userId, businessId);
+      assertPermission(ctx, 'editFlows');
+      return createFlowConversation(store, businessId, userId, {
+        name: String(body.name ?? ''),
+        flowKey: typeof body.flowKey === 'string' ? body.flowKey : undefined,
+      });
+    });
+    return c.json(created, { status: 201 });
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
 webApp.post('/api/flows/draft', async (c) => {
   try {
     const { userId, businessId } = getActorContext(c);
@@ -1090,6 +1117,7 @@ webApp.post('/api/flows/draft', async (c) => {
       outOfScriptRules?: OutOfScriptRule[];
       name?: string;
       humanHandoffConfig?: Partial<HumanHandoffConfig>;
+      flowKey?: string;
     };
     const result = await withStoreTransaction((store) => {
       const ctx = resolveActorContext(store, userId, businessId);
@@ -1101,13 +1129,15 @@ webApp.post('/api/flows/draft', async (c) => {
         body.steps,
         body.outOfScriptRules ?? [],
         body.name,
-        body.humanHandoffConfig
+        body.humanHandoffConfig,
+        body.flowKey
       );
       const biz = store.businesses.find((b) => b.id === businessId)!;
       const targetRuleset =
         store.rulesetVersions.find((r) => r.businessId === businessId && r.status === 'borrador') ??
         store.rulesetVersions.find((r) => r.id === biz.activeRulesetVersionId);
-      const issues = validateFlowAndDependencies(draft, targetRuleset);
+      const isPrimaryKey = getFlowKey(draft) === (businessId === 'biz_nexo' ? 'opting' : 'default');
+      const issues = validateFlowAndDependencies(draft, isPrimaryKey ? targetRuleset : undefined);
       return { draft, issues };
     });
     return c.json(result);
@@ -1119,12 +1149,64 @@ webApp.post('/api/flows/draft', async (c) => {
 webApp.post('/api/flows/publish', async (c) => {
   try {
     const { userId, businessId } = getActorContext(c);
+    const body = (await c.req.json().catch(() => ({}))) as { flowKey?: string };
     const result = await withStoreTransaction((store) => {
       const ctx = resolveActorContext(store, userId, businessId);
       assertPermission(ctx, 'activateVersions');
-      return publishFlowDraft(store, businessId, userId);
+      return publishFlowDraft(
+        store,
+        businessId,
+        userId,
+        typeof body.flowKey === 'string' ? body.flowKey : undefined
+      );
     });
     return c.json(result);
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.post('/api/entry-menu/draft', async (c) => {
+  try {
+    const { userId, businessId } = getActorContext(c);
+    const body = (await c.req.json()) as {
+      entryConfig: BusinessEntryConfig;
+      products: BusinessProduct[];
+    };
+    const entryDraft = await withStoreTransaction((store) => {
+      const ctx = resolveActorContext(store, userId, businessId);
+      assertPermission(ctx, 'editFlows');
+      return saveEntryMenuDraft(store, businessId, userId, {
+        entryConfig: body.entryConfig,
+        products: body.products ?? [],
+      });
+    });
+    return c.json({ entryDraft });
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.post('/api/entry-menu/publish', async (c) => {
+  try {
+    const { userId, businessId } = getActorContext(c);
+    const body = (await c.req.json().catch(() => ({}))) as {
+      entryConfig?: BusinessEntryConfig;
+      products?: BusinessProduct[];
+    };
+    const updated = await withStoreTransaction((store) => {
+      const ctx = resolveActorContext(store, userId, businessId);
+      assertPermission(ctx, 'activateVersions');
+      return publishEntryMenu(
+        store,
+        businessId,
+        userId,
+        body.entryConfig && Array.isArray(body.products)
+          ? { entryConfig: body.entryConfig, products: body.products }
+          : undefined
+      );
+    });
+    return c.json(updated);
   } catch (err) {
     return errorResponse(err);
   }
@@ -1933,6 +2015,9 @@ webApp.post('/api/simulator/start', async (c) => {
       contactPhone?: string;
       forceNew?: boolean;
       useDraft?: boolean;
+      flowKey?: string;
+      skipEntryMenu?: boolean;
+      useEntryDraft?: boolean;
     };
     const result = await withStoreTransaction(async (store) => {
       resolveActorContext(store, userId, businessId);
@@ -1944,6 +2029,9 @@ webApp.post('/api/simulator/start', async (c) => {
         contactPhone: body.contactPhone,
         forceNew: Boolean(body.forceNew),
         useDraft: Boolean(body.useDraft),
+        flowKey: typeof body.flowKey === 'string' ? body.flowKey : undefined,
+        skipEntryMenu: Boolean(body.skipEntryMenu),
+        useEntryDraft: Boolean(body.useEntryDraft),
       });
 
       const existingMsgs = store.messages.filter((m) => m.conversationId === started.conversation.id);

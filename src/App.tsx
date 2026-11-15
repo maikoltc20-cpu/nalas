@@ -196,13 +196,19 @@ export default function App() {
     await loadSession();
   }
 
-  async function handleOpenDraftInSimulator(connectionId: string) {
+  async function handleOpenDraftInSimulator(
+    connectionId: string,
+    opts?: { flowKey?: string; skipEntryMenu?: boolean; useEntryDraft?: boolean; useDraft?: boolean }
+  ) {
     const testCtx = { userId: activeUserId, businessId, environment: 'prueba' as Environment };
     const started = await nalasApi.startSimulator(testCtx, {
       connectionId,
       externalUserId: `borrador_${Date.now().toString(36)}`,
       forceNew: true,
-      useDraft: true,
+      useDraft: opts?.useDraft ?? true,
+      flowKey: opts?.flowKey,
+      skipEntryMenu: opts?.skipEntryMenu,
+      useEntryDraft: opts?.useEntryDraft,
     });
     setEnvironment('prueba');
     setDraftSimConvId(started.conversation.id);
