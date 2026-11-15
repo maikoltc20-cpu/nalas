@@ -85,11 +85,14 @@ export default function App() {
         mutated = true;
       }
       if (metaSignupStatus || metaSignupMessage) {
-        if (metaSignupStatus === 'error') {
-          setErrorMsg(metaSignupMessage || 'No se pudo completar el registro con Meta.');
-        } else {
+        if (metaSignupStatus === 'conectado') {
           setNoticeMsg(
-            metaSignupMessage || 'Estado de registro alojado de Meta actualizado.'
+            metaSignupMessage || 'Conexión WhatsApp de producción vinculada en modo coexistencia.'
+          );
+        } else {
+          setErrorMsg(
+            metaSignupMessage ||
+              'La conexión de producción permanece pendiente y sin modo coexistencia.'
           );
         }
         setTab('admin');

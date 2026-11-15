@@ -8,6 +8,7 @@ import {
 } from '../db/pgStore.ts';
 import { getEnv, isWorkerRuntime } from '../runtimeContext.ts';
 import { repairExistingAgentContacts } from './commercial.ts';
+import { sanitizeErroneousProdWhatsAppBinding } from './metaAssetPolicy.ts';
 import { createInitialStore } from './seed.ts';
 
 export const PG_ADVISORY_LOCK_ID = 78412031;
@@ -179,6 +180,10 @@ export function upgradeOptingDraftIfStale(store: NalasStore): boolean {
       conn.maxButtons = 10;
       changed = true;
     }
+  }
+
+  if (sanitizeErroneousProdWhatsAppBinding(store)) {
+    changed = true;
   }
 
   return changed;

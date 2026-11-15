@@ -7,6 +7,18 @@ import {
 import { getEnv, isWorkerRuntime } from '../runtimeContext.ts';
 import { getSessionSigningSecret, parseCookieHeader } from './auth.ts';
 import { appendAudit } from './consumptionAndAudit.ts';
+import {
+  getMetaTargetBusinessId,
+  isErroneousProdWhatsAppConnection,
+  isExpectedProdDisplayPhone,
+  isTestDisplayPhone,
+  isTestPhoneNumberId,
+  isTestWabaId,
+  isTestWhatsAppAsset,
+  NEXO_EXPECTED_PROD_DISPLAY_PHONE,
+  normalizePhoneDigits,
+  sanitizeErroneousProdWhatsAppBinding,
+} from './metaAssetPolicy.ts';
 import { withStoreTransaction } from './persistence.ts';
 import { resolveSafeAppBaseUrl } from './urlHelper.ts';
 
@@ -21,13 +33,19 @@ export interface MetaEmbeddedSignupState {
   displayPhoneNumber?: string;
   verifiedName?: string;
   platformType?: string;
-  coexistenceMode: true;
+  coexistenceMode: boolean;
   subscribedToWaba: boolean;
   tokenExchanged: boolean;
   statusReason: string;
   lastError?: string;
   updatedAt?: string;
 }
+
+export {
+  getMetaTargetBusinessId,
+  isErroneousProdWhatsAppConnection,
+  sanitizeErroneousProdWhatsAppBinding,
+};
 
 interface MetaSignupCookiePayload {
   state: string;
@@ -50,7 +68,6 @@ const META_EMBEDDED_SIGNUP_SETTING_KEY = 'meta_embedded_signup_state';
 export const META_SIGNUP_COOKIE_NAME = 'nalas_meta_signup';
 const META_SIGNUP_TTL_MS = 15 * 60 * 1000;
 const META_CONFIRM_TTL_MS = 10 * 60 * 1000;
-const NEXO_DEFAULT_PHONE_DIGITS = '50670582232';
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
@@ -156,10 +173,6 @@ export function getMetaGraphVersion(): string {
   return getEnv('META_GRAPH_API_VERSION')?.trim() || 'v21.0';
 }
 
-export function getMetaTargetBusinessId(): string {
-  return getEnv('META_BUSINESS_ID')?.trim() || 'biz_nexo';
-}
-
 export function getMetaEmbeddedSignupRedirectUri(requestOrOrigin?: Request | string): string {
   const baseUrl = resolveSafeAppBaseUrl(requestOrOrigin);
   return `${baseUrl}/api/integrations/meta/embedded-signup/callback`;
@@ -171,7 +184,7 @@ function buildDefaultSignupState(businessId = getMetaTargetBusinessId()): MetaEm
   const configIdReady = Boolean(getMetaEmbeddedSignupConfigId());
 
   let statusReason =
-    'Pendiente de completar el registro insertado alojado por Meta (Coexistencia con la app móvil).';
+    `Pendiente de completar el registro insertado alojado por Meta para el número real ${NEXO_EXPECTED_PROD_DISPLAY_PHONE} (Coexistencia con la app móvil).`;
   if (!appIdReady && !configIdReady) {
     statusReason =
       'Configurá META_APP_ID (para el intercambio de código) y META_EMBEDDED_SIGNUP_CONFIG_ID (para iniciar desde Nala), o pegá la URI OAuth en "Registro insertado alojado por Meta".';
@@ -185,7 +198,7 @@ function buildDefaultSignupState(businessId = getMetaTargetBusinessId()): MetaEm
     status: 'pendiente',
     businessId,
     connectionId: 'conn_nexo_wa_prod',
-    coexistenceMode: true,
+    coexistenceMode: false,
     subscribedToWaba: false,
     tokenExchanged: false,
     statusReason,
@@ -207,6 +220,41 @@ async function getDevMetaFilePaths(): Promise<{
   };
 }
 
+async function normalizeOrSanitizeStoredSignupState(
+  parsed: MetaEmbeddedSignupState,
+  businessId: string
+): Promise<MetaEmbeddedSignupState> {
+  const hasErroneousTestOrWrongBinding =
+    isTestWhatsAppAsset({
+      wabaId: parsed.wabaId,
+      phoneNumberId: parsed.phoneNumberId,
+      displayPhoneNumber: parsed.displayPhoneNumber,
+    }) ||
+    (parsed.status === 'conectado' && !isExpectedProdDisplayPhone(parsed.displayPhoneNumber));
+
+  if (hasErroneousTestOrWrongBinding) {
+    const cleaned: MetaEmbeddedSignupState = {
+      status: 'pendiente',
+      businessId: parsed.businessId || businessId,
+      connectionId: parsed.connectionId || 'conn_nexo_wa_prod',
+      coexistenceMode: false,
+      subscribedToWaba: false,
+      tokenExchanged: false,
+      statusReason: `Se retiró la vinculación previa de activos de prueba o número distinto de ${NEXO_EXPECTED_PROD_DISPLAY_PHONE} del canal de producción. La conexión permanece pendiente y sin modo coexistencia hasta autorizar el número real.`,
+    };
+    return saveMetaEmbeddedSignupState(cleaned);
+  }
+
+  if (parsed.status !== 'conectado' && parsed.coexistenceMode) {
+    return {
+      ...parsed,
+      coexistenceMode: false,
+    };
+  }
+
+  return parsed;
+}
+
 export async function readMetaEmbeddedSignupState(
   businessId = getMetaTargetBusinessId()
 ): Promise<MetaEmbeddedSignupState> {
@@ -216,7 +264,7 @@ export async function readMetaEmbeddedSignupState(
       if (raw) {
         const parsed = JSON.parse(raw) as MetaEmbeddedSignupState;
         if (parsed && parsed.status && parsed.businessId) {
-          return parsed;
+          return normalizeOrSanitizeStoredSignupState(parsed, businessId);
         }
       }
     } catch {
@@ -231,15 +279,22 @@ export async function readMetaEmbeddedSignupState(
       const raw = await fs.readFile(metaConfigPath, 'utf8');
       const parsed = JSON.parse(raw) as { embeddedSignupState?: MetaEmbeddedSignupState };
       if (parsed.embeddedSignupState && parsed.embeddedSignupState.status) {
-        inMemoryFallbackState = parsed.embeddedSignupState;
-        return parsed.embeddedSignupState;
+        const sanitized = await normalizeOrSanitizeStoredSignupState(
+          parsed.embeddedSignupState,
+          businessId
+        );
+        inMemoryFallbackState = sanitized;
+        return sanitized;
       }
     } catch {
       // Ignore if file doesn't exist yet
     }
   }
 
-  return inMemoryFallbackState ?? buildDefaultSignupState(businessId);
+  if (inMemoryFallbackState) {
+    return normalizeOrSanitizeStoredSignupState(inMemoryFallbackState, businessId);
+  }
+  return buildDefaultSignupState(businessId);
 }
 
 export async function saveMetaEmbeddedSignupState(
@@ -247,7 +302,7 @@ export async function saveMetaEmbeddedSignupState(
 ): Promise<MetaEmbeddedSignupState> {
   const normalized: MetaEmbeddedSignupState = {
     ...state,
-    coexistenceMode: true,
+    coexistenceMode: state.status === 'conectado' && Boolean(state.coexistenceMode),
     updatedAt: new Date().toISOString(),
   };
 
@@ -551,20 +606,18 @@ interface DebugTokenResponse {
   };
 }
 
-interface PhoneNumbersResponse {
-  data?: Array<{
-    id?: string;
-    display_phone_number?: string;
-    verified_name?: string;
-    code_verification_status?: string;
-    quality_rating?: string;
-    platform_type?: string;
-    is_official_business_account?: boolean;
-  }>;
+interface MetaPhoneNumberItem {
+  id?: string;
+  display_phone_number?: string;
+  verified_name?: string;
+  code_verification_status?: string;
+  quality_rating?: string;
+  platform_type?: string;
+  is_official_business_account?: boolean;
 }
 
-function normalizePhoneDigits(raw?: string): string {
-  return (raw ?? '').replace(/\D/g, '');
+interface PhoneNumbersResponse {
+  data?: MetaPhoneNumberItem[];
 }
 
 function resolveProductionWhatsAppConnectionInStore(
@@ -584,6 +637,29 @@ function resolveProductionWhatsAppConnectionInStore(
     );
   }
   return preferred;
+}
+
+async function retireErroneousProdAndRecordRejection(params: {
+  businessId: string;
+  actorUserId: string;
+  reasonDetail: string;
+}): Promise<void> {
+  try {
+    await withStoreTransaction((store) => {
+      sanitizeErroneousProdWhatsAppBinding(store, params.actorUserId);
+      appendAudit(store, {
+        businessId: params.businessId,
+        environment: 'produccion',
+        actorUserId: params.actorUserId,
+        module: 'integraciones',
+        action: 'rechazar_meta_embedded_signup_produccion',
+        correlationId: 'conn_nexo_wa_prod',
+        detail: params.reasonDetail,
+      });
+    });
+  } catch {
+    // Non-fatal if store isn't initialized yet
+  }
 }
 
 export async function completeMetaEmbeddedSignupExchange(params: {
@@ -610,7 +686,7 @@ export async function completeMetaEmbeddedSignupExchange(params: {
       status: 'error',
       businessId: targetBusinessId,
       connectionId: 'conn_nexo_wa_prod',
-      coexistenceMode: true,
+      coexistenceMode: false,
       subscribedToWaba: false,
       tokenExchanged: false,
       statusReason: `No se pudo intercambiar el código con Meta porque falta ${missing} en Cloudflare.`,
@@ -636,7 +712,7 @@ export async function completeMetaEmbeddedSignupExchange(params: {
       status: tokenRes.isPendingReviewOrPermission ? 'pendiente' : 'error',
       businessId: targetBusinessId,
       connectionId: 'conn_nexo_wa_prod',
-      coexistenceMode: true,
+      coexistenceMode: false,
       subscribedToWaba: false,
       tokenExchanged: false,
       statusReason: tokenRes.isPendingReviewOrPermission
@@ -666,7 +742,7 @@ export async function completeMetaEmbeddedSignupExchange(params: {
       status: 'error',
       businessId: targetBusinessId,
       connectionId: 'conn_nexo_wa_prod',
-      coexistenceMode: true,
+      coexistenceMode: false,
       subscribedToWaba: false,
       tokenExchanged: true,
       statusReason: `El token de Meta se obtuvo pero falló la inspección de activos (debug_token): ${errMsg}`,
@@ -690,89 +766,208 @@ export async function completeMetaEmbeddedSignupExchange(params: {
   }
 
   const hintWaba = params.wabaIdHint?.trim();
-  let resolvedWabaId = '';
-  if (hintWaba && (targetWabaIds.size === 0 || targetWabaIds.has(hintWaba))) {
-    resolvedWabaId = hintWaba;
-  } else if (targetWabaIds.size > 0) {
-    resolvedWabaId = Array.from(targetWabaIds)[0];
+  const hintPhoneId = params.phoneNumberIdHint?.trim();
+
+  const orderedCandidateWabas: string[] = [];
+  if (targetWabaIds.size > 0) {
+    if (hintWaba && targetWabaIds.has(hintWaba)) {
+      orderedCandidateWabas.push(hintWaba);
+    }
+    for (const id of targetWabaIds) {
+      if (!orderedCandidateWabas.includes(id)) {
+        orderedCandidateWabas.push(id);
+      }
+    }
+  } else if (hintWaba) {
+    orderedCandidateWabas.push(hintWaba);
   }
 
-  if (!resolvedWabaId) {
+  const rejectedTestWabas = Array.from(
+    new Set([
+      ...orderedCandidateWabas.filter((id) => isTestWabaId(id)),
+      ...(hintWaba && isTestWabaId(hintWaba) ? [hintWaba] : []),
+    ])
+  );
+  const candidateProdWabas = orderedCandidateWabas.filter((id) => !isTestWabaId(id));
+
+  if (orderedCandidateWabas.length === 0) {
+    const reason =
+      `Meta intercambió el código OAuth pero no devolvió un WABA ID autorizado para el número real ${NEXO_EXPECTED_PROD_DISPLAY_PHONE}. La conexión de producción permanece pendiente y sin modo coexistencia.`;
+    await retireErroneousProdAndRecordRejection({
+      businessId: targetBusinessId,
+      actorUserId: params.actorUserId,
+      reasonDetail: reason,
+    });
     return saveMetaEmbeddedSignupState({
       status: 'pendiente',
       businessId: targetBusinessId,
       connectionId: 'conn_nexo_wa_prod',
-      coexistenceMode: true,
+      coexistenceMode: false,
       subscribedToWaba: false,
       tokenExchanged: true,
-      statusReason:
-        'Meta intercambió el código OAuth pero no devolvió un WABA ID autorizado. Esto ocurre si no se seleccionó la cuenta de WhatsApp Business o si falta aprobar la incorporación de Tech Provider / App Review.',
+      statusReason: reason,
     });
   }
 
-  // 3. Consultar números reales asociados al WABA (solo lectura; PROHIBIDO llamar /register para conservar coexistencia en iPhone)
-  const phonesUrl = new URL(
-    `https://graph.facebook.com/${graphVersion}/${encodeURIComponent(resolvedWabaId)}/phone_numbers`
-  );
-  phonesUrl.searchParams.set(
-    'fields',
-    'id,display_phone_number,verified_name,code_verification_status,quality_rating,platform_type,is_official_business_account'
-  );
-
-  const phonesResp = await fetch(phonesUrl.toString(), {
-    headers: {
-      Authorization: `Bearer ${userAccessToken}`,
-      Accept: 'application/json',
-    },
-  });
-  const phonesJson = (await phonesResp.json().catch(() => ({}))) as PhoneNumbersResponse &
-    MetaGraphErrorPayload;
-
-  if (!phonesResp.ok) {
-    const errMsg = formatMetaGraphError(phonesJson, phonesResp.status);
+  if (candidateProdWabas.length === 0) {
+    const testAssetsDesc = [
+      `WABA de prueba ${rejectedTestWabas.join(', ')}`,
+      hintPhoneId ? `phone_number_id ${hintPhoneId}` : null,
+    ]
+      .filter(Boolean)
+      .join(' / ');
+    const reason = `Conexión rechazada para producción: Meta devolvió activos de prueba (${testAssetsDesc}), que permanecen aislados exclusivamente en conn_nexo_wa_test. Para producción solo se vincula el número real ${NEXO_EXPECTED_PROD_DISPLAY_PHONE}; conn_nexo_wa_prod queda pendiente y sin modo coexistencia.`;
+    await retireErroneousProdAndRecordRejection({
+      businessId: targetBusinessId,
+      actorUserId: params.actorUserId,
+      reasonDetail: reason,
+    });
     return saveMetaEmbeddedSignupState({
-      status: 'error',
+      status: 'pendiente',
       businessId: targetBusinessId,
       connectionId: 'conn_nexo_wa_prod',
-      wabaId: resolvedWabaId,
-      coexistenceMode: true,
+      coexistenceMode: false,
       subscribedToWaba: false,
       tokenExchanged: true,
-      statusReason: `WABA ${resolvedWabaId} detectado, pero falló la lectura de números en Meta: ${errMsg}`,
-      lastError: errMsg,
+      statusReason: reason,
     });
   }
 
-  const phones = Array.isArray(phonesJson.data) ? phonesJson.data : [];
-  const hintPhoneId = params.phoneNumberIdHint?.trim();
+  // 3. Consultar números reales asociados a los WABA candidatos (solo lectura; PROHIBIDO llamar /register o elegir números alternativos)
+  let matchedWabaId = '';
+  let matchedPhone: MetaPhoneNumberItem | undefined;
+  const observedNonMatchingPhones: string[] = [];
+  const observedTestPhones: string[] = [];
+  const phoneQueryErrors: string[] = [];
 
-  const matchedPhone =
-    (hintPhoneId ? phones.find((p) => p.id === hintPhoneId) : undefined) ??
-    (configuredPhoneId ? phones.find((p) => p.id === configuredPhoneId) : undefined) ??
-    phones.find((p) => normalizePhoneDigits(p.display_phone_number) === NEXO_DEFAULT_PHONE_DIGITS) ??
-    phones[0];
+  for (const wabaIdCandidate of candidateProdWabas) {
+    const phonesUrl = new URL(
+      `https://graph.facebook.com/${graphVersion}/${encodeURIComponent(wabaIdCandidate)}/phone_numbers`
+    );
+    phonesUrl.searchParams.set(
+      'fields',
+      'id,display_phone_number,verified_name,code_verification_status,quality_rating,platform_type,is_official_business_account'
+    );
 
-  const resolvedPhoneNumberId = matchedPhone?.id?.trim() || hintPhoneId || undefined;
+    const phonesResp = await fetch(phonesUrl.toString(), {
+      headers: {
+        Authorization: `Bearer ${userAccessToken}`,
+        Accept: 'application/json',
+      },
+    });
+    const phonesJson = (await phonesResp.json().catch(() => ({}))) as PhoneNumbersResponse &
+      MetaGraphErrorPayload;
+
+    if (!phonesResp.ok) {
+      phoneQueryErrors.push(
+        `WABA ${wabaIdCandidate}: ${formatMetaGraphError(phonesJson, phonesResp.status)}`
+      );
+      continue;
+    }
+
+    const phones = Array.isArray(phonesJson.data) ? phonesJson.data : [];
+    const realMatchingPhones: MetaPhoneNumberItem[] = [];
+
+    for (const phone of phones) {
+      const pid = phone.id?.trim() || '';
+      const display = phone.display_phone_number?.trim() || '';
+
+      if (isTestPhoneNumberId(pid) || isTestDisplayPhone(display)) {
+        observedTestPhones.push(
+          `${display || 'sin display'} (ID ${pid || 'sin ID'}, WABA ${wabaIdCandidate})`
+        );
+        continue;
+      }
+
+      if (pid && isExpectedProdDisplayPhone(display)) {
+        realMatchingPhones.push(phone);
+      } else {
+        observedNonMatchingPhones.push(
+          `${display || 'sin display'} (ID ${pid || 'sin ID'}, WABA ${wabaIdCandidate})`
+        );
+      }
+    }
+
+    if (realMatchingPhones.length > 0) {
+      matchedWabaId = wabaIdCandidate;
+      matchedPhone =
+        (configuredPhoneId
+          ? realMatchingPhones.find((p) => p.id?.trim() === configuredPhoneId)
+          : undefined) ??
+        (hintPhoneId
+          ? realMatchingPhones.find((p) => p.id?.trim() === hintPhoneId)
+          : undefined) ??
+        realMatchingPhones[0];
+      break;
+    }
+  }
+
+  const resolvedPhoneNumberId = matchedPhone?.id?.trim() || undefined;
   const displayPhoneNumber = matchedPhone?.display_phone_number?.trim() || undefined;
   const verifiedName = matchedPhone?.verified_name?.trim() || undefined;
   const platformType = matchedPhone?.platform_type?.trim() || undefined;
 
-  if (!resolvedPhoneNumberId) {
+  if (
+    !matchedWabaId ||
+    !resolvedPhoneNumberId ||
+    !isExpectedProdDisplayPhone(displayPhoneNumber) ||
+    isTestWhatsAppAsset({
+      wabaId: matchedWabaId,
+      phoneNumberId: resolvedPhoneNumberId,
+      displayPhoneNumber,
+    })
+  ) {
+    const details: string[] = [];
+    if (rejectedTestWabas.length > 0 || observedTestPhones.length > 0) {
+      const testItems = [
+        ...rejectedTestWabas.map((id) => `WABA prueba ${id}`),
+        ...observedTestPhones,
+      ];
+      details.push(`se rechazaron activos de prueba (${testItems.join(', ')})`);
+    }
+    if (observedNonMatchingPhones.length > 0) {
+      details.push(
+        `Meta devolvió otros números distintos del real (${observedNonMatchingPhones.join(', ')})`
+      );
+    }
+    if (phoneQueryErrors.length > 0) {
+      details.push(`errores de lectura (${phoneQueryErrors.join('; ')})`);
+    }
+    if (details.length === 0) {
+      details.push(
+        `Meta no devolvió ningún número asociado en los WABA consultados (${candidateProdWabas.join(', ')})`
+      );
+    }
+
+    const reason = `No se vinculó producción porque el número real ${NEXO_EXPECTED_PROD_DISPLAY_PHONE} no estuvo disponible en los activos devueltos por Meta: ${details.join('; ')}. No se seleccionó ningún número alternativo; la conexión permanece pendiente y sin modo coexistencia.`;
+
+    await retireErroneousProdAndRecordRejection({
+      businessId: targetBusinessId,
+      actorUserId: params.actorUserId,
+      reasonDetail: reason,
+    });
+
+    const isPureReadFailure =
+      phoneQueryErrors.length > 0 &&
+      observedNonMatchingPhones.length === 0 &&
+      observedTestPhones.length === 0 &&
+      rejectedTestWabas.length === 0;
+
     return saveMetaEmbeddedSignupState({
-      status: 'pendiente',
+      status: isPureReadFailure ? 'error' : 'pendiente',
       businessId: targetBusinessId,
       connectionId: 'conn_nexo_wa_prod',
-      wabaId: resolvedWabaId,
-      coexistenceMode: true,
+      coexistenceMode: false,
       subscribedToWaba: false,
       tokenExchanged: true,
-      statusReason: `WABA ${resolvedWabaId} autorizado, pero Meta aún no devolvió un phone_number_id vinculado. Completá el emparejamiento por QR desde WhatsApp Business en el iPhone.`,
+      statusReason: reason,
+      lastError: isPureReadFailure ? phoneQueryErrors.join('; ') : undefined,
     });
   }
 
-  // 4. Suscribir la app Nalas al WABA correspondiente
+  // 4. Suscribir la app Nalas únicamente al WABA real verificado con +506 7058 2232
   const subResp = await fetch(
-    `https://graph.facebook.com/${graphVersion}/${encodeURIComponent(resolvedWabaId)}/subscribed_apps`,
+    `https://graph.facebook.com/${graphVersion}/${encodeURIComponent(matchedWabaId)}/subscribed_apps`,
     {
       method: 'POST',
       headers: {
@@ -792,15 +987,15 @@ export async function completeMetaEmbeddedSignupExchange(params: {
       status: 'error',
       businessId: targetBusinessId,
       connectionId: 'conn_nexo_wa_prod',
-      wabaId: resolvedWabaId,
+      wabaId: matchedWabaId,
       phoneNumberId: resolvedPhoneNumberId,
       displayPhoneNumber,
       verifiedName,
       platformType,
-      coexistenceMode: true,
+      coexistenceMode: false,
       subscribedToWaba: false,
       tokenExchanged: true,
-      statusReason: `Se identificó WABA ${resolvedWabaId} y número ${resolvedPhoneNumberId}, pero falló la suscripción de la app (subscribed_apps): ${errMsg}`,
+      statusReason: `Se identificó WABA ${matchedWabaId} y número ${displayPhoneNumber} (${resolvedPhoneNumberId}), pero falló la suscripción de la app (subscribed_apps): ${errMsg}. La coexistencia aún no está activa.`,
       lastError: errMsg,
     });
   }
@@ -809,10 +1004,9 @@ export async function completeMetaEmbeddedSignupExchange(params: {
   const linkedConn = await withStoreTransaction((store) => {
     const conn = resolveProductionWhatsAppConnectionInStore(store, targetBusinessId);
     conn.destinationAddress = resolvedPhoneNumberId;
-    if (displayPhoneNumber) {
-      conn.displayName = `WhatsApp NEXO (${displayPhoneNumber})`;
-    }
+    conn.displayName = `WhatsApp NEXO (${displayPhoneNumber})`;
     conn.implementationStatus = 'Producción conectada';
+    conn.status = 'activa';
 
     appendAudit(store, {
       businessId: targetBusinessId,
@@ -821,7 +1015,7 @@ export async function completeMetaEmbeddedSignupExchange(params: {
       module: 'integraciones',
       action: 'vincular_meta_embedded_signup',
       correlationId: conn.id,
-      detail: `Meta Embedded Signup (coexistencia) vinculado a ${targetBusinessId}: WABA=${resolvedWabaId}, phone_number_id=${resolvedPhoneNumberId}, número=${displayPhoneNumber ?? 'sin display'}, subscribed_apps=true.`,
+      detail: `Meta Embedded Signup (coexistencia) vinculado a ${targetBusinessId}: WABA=${matchedWabaId}, phone_number_id=${resolvedPhoneNumberId}, número=${displayPhoneNumber}, subscribed_apps=true.`,
     });
     return { id: conn.id };
   });
@@ -830,7 +1024,7 @@ export async function completeMetaEmbeddedSignupExchange(params: {
     status: 'conectado',
     businessId: targetBusinessId,
     connectionId: linkedConn.id,
-    wabaId: resolvedWabaId,
+    wabaId: matchedWabaId,
     phoneNumberId: resolvedPhoneNumberId,
     displayPhoneNumber,
     verifiedName,
@@ -839,7 +1033,7 @@ export async function completeMetaEmbeddedSignupExchange(params: {
     subscribedToWaba: true,
     tokenExchanged: true,
     statusReason:
-      'WABA y número vinculados correctamente con suscripción activa en modo coexistencia (sin re-registrar ni desconectar el iPhone). Recordá que los envíos siguen pausados (META_OUTBOUND_ENABLED=false) y la sincronización bidireccional completa depende de Tech Provider / campos de coexistencia.',
+      'WABA y número real +506 7058 2232 vinculados correctamente con suscripción activa en modo coexistencia (sin re-registrar ni desconectar el iPhone). Recordá que los envíos siguen pausados (META_OUTBOUND_ENABLED=false) y la sincronización bidireccional completa depende de Tech Provider / campos de coexistencia.',
   });
 }
 

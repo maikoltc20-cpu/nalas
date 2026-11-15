@@ -373,7 +373,7 @@ export const nalasApi = {
           displayPhoneNumber?: string;
           verifiedName?: string;
           platformType?: string;
-          coexistenceMode: true;
+          coexistenceMode: boolean;
           subscribedToWaba: boolean;
           tokenExchanged: boolean;
           statusReason: string;

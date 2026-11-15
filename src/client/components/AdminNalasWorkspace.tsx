@@ -885,6 +885,16 @@ export function AdminNalasWorkspace({
                       {metaConfig.embeddedSignup.connectionState.statusReason}
                     </div>
 
+                    <div className="text-xs text-[#5A6877]">
+                      Coexistencia iPhone:{' '}
+                      <strong className="text-[#25364A]">
+                        {metaConfig.embeddedSignup.connectionState.status === 'conectado' &&
+                        metaConfig.embeddedSignup.connectionState.coexistenceMode
+                          ? 'Activa (+506 7058 2232)'
+                          : 'No activa (pendiente de vincular +506 7058 2232)'}
+                      </strong>
+                    </div>
+
                     {(metaConfig.embeddedSignup.connectionState.wabaId ||
                       metaConfig.embeddedSignup.connectionState.phoneNumberId ||
                       metaConfig.embeddedSignup.connectionState.displayPhoneNumber) && (

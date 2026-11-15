@@ -79,6 +79,8 @@ import {
   createMetaConfirmToken,
   createMetaEmbeddedSignupRequest,
   getMetaTargetBusinessId,
+  isErroneousProdWhatsAppConnection,
+  sanitizeErroneousProdWhatsAppBinding,
   saveMetaEmbeddedSignupState,
   verifyMetaConfirmToken,
   verifyMetaSignupCallbackState,
@@ -673,9 +675,15 @@ webApp.post('/api/auth/change-password', async (c) => {
 
 webApp.get('/api/bootstrap', async (c) => {
   try {
-    const store = await readStore();
-    repairExistingAgentContacts(store);
     const { userId, businessId } = getActorContext(c);
+    let store = await readStore();
+    if (store.channelConnections.some(isErroneousProdWhatsAppConnection)) {
+      await withStoreTransaction((tx) => {
+        sanitizeErroneousProdWhatsAppBinding(tx, userId);
+      });
+      store = await readStore();
+    }
+    repairExistingAgentContacts(store);
     const environment = (c.req.query('environment') === 'produccion'
       ? 'produccion'
       : 'prueba') as Environment;
@@ -1253,9 +1261,15 @@ webApp.post('/api/outbox/process-pending', async (c) => {
 webApp.get('/api/integrations/meta/config', async (c) => {
   try {
     const { userId, businessId } = getActorContext(c);
-    const store = await readStore();
+    let store = await readStore();
     const ctx = resolveActorContext(store, userId, businessId);
     assertPermission(ctx, 'manageIntegrations');
+    if (store.channelConnections.some(isErroneousProdWhatsAppConnection)) {
+      await withStoreTransaction((tx) => {
+        sanitizeErroneousProdWhatsAppBinding(tx, userId);
+      });
+      store = await readStore();
+    }
     const url = new URL(c.req.url);
     const forwardedHost = c.req.header('x-forwarded-host') || c.req.header('host');
     const forwardedProto = c.req.header('x-forwarded-proto') || url.protocol.replace(':', '');
@@ -1401,7 +1415,7 @@ async function handleMetaEmbeddedSignupCallback(c: {
         status: oauthError === 'access_denied' ? 'pendiente' : 'error',
         businessId: targetBusinessId,
         connectionId: 'conn_nexo_wa_prod',
-        coexistenceMode: true,
+        coexistenceMode: false,
         subscribedToWaba: false,
         tokenExchanged: false,
         statusReason: msg,
@@ -1426,7 +1440,7 @@ async function handleMetaEmbeddedSignupCallback(c: {
         status: 'error',
         businessId: targetBusinessId,
         connectionId: 'conn_nexo_wa_prod',
-        coexistenceMode: true,
+        coexistenceMode: false,
         subscribedToWaba: false,
         tokenExchanged: false,
         statusReason: msg,
@@ -1446,7 +1460,7 @@ async function handleMetaEmbeddedSignupCallback(c: {
         status: 'error',
         businessId: targetBusinessId,
         connectionId: 'conn_nexo_wa_prod',
-        coexistenceMode: true,
+        coexistenceMode: false,
         subscribedToWaba: false,
         tokenExchanged: false,
         statusReason: stateCheck.reason,
