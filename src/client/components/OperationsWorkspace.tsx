@@ -1103,7 +1103,7 @@ export function OperationsWorkspace({
                     >
                       <div className="flex items-center justify-between gap-2">
                         <span className="text-[15px] font-semibold text-[#25364A] truncate">
-                          {cnt?.fullName || 'Visitante'}
+                          {cnt?.fullName || cnt?.phone || 'Visitante'}
                         </span>
                         <span className="text-xs text-[#5A6877] tabular-nums shrink-0">
                           {new Date(conv.updatedAt).toLocaleTimeString('es-ES', {
@@ -1170,7 +1170,7 @@ export function OperationsWorkspace({
                     </button>
                     <div className="min-w-0">
                       <h2 className="text-base font-semibold text-[#25364A] truncate">
-                        {selectedContact?.fullName || 'Visitante'}
+                        {selectedContact?.fullName || selectedContact?.phone || 'Visitante'}
                         {selectedConv.productName ? ` · ${selectedConv.productName}` : ''}
                       </h2>
                       <span

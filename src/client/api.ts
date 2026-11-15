@@ -340,6 +340,20 @@ export const nalasApi = {
       verifyToken: string;
       verifyTokenSource: 'env' | 'database' | 'server_file';
       outboundEnabled: boolean;
+      channelBindings?: {
+        productionChannel: {
+          connectionId: string;
+          environment: 'produccion';
+          phoneNumberIdConfigured: boolean;
+        };
+        testChannel: {
+          connectionId: string;
+          environment: 'prueba';
+          phoneNumberId: string;
+          wabaId: string;
+          displayPhoneNumber: string;
+        };
+      };
       embeddedSignup: {
         redirectUri: string;
         startPath: string;

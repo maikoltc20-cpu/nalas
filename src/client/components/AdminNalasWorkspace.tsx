@@ -793,6 +793,32 @@ export function AdminNalasWorkspace({
                     </div>
                   </div>
 
+                  {metaConfig.channelBindings && (
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
+                      <div className="p-3.5 bg-[#EAF5F2]/60 border border-[#CBE4DD] rounded-[10px] space-y-1">
+                        <div className="font-semibold text-[#116B70]">
+                          Canal real (Producción)
+                        </div>
+                        <div className="text-[#25364A] font-mono">
+                          {metaConfig.channelBindings.productionChannel.connectionId} ·{' '}
+                          {metaConfig.channelBindings.productionChannel.phoneNumberIdConfigured
+                            ? 'META_PHONE_NUMBER_ID vinculado'
+                            : 'Pendiente de vincular'}
+                        </div>
+                      </div>
+                      <div className="p-3.5 bg-[#FFF0E3]/60 border border-[#F2D7BF] rounded-[10px] space-y-1">
+                        <div className="font-semibold text-[#8C542C]">
+                          Canal de prueba Meta aislado (Espacio de prueba)
+                        </div>
+                        <div className="text-[#25364A] font-mono">
+                          {metaConfig.channelBindings.testChannel.connectionId} · ID{' '}
+                          {metaConfig.channelBindings.testChannel.phoneNumberId} (
+                          {metaConfig.channelBindings.testChannel.displayPhoneNumber})
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
                   <div className="p-4 border border-[#E2E7EB] rounded-[10px] space-y-3 bg-[#F7F8FA]">
                     <div className="flex flex-wrap items-center justify-between gap-3">
                       <div>

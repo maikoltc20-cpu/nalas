@@ -136,6 +136,17 @@ export function upgradeOptingDraftIfStale(store: NalasStore): boolean {
       if (!store.proPolicyVersions.some((x) => x.id === p.id)) store.proPolicyVersions.push(structuredClone(p));
     }
     changed = true;
+  } else if (nexoBiz) {
+    const canonicalTestConn = canonical.channelConnections.find(
+      (c) => c.id === 'conn_nexo_wa_test'
+    );
+    if (
+      canonicalTestConn &&
+      !store.channelConnections.some((c) => c.id === canonicalTestConn.id)
+    ) {
+      store.channelConnections.push(structuredClone(canonicalTestConn));
+      changed = true;
+    }
   }
 
   const canonicalNexoFlow = canonical.flowVersions.find((f) => f.id === 'flow_nexo_opting_v1');

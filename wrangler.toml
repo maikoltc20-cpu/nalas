@@ -38,4 +38,5 @@ META_OUTBOUND_ENABLED = "false"
 #   - META_APP_SECRET           (obligatorio al validar firma de Meta Webhook e intercambio OAuth)
 #   - META_EMBEDDED_SIGNUP_CONFIG_ID (opcional/obligatorio para iniciar el flujo desde Nala con Facebook Login for Business)
 #   - APP_URL                   (opcional: https://<worker>.<subdominio>.workers.dev)
-#   - META_WHATSAPP_ACCESS_TOKEN / META_PHONE_NUMBER_ID (solo al habilitar envíos reales más adelante)
+#   - META_WHATSAPP_ACCESS_TOKEN / META_PHONE_NUMBER_ID (credenciales del número real en Producción)
+#   - META_TEST_PHONE_NUMBER_ID (opcional: número de prueba de Meta en Espacio de prueba; por defecto 1435307863000385)

@@ -236,6 +236,22 @@ export function isMetaOutboundEnabled(): boolean {
   return getEnv('META_OUTBOUND_ENABLED') === 'true';
 }
 
+const META_DEFAULT_TEST_PHONE_NUMBER_ID = '1435307863000385';
+const META_DEFAULT_TEST_WABA_ID = '2542564876228790';
+const META_DEFAULT_TEST_DISPLAY_PHONE = '+1 555 139 1943';
+
+function getConfiguredProdPhoneNumberId(): string {
+  return getEnv('META_PHONE_NUMBER_ID')?.trim() || '';
+}
+
+function getConfiguredTestPhoneNumberId(): string {
+  return getEnv('META_TEST_PHONE_NUMBER_ID')?.trim() || META_DEFAULT_TEST_PHONE_NUMBER_ID;
+}
+
+function isLinkedNumericPhoneId(value?: string | null): boolean {
+  return Boolean(value && /^\d{5,}$/.test(value.trim()));
+}
+
 export async function getMetaIntegrationConfig(requestOrigin?: string) {
   const { token, source } = await readOrCreateServerVerifyToken();
   const baseUrl = resolveSafeAppBaseUrl(requestOrigin);
@@ -244,6 +260,8 @@ export async function getMetaIntegrationConfig(requestOrigin?: string) {
   const kService = getEnv('K_SERVICE') || null;
   const isWorkers = isWorkerRuntime();
   const embeddedSignup = await getMetaEmbeddedSignupOverview(baseUrl);
+  const configuredProdPhoneId = getConfiguredProdPhoneNumberId();
+  const configuredTestPhoneId = getConfiguredTestPhoneNumberId();
 
   return {
     targetBusinessId: getEnv('META_BUSINESS_ID')?.trim() || 'biz_nexo',
@@ -253,11 +271,27 @@ export async function getMetaIntegrationConfig(requestOrigin?: string) {
     verifyTokenSource: source,
     outboundEnabled: isMetaOutboundEnabled(),
     embeddedSignup,
+    channelBindings: {
+      productionChannel: {
+        connectionId: embeddedSignup.connectionState.connectionId || 'conn_nexo_wa_prod',
+        environment: 'produccion' as const,
+        phoneNumberIdConfigured:
+          Boolean(configuredProdPhoneId) ||
+          isLinkedNumericPhoneId(embeddedSignup.connectionState.phoneNumberId),
+      },
+      testChannel: {
+        connectionId: 'conn_nexo_wa_test',
+        environment: 'prueba' as const,
+        phoneNumberId: configuredTestPhoneId,
+        wabaId: getEnv('META_TEST_WABA_ID')?.trim() || META_DEFAULT_TEST_WABA_ID,
+        displayPhoneNumber: META_DEFAULT_TEST_DISPLAY_PHONE,
+      },
+    },
     envStatus: {
       appSecretConfigured: Boolean(getEnv('META_APP_SECRET')?.trim()),
       verifyTokenOverriddenByEnv: Boolean(getEnv('META_VERIFY_TOKEN')?.trim()),
       accessTokenConfigured: Boolean(getEnv('META_WHATSAPP_ACCESS_TOKEN')?.trim()),
-      phoneNumberIdConfigured: Boolean(getEnv('META_PHONE_NUMBER_ID')?.trim()),
+      phoneNumberIdConfigured: Boolean(configuredProdPhoneId),
       outboundEnabled: isMetaOutboundEnabled(),
     },
     hostingDiagnostics: {
@@ -333,29 +367,99 @@ interface MetaWebhookPayload {
   }>;
 }
 
-function resolveProductionWhatsAppConnection(
+function ensureNexoTestWhatsAppConnection(
+  store: NalasStore,
+  businessId: string,
+  testPhoneNumberId: string
+): ChannelConnection | null {
+  const existing =
+    store.channelConnections.find(
+      (c) =>
+        c.id === 'conn_nexo_wa_test' &&
+        c.businessId === businessId &&
+        c.environment === 'prueba'
+    ) ??
+    store.channelConnections.find(
+      (c) =>
+        c.businessId === businessId &&
+        c.environment === 'prueba' &&
+        c.channelType === 'whatsapp_prueba'
+    );
+  if (existing) {
+    if (!isLinkedNumericPhoneId(existing.destinationAddress)) {
+      existing.destinationAddress = testPhoneNumberId;
+    }
+    return existing;
+  }
+
+  const assistant = store.assistants.find((a) => a.businessId === businessId);
+  if (!assistant) return null;
+
+  const created: ChannelConnection = {
+    id: businessId === 'biz_nexo' ? 'conn_nexo_wa_test' : `conn_${businessId}_wa_test`,
+    businessId,
+    assistantId: assistant.id,
+    environment: 'prueba',
+    channelType: 'whatsapp_prueba',
+    displayName: `WhatsApp Prueba Meta NEXO (${META_DEFAULT_TEST_DISPLAY_PHONE})`,
+    destinationAddress: testPhoneNumberId,
+    supportsButtons: true,
+    maxButtons: 3,
+    adapterId: 'adapter_wa_official',
+    implementationStatus: 'Prueba oficial conectada',
+    status: 'activa',
+  };
+  store.channelConnections.push(created);
+  return created;
+}
+
+function resolveWhatsAppConnectionForWebhook(
   store: NalasStore,
   businessId: string,
   phoneNumberId?: string
-): ChannelConnection {
+): ChannelConnection | null {
+  const incomingPhoneId = phoneNumberId?.trim() || '';
+  if (!incomingPhoneId) {
+    return null;
+  }
+
+  const configuredProdPhoneId = getConfiguredProdPhoneNumberId();
+  const configuredTestPhoneId = getConfiguredTestPhoneNumberId();
+
   const prodWaConnections = store.channelConnections.filter(
     (c) =>
       c.businessId === businessId &&
       c.environment === 'produccion' &&
       c.channelType === 'whatsapp_prueba'
   );
-  if (phoneNumberId) {
-    const matched = prodWaConnections.find((c) => c.destinationAddress.includes(phoneNumberId));
-    if (matched) return matched;
-  }
-  const preferred =
+  const preferredProd =
     prodWaConnections.find((c) => c.id === 'conn_nexo_wa_prod') ?? prodWaConnections[0];
-  if (!preferred) {
-    throw new Error(
-      `No existe una conexión WhatsApp de producción configurada para el negocio ${businessId}.`
-    );
+
+  // 1. Coincidencia estricta con el número real de producción (META_PHONE_NUMBER_ID o destino numérico vinculado)
+  const prodExplicitMatch = prodWaConnections.find(
+    (c) =>
+      isLinkedNumericPhoneId(c.destinationAddress) &&
+      c.destinationAddress.trim() === incomingPhoneId &&
+      incomingPhoneId !== configuredTestPhoneId
+  );
+  if (prodExplicitMatch) {
+    return prodExplicitMatch;
   }
-  return preferred;
+  if (configuredProdPhoneId && incomingPhoneId === configuredProdPhoneId && preferredProd) {
+    return preferredProd;
+  }
+
+  // 2. Coincidencia estricta con el número de prueba explícito (aislado en environment = 'prueba')
+  if (
+    configuredTestPhoneId &&
+    incomingPhoneId === configuredTestPhoneId &&
+    incomingPhoneId !== configuredProdPhoneId
+  ) {
+    return ensureNexoTestWhatsAppConnection(store, businessId, configuredTestPhoneId);
+  }
+
+  // 3. No aceptar ningún phone_number_id arbitrario o no vinculado como NEXO
+  return null;
 }
 
 function extractInboundContent(msg: MetaInboundMessage): {
@@ -531,7 +635,7 @@ export async function dispatchWhatsAppOutboxTargets(
   let failed = 0;
 
   for (const item of targets) {
-    const phoneNumberId = configuredPhoneId || item.phoneNumberIdFromWebhook;
+    const phoneNumberId = item.phoneNumberIdFromWebhook || configuredPhoneId;
     if (!accessToken || !phoneNumberId) {
       await withStoreTransaction((store) => {
         const outbox = store.outboxEvents.find((o) => o.id === item.outboxId);
@@ -719,30 +823,39 @@ export async function processDueOutboxRetries(limit = 10): Promise<{
 export async function processMetaWebhookEvents(payload: MetaWebhookPayload): Promise<{
   processedMessages: number;
   deduplicatedMessages: number;
+  ignoredMessages: number;
   processedStatuses: number;
 }> {
   const targetBusinessId = getEnv('META_BUSINESS_ID')?.trim() || 'biz_nexo';
   let processedMessages = 0;
   let deduplicatedMessages = 0;
+  let ignoredMessages = 0;
   let processedStatuses = 0;
 
   if (!payload || !Array.isArray(payload.entry)) {
-    return { processedMessages, deduplicatedMessages, processedStatuses };
+    return { processedMessages, deduplicatedMessages, ignoredMessages, processedStatuses };
   }
 
   const backgroundTargets: OutboxDispatchTarget[] = [];
 
   for (const entry of payload.entry) {
+    const entryWabaId = entry.id?.trim();
     for (const change of entry.changes ?? []) {
       if (change.field && change.field !== 'messages') continue;
       const value = change.value;
       if (!value) continue;
 
-      const phoneNumberId = value.metadata?.phone_number_id;
+      const phoneNumberId = value.metadata?.phone_number_id?.trim();
+      const displayPhoneNumber = value.metadata?.display_phone_number?.trim();
 
       // 1. Delivery statuses (sent / delivered / read / failed)
       if (Array.isArray(value.statuses) && value.statuses.length > 0) {
         await withStoreTransaction((store) => {
+          const matchedConn = resolveWhatsAppConnectionForWebhook(
+            store,
+            targetBusinessId,
+            phoneNumberId
+          );
           for (const st of value.statuses ?? []) {
             if (!st.id) continue;
             const outbox = store.outboxEvents.find(
@@ -779,7 +892,7 @@ export async function processMetaWebhookEvents(payload: MetaWebhookPayload): Pro
             }
             appendAudit(store, {
               businessId: targetBusinessId,
-              environment: 'produccion',
+              environment: outbox?.environment ?? matchedConn?.environment ?? 'produccion',
               actorUserId: 'integraciones',
               module: 'integraciones',
               action: 'estado_meta_whatsapp',
@@ -791,7 +904,7 @@ export async function processMetaWebhookEvents(payload: MetaWebhookPayload): Pro
         });
       }
 
-      // 2. Inbound user messages routed to target business (NEXO) + BÁSICA
+      // 2. Inbound user messages routed strictly by phone_number_id (real vs prueba aislada)
       for (const inbound of value.messages ?? []) {
         if (!inbound.id || !inbound.from) continue;
 
@@ -802,9 +915,22 @@ export async function processMetaWebhookEvents(payload: MetaWebhookPayload): Pro
         const { text, selectedOptionId } = extractInboundContent(inbound);
 
         const convResolution = await withStoreTransaction((store) => {
-          const conn = resolveProductionWhatsAppConnection(store, targetBusinessId, phoneNumberId);
+          const conn = resolveWhatsAppConnectionForWebhook(store, targetBusinessId, phoneNumberId);
+          if (!conn) {
+            appendAudit(store, {
+              businessId: targetBusinessId,
+              environment: 'produccion',
+              actorUserId: 'integraciones',
+              module: 'integraciones',
+              action: 'webhook_meta_canal_no_vinculado',
+              detail: `Evento entrante ignorado: phone_number_id="${phoneNumberId || 'ausente'}" (WABA="${entryWabaId || 'sin entry.id'}", display="${displayPhoneNumber || 'sin display'}") no corresponde al número real ni al canal de prueba vinculado de ${targetBusinessId}.`,
+            });
+            return { matched: false as const };
+          }
           return {
+            matched: true as const,
             connectionId: conn.id,
+            environment: conn.environment,
             ...startOrGetSimulatorConversation(store, {
               businessId: targetBusinessId,
               connectionId: conn.id,
@@ -815,6 +941,11 @@ export async function processMetaWebhookEvents(payload: MetaWebhookPayload): Pro
             }),
           };
         });
+
+        if (!convResolution.matched) {
+          ignoredMessages += 1;
+          continue;
+        }
 
         const result = await runSerializedForConversation(convResolution.conversation.id, () =>
           withStoreTransaction(async (store) => {
@@ -898,5 +1029,5 @@ export async function processMetaWebhookEvents(payload: MetaWebhookPayload): Pro
     scheduleBackgroundTask(dispatchWhatsAppOutboxTargets(backgroundTargets));
   }
 
-  return { processedMessages, deduplicatedMessages, processedStatuses };
+  return { processedMessages, deduplicatedMessages, ignoredMessages, processedStatuses };
 }
