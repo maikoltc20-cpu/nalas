@@ -815,6 +815,16 @@ export function AdminNalasWorkspace({
                           {metaConfig.channelBindings.testChannel.phoneNumberId} (
                           {metaConfig.channelBindings.testChannel.displayPhoneNumber})
                         </div>
+                        <div className="text-[#5A6877] font-mono">
+                          META_TEST_OUTBOUND_ENABLED:{' '}
+                          {metaConfig.channelBindings.testChannel.outboundEnabled
+                            ? 'Activo'
+                            : 'Pausado'}{' '}
+                          · META_TEST_WHATSAPP_ACCESS_TOKEN:{' '}
+                          {metaConfig.channelBindings.testChannel.accessTokenConfigured
+                            ? 'Configurada'
+                            : 'Pendiente'}
+                        </div>
                       </div>
                     </div>
                   )}

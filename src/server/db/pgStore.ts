@@ -156,17 +156,29 @@ export async function verifyPasswordPg(password: string, storedHash: string): Pr
   });
 }
 
-export async function claimDueOutboxIdsPg(client: PoolClient, limit = 10): Promise<string[]> {
+export async function claimDueOutboxIdsPg(
+  client: PoolClient,
+  limit = 10,
+  allowedConnectionIds?: string[]
+): Promise<string[]> {
+  const connFilter =
+    allowedConnectionIds && allowedConnectionIds.length > 0 ? allowedConnectionIds : null;
+  if (!connFilter) {
+    return [];
+  }
   const res = await client.query<{ id: string }>(
     `SELECT id
      FROM nalas_outbox_events
-     WHERE delivery_status IN ('pendiente', 'fallido')
+     WHERE connection_id = ANY($2::text[])
+       AND delivery_status IN ('pendiente', 'fallido')
        AND attempts < COALESCE(max_attempts, 3)
-       AND (next_retry_at IS NULL OR next_retry_at <= NOW())
+       AND next_retry_at IS NOT NULL
+       AND next_retry_at <= NOW()
+       AND COALESCE(last_error, '') NOT ILIKE '%pausado%'
      ORDER BY created_at ASC
      FOR UPDATE SKIP LOCKED
      LIMIT $1`,
-    [limit]
+    [limit, connFilter]
   );
   return res.rows.map((r) => r.id);
 }

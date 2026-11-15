@@ -236,6 +236,34 @@ export function isMetaOutboundEnabled(): boolean {
   return getEnv('META_OUTBOUND_ENABLED') === 'true';
 }
 
+export function isMetaTestOutboundEnabled(): boolean {
+  return getEnv('META_TEST_OUTBOUND_ENABLED') === 'true';
+}
+
+function getAllowedOutboundConnectionIds(): string[] {
+  const ids: string[] = [];
+  if (isMetaOutboundEnabled()) {
+    ids.push('conn_nexo_wa_prod');
+  }
+  if (isMetaTestOutboundEnabled()) {
+    ids.push('conn_nexo_wa_test');
+  }
+  return ids;
+}
+
+function isOutboundEnabledForConnection(
+  connectionId?: string,
+  environment?: 'prueba' | 'produccion'
+): boolean {
+  if (connectionId === 'conn_nexo_wa_test') {
+    return isMetaTestOutboundEnabled();
+  }
+  if (connectionId === 'conn_nexo_wa_prod' || environment === 'produccion') {
+    return isMetaOutboundEnabled();
+  }
+  return false;
+}
+
 const META_DEFAULT_TEST_PHONE_NUMBER_ID = '1435307863000385';
 const META_DEFAULT_TEST_WABA_ID = '2542564876228790';
 const META_DEFAULT_TEST_DISPLAY_PHONE = '+1 555 139 1943';
@@ -262,6 +290,8 @@ export async function getMetaIntegrationConfig(requestOrigin?: string) {
   const embeddedSignup = await getMetaEmbeddedSignupOverview(baseUrl);
   const configuredProdPhoneId = getConfiguredProdPhoneNumberId();
   const configuredTestPhoneId = getConfiguredTestPhoneNumberId();
+  const testOutboundEnabled = isMetaTestOutboundEnabled();
+  const testAccessTokenConfigured = Boolean(getEnv('META_TEST_WHATSAPP_ACCESS_TOKEN')?.trim());
 
   return {
     targetBusinessId: getEnv('META_BUSINESS_ID')?.trim() || 'biz_nexo',
@@ -285,6 +315,8 @@ export async function getMetaIntegrationConfig(requestOrigin?: string) {
         phoneNumberId: configuredTestPhoneId,
         wabaId: getEnv('META_TEST_WABA_ID')?.trim() || META_DEFAULT_TEST_WABA_ID,
         displayPhoneNumber: META_DEFAULT_TEST_DISPLAY_PHONE,
+        outboundEnabled: testOutboundEnabled,
+        accessTokenConfigured: testAccessTokenConfigured,
       },
     },
     envStatus: {
@@ -564,6 +596,8 @@ interface OutboxDispatchTarget {
   outboxId: string;
   messageId: string;
   businessId: string;
+  connectionId: string;
+  environment: 'prueba' | 'produccion';
   toWaId: string;
   text: string;
   options?: StructuredOption[];
@@ -580,6 +614,7 @@ async function resolveOutboxTargetById(
   const msg = store.messages.find((m) => m.id === outbox.messageId);
   const conv = store.conversations.find((c) => c.id === outbox.conversationId);
   if (!conv) return null;
+  const conn = store.channelConnections.find((c) => c.id === outbox.connectionId);
   const identity = store.channelIdentities.find(
     (ci) =>
       ci.businessId === conv.businessId &&
@@ -590,14 +625,100 @@ async function resolveOutboxTargetById(
   const contact = store.contacts.find((c) => c.id === conv.contactId);
   const toWaId = identity?.externalUserId || contact?.phone?.replace(/[^\d]/g, '') || '';
   if (!toWaId) return null;
+
+  const resolvedPhoneNumberId =
+    phoneNumberIdOverride?.trim() ||
+    (outbox.connectionId === 'conn_nexo_wa_test'
+      ? conn && isLinkedNumericPhoneId(conn.destinationAddress)
+        ? conn.destinationAddress.trim()
+        : getConfiguredTestPhoneNumberId()
+      : outbox.connectionId === 'conn_nexo_wa_prod'
+        ? conn && isLinkedNumericPhoneId(conn.destinationAddress)
+          ? conn.destinationAddress.trim()
+          : getConfiguredProdPhoneNumberId()
+        : undefined);
+
   return {
     outboxId: outbox.id,
     messageId: outbox.messageId,
     businessId: outbox.businessId,
+    connectionId: outbox.connectionId,
+    environment: outbox.environment,
     toWaId,
     text: msg?.text ?? outbox.payloadText,
     options: msg?.options,
-    phoneNumberIdFromWebhook: phoneNumberIdOverride,
+    phoneNumberIdFromWebhook: resolvedPhoneNumberId,
+  };
+}
+
+function resolveOutboundCredentialsForTarget(item: OutboxDispatchTarget): {
+  enabled: boolean;
+  accessToken: string;
+  phoneNumberId: string;
+  missingReason?: string;
+  pausedReason?: string;
+} {
+  if (item.connectionId === 'conn_nexo_wa_test') {
+    if (!isMetaTestOutboundEnabled()) {
+      return {
+        enabled: false,
+        accessToken: '',
+        phoneNumberId: '',
+        pausedReason:
+          'Envío saliente de prueba pausado (META_TEST_OUTBOUND_ENABLED=false). Evento guardado en outbox.',
+      };
+    }
+    const testToken = getEnv('META_TEST_WHATSAPP_ACCESS_TOKEN')?.trim() || '';
+    const testPhoneId = item.phoneNumberIdFromWebhook?.trim() || getConfiguredTestPhoneNumberId();
+    if (!testToken || !testPhoneId) {
+      return {
+        enabled: true,
+        accessToken: '',
+        phoneNumberId: testPhoneId,
+        missingReason:
+          'Falta META_TEST_WHATSAPP_ACCESS_TOKEN en las variables del servidor (canal de prueba; no se usa el token de producción).',
+      };
+    }
+    return {
+      enabled: true,
+      accessToken: testToken,
+      phoneNumberId: testPhoneId,
+    };
+  }
+
+  if (item.connectionId === 'conn_nexo_wa_prod' || item.environment === 'produccion') {
+    if (!isMetaOutboundEnabled()) {
+      return {
+        enabled: false,
+        accessToken: '',
+        phoneNumberId: '',
+        pausedReason:
+          'Envío saliente hacia WhatsApp pausado (META_OUTBOUND_ENABLED=false). Evento guardado en outbox.',
+      };
+    }
+    const prodToken = getEnv('META_WHATSAPP_ACCESS_TOKEN')?.trim() || '';
+    const prodPhoneId = item.phoneNumberIdFromWebhook?.trim() || getConfiguredProdPhoneNumberId();
+    if (!prodToken || !prodPhoneId) {
+      return {
+        enabled: true,
+        accessToken: '',
+        phoneNumberId: prodPhoneId,
+        missingReason:
+          'Faltan META_WHATSAPP_ACCESS_TOKEN o META_PHONE_NUMBER_ID en las variables del servidor.',
+      };
+    }
+    return {
+      enabled: true,
+      accessToken: prodToken,
+      phoneNumberId: prodPhoneId,
+    };
+  }
+
+  return {
+    enabled: false,
+    accessToken: '',
+    phoneNumberId: '',
+    pausedReason: `Conexión ${item.connectionId} no habilitada para envío saliente por Meta Cloud API.`,
   };
 }
 
@@ -605,38 +726,44 @@ export async function dispatchWhatsAppOutboxTargets(
   targets: OutboxDispatchTarget[]
 ): Promise<{ processed: number; succeeded: number; failed: number; pausedOutbound: boolean }> {
   if (targets.length === 0) {
-    return { processed: 0, succeeded: 0, failed: 0, pausedOutbound: !isMetaOutboundEnabled() };
+    return {
+      processed: 0,
+      succeeded: 0,
+      failed: 0,
+      pausedOutbound: !isMetaOutboundEnabled() && !isMetaTestOutboundEnabled(),
+    };
   }
 
-  if (!isMetaOutboundEnabled()) {
-    await withStoreTransaction((store) => {
-      const now = new Date().toISOString();
-      for (const t of targets) {
-        const outbox = store.outboxEvents.find((o) => o.id === t.outboxId);
-        const msg = store.messages.find((m) => m.id === t.messageId);
+  let succeeded = 0;
+  let failed = 0;
+  let pausedCount = 0;
+
+  for (const item of targets) {
+    const creds = resolveOutboundCredentialsForTarget(item);
+    if (!creds.enabled) {
+      pausedCount += 1;
+      await withStoreTransaction((store) => {
+        const now = new Date().toISOString();
+        const outbox = store.outboxEvents.find((o) => o.id === item.outboxId);
+        const msg = store.messages.find((m) => m.id === item.messageId);
         if (outbox) {
           outbox.deliveryStatus = 'pendiente';
           outbox.nextRetryAt = undefined;
           outbox.lastError =
-            'Envío saliente hacia WhatsApp pausado (META_OUTBOUND_ENABLED=false). Evento guardado en outbox.';
+            creds.pausedReason ??
+            'Envío saliente hacia WhatsApp pausado. Evento guardado en outbox.';
           outbox.updatedAt = now;
         }
         if (msg) {
           msg.deliveryStatus = 'pendiente';
         }
-      }
-    });
-    return { processed: targets.length, succeeded: 0, failed: 0, pausedOutbound: true };
-  }
+      });
+      continue;
+    }
 
-  const accessToken = getEnv('META_WHATSAPP_ACCESS_TOKEN')?.trim();
-  const configuredPhoneId = getEnv('META_PHONE_NUMBER_ID')?.trim();
-  let succeeded = 0;
-  let failed = 0;
-
-  for (const item of targets) {
-    const phoneNumberId = item.phoneNumberIdFromWebhook || configuredPhoneId;
-    if (!accessToken || !phoneNumberId) {
+    if (!creds.accessToken || !creds.phoneNumberId) {
+      const missingErr =
+        creds.missingReason ?? 'Faltan credenciales requeridas para enviar por Meta Cloud API.';
       await withStoreTransaction((store) => {
         const outbox = store.outboxEvents.find((o) => o.id === item.outboxId);
         const msg = store.messages.find((m) => m.id === item.messageId);
@@ -646,11 +773,21 @@ export async function dispatchWhatsAppOutboxTargets(
           outbox.deliveryStatus = 'fallido';
           outbox.nextRetryAt =
             outbox.attempts < outbox.maxAttempts ? computeNextRetryIso(outbox.attempts) : undefined;
-          outbox.lastError =
-            'Faltan META_WHATSAPP_ACCESS_TOKEN o META_PHONE_NUMBER_ID en las variables del servidor.';
+          outbox.lastError = missingErr;
           outbox.updatedAt = new Date().toISOString();
         }
         if (msg) msg.deliveryStatus = 'fallido';
+        appendAudit(store, {
+          businessId: item.businessId,
+          environment: item.environment,
+          actorUserId: 'integraciones',
+          module: 'integraciones',
+          action:
+            item.connectionId === 'conn_nexo_wa_test'
+              ? 'error_envio_whatsapp_prueba'
+              : 'error_envio_whatsapp',
+          detail: missingErr,
+        });
       });
       failed += 1;
       continue;
@@ -658,14 +795,17 @@ export async function dispatchWhatsAppOutboxTargets(
 
     const graphPayload = buildWhatsAppGraphPayload(item.toWaId, item.text, item.options);
     try {
-      const resp = await fetch(`https://graph.facebook.com/v21.0/${phoneNumberId}/messages`, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(graphPayload),
-      });
+      const resp = await fetch(
+        `https://graph.facebook.com/v21.0/${creds.phoneNumberId}/messages`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${creds.accessToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(graphPayload),
+        }
+      );
       const rawText = await resp.text();
       const parsed = rawText
         ? (JSON.parse(rawText) as { messages?: Array<{ id?: string }>; error?: { message?: string } })
@@ -707,11 +847,14 @@ export async function dispatchWhatsAppOutboxTargets(
           }
           appendAudit(store, {
             businessId: item.businessId,
-            environment: 'produccion',
+            environment: item.environment,
             actorUserId: 'integraciones',
             module: 'integraciones',
-            action: 'error_envio_whatsapp',
-            detail: `Fallo enviando mensaje saliente a Meta Cloud API: ${errMsg}`,
+            action:
+              item.connectionId === 'conn_nexo_wa_test'
+                ? 'error_envio_whatsapp_prueba'
+                : 'error_envio_whatsapp',
+            detail: `Fallo enviando mensaje saliente a Meta Cloud API (${item.connectionId}): ${errMsg}`,
           });
           failed += 1;
         }
@@ -742,7 +885,7 @@ export async function dispatchWhatsAppOutboxTargets(
     processed: targets.length,
     succeeded,
     failed,
-    pausedOutbound: false,
+    pausedOutbound: pausedCount === targets.length,
   };
 }
 
@@ -753,7 +896,8 @@ export async function processDueOutboxRetries(limit = 10): Promise<{
   failed: number;
   pausedOutbound: boolean;
 }> {
-  if (!isMetaOutboundEnabled()) {
+  const allowedConnectionIds = getAllowedOutboundConnectionIds();
+  if (allowedConnectionIds.length === 0) {
     return {
       claimedCount: 0,
       processed: 0,
@@ -768,7 +912,7 @@ export async function processDueOutboxRetries(limit = 10): Promise<{
     dueIds = await withPgClient(async (client) => {
       await client.query('BEGIN');
       try {
-        const ids = await claimDueOutboxIdsPg(client, limit);
+        const ids = await claimDueOutboxIdsPg(client, limit, allowedConnectionIds);
         await client.query('COMMIT');
         return ids;
       } catch (err) {
@@ -781,11 +925,12 @@ export async function processDueOutboxRetries(limit = 10): Promise<{
     await withStoreTransaction((store) => {
       dueIds = store.outboxEvents
         .filter((o) => {
-          if (o.environment !== 'produccion') return false;
+          if (!allowedConnectionIds.includes(o.connectionId)) return false;
           if (o.deliveryStatus !== 'pendiente' && o.deliveryStatus !== 'fallido') return false;
           const maxAtt = o.maxAttempts ?? 3;
           if (o.attempts >= maxAtt) return false;
-          if (o.nextRetryAt && new Date(o.nextRetryAt).getTime() > nowMs) return false;
+          if (!o.nextRetryAt || new Date(o.nextRetryAt).getTime() > nowMs) return false;
+          if ((o.lastError ?? '').toLowerCase().includes('pausado')) return false;
           return true;
         })
         .slice(0, limit)
@@ -807,7 +952,7 @@ export async function processDueOutboxRetries(limit = 10): Promise<{
   await withStoreTransaction(async (store) => {
     for (const id of dueIds) {
       const target = await resolveOutboxTargetById(store, id);
-      if (target) {
+      if (target && allowedConnectionIds.includes(target.connectionId)) {
         targets.push(target);
       }
     }
@@ -981,21 +1126,29 @@ export async function processMetaWebhookEvents(payload: MetaWebhookPayload): Pro
                   ? [out.outgoingMessage]
                   : [];
 
+            const outboundEnabledForThisChannel = isOutboundEnabledForConnection(
+              convResolution.connectionId,
+              convResolution.environment
+            );
             const targets: OutboxDispatchTarget[] = [];
             for (const msg of fallbackList) {
               const ob = store.outboxEvents.find((o) => o.messageId === msg.id);
               if (ob) {
-                if (!isMetaOutboundEnabled()) {
+                if (!outboundEnabledForThisChannel) {
                   ob.deliveryStatus = 'pendiente';
                   ob.nextRetryAt = undefined;
                   ob.lastError =
-                    'Envío saliente hacia WhatsApp pausado (META_OUTBOUND_ENABLED=false). Evento persistido en outbox.';
+                    convResolution.connectionId === 'conn_nexo_wa_test'
+                      ? 'Envío saliente de prueba pausado (META_TEST_OUTBOUND_ENABLED=false). Evento persistido en outbox y excluido de despacho automático.'
+                      : 'Envío saliente hacia WhatsApp pausado (META_OUTBOUND_ENABLED=false). Evento persistido en outbox.';
                   msg.deliveryStatus = 'pendiente';
                 }
                 targets.push({
                   outboxId: ob.id,
                   messageId: msg.id,
                   businessId: targetBusinessId,
+                  connectionId: convResolution.connectionId,
+                  environment: convResolution.environment,
                   toWaId: inbound.from,
                   text: msg.text,
                   options: msg.options,
@@ -1017,7 +1170,10 @@ export async function processMetaWebhookEvents(payload: MetaWebhookPayload): Pro
         }
 
         processedMessages += 1;
-        if (result.targets.length > 0 && isMetaOutboundEnabled()) {
+        if (
+          result.targets.length > 0 &&
+          isOutboundEnabledForConnection(convResolution.connectionId, convResolution.environment)
+        ) {
           backgroundTargets.push(...result.targets);
         }
       }

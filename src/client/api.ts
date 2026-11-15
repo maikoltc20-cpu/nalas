@@ -352,6 +352,8 @@ export const nalasApi = {
           phoneNumberId: string;
           wabaId: string;
           displayPhoneNumber: string;
+          outboundEnabled?: boolean;
+          accessTokenConfigured?: boolean;
         };
       };
       embeddedSignup: {

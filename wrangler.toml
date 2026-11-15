@@ -24,6 +24,8 @@ NALAS_DISABLE_DEMO_LOGIN = "true"
 META_BUSINESS_ID = "biz_nexo"
 # Mantener en "false" hasta validar webhook y credenciales definitivas de WhatsApp Cloud API
 META_OUTBOUND_ENABLED = "false"
+# Habilita respuestas automáticas exclusivamente para conn_nexo_wa_test (Espacio de prueba); mantener "false" por defecto
+META_TEST_OUTBOUND_ENABLED = "false"
 
 # Configurar únicamente como Secrets en Cloudflare Dashboard (Workers & Pages -> Settings -> Variables and Secrets)
 # o con "npx wrangler secret put <NOMBRE>" (nunca incluir valores secretos en este repositorio):
@@ -39,4 +41,5 @@ META_OUTBOUND_ENABLED = "false"
 #   - META_EMBEDDED_SIGNUP_CONFIG_ID (opcional/obligatorio para iniciar el flujo desde Nala con Facebook Login for Business)
 #   - APP_URL                   (opcional: https://<worker>.<subdominio>.workers.dev)
 #   - META_WHATSAPP_ACCESS_TOKEN / META_PHONE_NUMBER_ID (credenciales del número real en Producción)
+#   - META_TEST_WHATSAPP_ACCESS_TOKEN (obligatorio al activar META_TEST_OUTBOUND_ENABLED="true"; token exclusivo del número de prueba)
 #   - META_TEST_PHONE_NUMBER_ID (opcional: número de prueba de Meta en Espacio de prueba; por defecto 1435307863000385)

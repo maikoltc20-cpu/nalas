@@ -53,8 +53,8 @@ export default {
     env: WorkerEnv,
     ctx: WorkerExecContext
   ): Promise<void> {
-    // Evitar despertar o consultar Neon cuando los envíos salientes están pausados
-    if (env.META_OUTBOUND_ENABLED !== 'true') {
+    // Evitar despertar o consultar Neon cuando los envíos salientes de producción y prueba están pausados
+    if (env.META_OUTBOUND_ENABLED !== 'true' && env.META_TEST_OUTBOUND_ENABLED !== 'true') {
       return;
     }
 
