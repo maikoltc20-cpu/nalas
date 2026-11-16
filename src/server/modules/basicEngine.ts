@@ -18,7 +18,7 @@ import type {
   Session,
   StructuredOption,
 } from '../../shared/types.ts';
-import { getFlowKey, resolvePublishedFlowForKey } from './config.ts';
+import { getFlowKey, inspectPublishedFlowTarget } from './config.ts';
 import { appendAudit } from './consumptionAndAudit.ts';
 
 export interface BasicEngineOutput {
@@ -28,6 +28,8 @@ export interface BasicEngineOutput {
   allowMultiple?: boolean;
   requestHumanHandoff?: boolean;
   handoffReason?: string;
+  configInvalid?: boolean;
+  configInvalidReason?: string;
   confirmedLead?: Lead;
   cancelled?: boolean;
   categorization?: CategorizationResult;
@@ -332,6 +334,13 @@ function resolveTargetFlowForProduct(
 ): FlowVersion | undefined {
   if (product.targetType === 'handoff') return undefined;
 
+  if (product.flowVersionId) {
+    const rawLinked = store.flowVersions.find((f) => f.id === product.flowVersionId);
+    if (rawLinked && rawLinked.businessId !== business.id) {
+      return undefined;
+    }
+  }
+
   const explicitLinked = product.flowVersionId
     ? store.flowVersions.find((f) => f.id === product.flowVersionId && f.businessId === business.id)
     : undefined;
@@ -348,25 +357,21 @@ function resolveTargetFlowForProduct(
             getFlowKey(f) === flowKey
         )
         .sort((a, b) => b.versionNumber - a.versionNumber)[0];
-      if (draftMatch) return draftMatch;
+      if (draftMatch && draftMatch.steps.length > 0) return draftMatch;
     }
 
-    // Legacy unmigrated product without explicit flowKey (e.g. prod_nexo_opting before first menu publish):
-    // honor the business's latest active published flow for that flowKey so user edits remain active.
-    const activeBizFlow = store.flowVersions.find(
-      (f) =>
-        f.id === business.activeFlowVersionId &&
-        f.businessId === business.id &&
-        f.status === 'publicada' &&
-        getFlowKey(f) === flowKey
-    );
-    const preferredPubId = product.flowKey
-      ? product.flowVersionId
-      : activeBizFlow?.id;
+    const explicitInspection = product.flowVersionId
+      ? inspectPublishedFlowTarget(store, business.id, {
+          flowKey,
+          flowVersionId: product.flowVersionId,
+        })
+      : undefined;
+    if (explicitInspection) {
+      return explicitInspection.ok ? explicitInspection.flow : undefined;
+    }
 
-    const pub = resolvePublishedFlowForKey(store, business.id, flowKey, preferredPubId);
-    if (pub && pub.steps.length > 0) return pub;
-    return undefined;
+    const inspection = inspectPublishedFlowTarget(store, business.id, { flowKey });
+    return inspection.ok ? inspection.flow : undefined;
   }
 
   if (preferDraft && product.draftFlowVersionId) {
@@ -376,25 +381,24 @@ function resolveTargetFlowForProduct(
     if (draftFlow && draftFlow.steps.length > 0) return draftFlow;
   }
 
-  if (explicitLinked && explicitLinked.status === 'publicada' && explicitLinked.steps.length > 0) {
-    return explicitLinked;
+  if (product.flowVersionId) {
+    const inspection = inspectPublishedFlowTarget(store, business.id, {
+      flowVersionId: product.flowVersionId,
+    });
+    return inspection.ok ? inspection.flow : undefined;
   }
 
   return undefined;
 }
 
 function getPlayableEntryProducts(
-  store: NalasStore,
+  _store: NalasStore,
   business: Business,
   session?: Session,
   flow?: FlowVersion
 ): BusinessProduct[] {
-  const { products, isDraft } = getEffectiveEntrySettings(business, session, flow);
-  return products.filter((p) => {
-    if (!p.active) return false;
-    if (p.targetType === 'handoff') return true;
-    return Boolean(resolveTargetFlowForProduct(store, business, p, isDraft));
-  });
+  const { products } = getEffectiveEntrySettings(business, session, flow);
+  return products.filter((p) => p.active && Boolean(p.optionLabel?.trim()));
 }
 
 function buildEntryMenuOutput(
@@ -404,32 +408,23 @@ function buildEntryMenuOutput(
   flow?: FlowVersion
 ): BasicEngineOutput {
   const { entryConfig } = getEffectiveEntrySettings(business, session, flow);
+  const greeting = entryConfig?.greetingPrompt?.trim() ?? '';
   const activeProducts = getPlayableEntryProducts(store, business, session, flow);
+  if (!greeting || activeProducts.length === 0) {
+    return {
+      replyText: '',
+      configInvalid: true,
+      configInvalidReason: !greeting
+        ? 'El saludo del menú general está vacío en la configuración publicada.'
+        : 'El menú general publicado no tiene ninguna opción activa con destino publicado válido.',
+    };
+  }
   return {
-    replyText: entryConfig?.greetingPrompt ?? `¡Hola! Gracias por escribir a ${business.name}.`,
+    replyText: greeting,
     options: activeProducts.map((p) => ({
       id: `prod:${p.id}`,
       label: p.optionLabel,
     })),
-  };
-}
-
-function renderUnconfiguredProductOutput(
-  business: Business,
-  productName: string,
-  session?: Session,
-  flow?: FlowVersion
-): BasicEngineOutput {
-  const { entryConfig } = getEffectiveEntrySettings(business, session, flow);
-  const template =
-    entryConfig?.unconfiguredProductPrompt ??
-    'Podemos derivar tu consulta sobre {{producto}} al equipo. ¿Querés solicitar atención humana?';
-  return {
-    replyText: template.replace(/\{\{producto\}\}/g, productName),
-    options: [
-      { id: 'cmd_humano', label: 'Solicitar atención humana.' },
-      { id: 'cmd_entry_menu', label: 'Elegir otro producto.' },
-    ],
   };
 }
 
@@ -1124,27 +1119,24 @@ export function runBasicEngine(params: {
     };
   }
 
-  // Pending action on a selected product that does not yet have a configured flow
+  // Pending action on a legacy unconfigured product session: fail closed for review
   if (session.awaitingUnconfiguredProductAction && business) {
-    if (normalized === 'si' || normalized === 'sí' || normalized === 'sí.' || normalized === 'si.') {
-      session.awaitingUnconfiguredProductAction = false;
-      const baseMsg =
-        flow.handoffMessage ??
-        'Derivando tu conversación a una persona de nuestro equipo. Conservaremos tus respuestas registradas hasta este momento.';
-      return {
-        replyText: baseMsg,
-        requestHumanHandoff: true,
-        handoffReason: `Solicitado explícitamente por el usuario para ${session.productName ?? 'producto sin flujo configurado'}.`,
-      };
-    }
-    return renderUnconfiguredProductOutput(business, session.productName ?? 'este producto', session, flow);
+    session.awaitingUnconfiguredProductAction = false;
+    return {
+      replyText: '',
+      configInvalid: true,
+      configInvalidReason: `La opción seleccionada "${session.productName ?? 'sin destino'}" no tiene una conversación publicada válida.`,
+    };
   }
 
   // First turn initialization & optional business common entry menu
   if (!session.currentStepId) {
     const entryMeta = business ? getEffectiveEntrySettings(business, session, flow) : undefined;
     const activeProducts = business ? getPlayableEntryProducts(store, business, session, flow) : [];
-    if (business && entryMeta?.entryConfig?.enabled && activeProducts.length > 0 && !session.productId) {
+    if (business && entryMeta?.entryConfig?.enabled && !session.productId) {
+      if (!entryMeta.entryConfig.greetingPrompt?.trim() || activeProducts.length === 0) {
+        return buildEntryMenuOutput(store, business, session, flow);
+      }
       if (!session.awaitingEntryProductSelection) {
         session.awaitingEntryProductSelection = true;
         session.updatedAt = new Date().toISOString();
@@ -1198,9 +1190,11 @@ export function runBasicEngine(params: {
       );
 
       if (!targetFlow || targetFlow.steps.length === 0) {
-        session.awaitingUnconfiguredProductAction = true;
-        session.updatedAt = new Date().toISOString();
-        return renderUnconfiguredProductOutput(business, matchedProduct.name, session, flow);
+        return {
+          replyText: '',
+          configInvalid: true,
+          configInvalidReason: `La opción "${matchedProduct.name}" no tiene una conversación publicada activa o su versión fue retirada.`,
+        };
       }
 
       const candidateRulesetId =
@@ -1245,7 +1239,11 @@ export function runBasicEngine(params: {
 
     const firstStep = flow.steps[0];
     if (!firstStep) {
-      return { replyText: 'Flujo sin pasos configurados.' };
+      return {
+        replyText: '',
+        configInvalid: true,
+        configInvalidReason: 'La conversación fijada no tiene pasos configurados.',
+      };
     }
     return advanceFromStep(flow, session, firstStep.id);
   }
@@ -1253,9 +1251,9 @@ export function runBasicEngine(params: {
   const currentStep = flow.steps.find((s) => s.id === session.currentStepId);
   if (!currentStep) {
     return {
-      replyText: 'El paso actual ya no existe. Escribe "humano" para recibir asistencia.',
-      requestHumanHandoff: true,
-      handoffReason: 'Paso no encontrado en la versión de flujo fijada.',
+      replyText: '',
+      configInvalid: true,
+      configInvalidReason: 'El paso actual ya no existe en la versión de conversación fijada.',
     };
   }
 

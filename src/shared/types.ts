@@ -111,7 +111,7 @@ export interface FlowVersion {
   flowKey?: string;
   versionNumber: number;
   name: string;
-  status: 'borrador' | 'publicada';
+  status: 'borrador' | 'publicada' | 'retirada';
   steps: FlowStep[];
   outOfScriptRules: OutOfScriptRule[];
   summaryTemplate?: string;
@@ -126,6 +126,12 @@ export interface FlowVersion {
   humanHandoffConfig?: HumanHandoffConfig;
   createdAt: string;
   publishedAt?: string;
+  publishedByUserId?: string;
+  publishedByName?: string;
+  retiredAt?: string;
+  retiredByUserId?: string;
+  retiredByName?: string;
+  retiredReason?: string;
 }
 
 export interface RuleCondition {
@@ -224,6 +230,9 @@ export interface BusinessEntryConfig {
   enabled: boolean;
   greetingPrompt: string;
   unconfiguredProductPrompt: string;
+  publishedAt?: string;
+  publishedByUserId?: string;
+  publishedByName?: string;
 }
 
 export interface BusinessEntryDraft {
@@ -428,6 +437,9 @@ export interface Session {
   awaitingHumanContactName?: boolean;
   awaitingHumanContactPhone?: boolean;
   awaitingHumanTaskId?: string;
+  pausedForReview?: boolean;
+  pausedReason?: string;
+  pausedAt?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -615,4 +627,102 @@ export interface AcceptanceCriterionResult {
   title: string;
   passed: boolean;
   evidence: string;
+}
+
+export interface ProductionChannelSummary {
+  connectionId: string;
+  provider: 'wasapflow' | 'meta' | 'simulador' | 'otro';
+  displayName: string;
+  phoneNumber: string | null;
+  connectionStatus: 'conectado' | 'pendiente' | 'error' | 'activa' | 'pausada';
+  outboundEnabled: boolean;
+  outboundLabel: string;
+  detail: string;
+}
+
+export interface ProductionMenuOptionSummary {
+  id: string;
+  name: string;
+  optionLabel: string;
+  active: boolean;
+  targetType: 'flow' | 'handoff';
+  flowKey: string | null;
+  handoffLabel: string | null;
+  destinationStatus: 'valida' | 'sin_publicar' | 'retirada' | 'invalida' | 'atencion_humana';
+  destinationReason?: string;
+  targetFlowId: string | null;
+  targetFlowName: string | null;
+  targetFlowVersionNumber: number | null;
+  targetFlowPublishedAt: string | null;
+  targetFlowPublishedByName: string | null;
+}
+
+export interface ProductionConversationSummary {
+  flowKey: string;
+  label: string;
+  isDefaultEntryFallback: boolean;
+  latestPublished: {
+    id: string;
+    name: string;
+    versionNumber: number;
+    publishedAt: string | null;
+    publishedByUserId: string | null;
+    publishedByName: string | null;
+    stepsCount: number;
+    steps: FlowStep[];
+    outOfScriptRules: OutOfScriptRule[];
+    humanHandoffConfig?: HumanHandoffConfig;
+    handoffMessage?: string;
+    cancelMessage?: string;
+    outOfScriptPrompt?: string;
+  } | null;
+  latestRetired: {
+    id: string;
+    name: string;
+    versionNumber: number;
+    retiredAt: string | null;
+    retiredByName: string | null;
+    retiredReason: string | null;
+  } | null;
+  hasDraft: boolean;
+  draftVersionNumber: number | null;
+  linkedMenuOptions: string[];
+  openChatsCount: number;
+  outdatedOpenChatsCount: number;
+  pausedOpenChatsCount: number;
+}
+
+export interface ProductionSummary {
+  businessId: string;
+  businessName: string;
+  checkedAt: string;
+  runtime: {
+    wasapflowOutboundEnabled: boolean;
+    metaOutboundEnabled: boolean;
+    metaTestOutboundEnabled: boolean;
+  };
+  primaryChannel: ProductionChannelSummary | null;
+  channels: ProductionChannelSummary[];
+  entryMenu: {
+    enabled: boolean;
+    greetingPrompt: string;
+    unconfiguredProductPrompt: string;
+    publishedAt: string | null;
+    publishedByUserId: string | null;
+    publishedByName: string | null;
+    hasPendingDraft: boolean;
+    draftUpdatedAt: string | null;
+    options: ProductionMenuOptionSummary[];
+    validationErrors: string[];
+  };
+  defaultFallbackFlow: {
+    id: string;
+    name: string;
+    versionNumber: number | null;
+    flowKey: string | null;
+    status: 'publicada' | 'retirada' | 'borrador' | 'inexistente';
+    isValid: boolean;
+    reason?: string;
+  };
+  conversations: ProductionConversationSummary[];
 }

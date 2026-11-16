@@ -1,5 +1,19 @@
 import { useEffect, useState } from 'react';
-import { ArrowDown, ArrowUp, Play, Plus, RotateCcw, Save, Trash2 } from 'lucide-react';
+import {
+  AlertTriangle,
+  ArrowDown,
+  ArrowUp,
+  Ban,
+  CheckCircle2,
+  Eye,
+  Play,
+  Plus,
+  Radio,
+  RotateCcw,
+  Save,
+  Trash2,
+  X,
+} from 'lucide-react';
 import type {
   Business,
   BusinessEntryConfig,
@@ -10,6 +24,7 @@ import type {
   FlowVersion,
   HumanHandoffConfig,
   OutOfScriptRule,
+  ProductionSummary,
   RuleOperator,
   StepType,
 } from '../../shared/types';
@@ -113,7 +128,9 @@ export function FlowAndRulesDesigner({
         label: string;
         draft?: FlowVersion;
         latestPublished?: FlowVersion;
+        latestRetired?: FlowVersion;
         publishedVersions: FlowVersion[];
+        retiredVersions: FlowVersion[];
       }
     >();
     for (const fv of scoped.flowVersions) {
@@ -124,6 +141,7 @@ export function FlowAndRulesDesigner({
           flowKey: key,
           label: fv.name,
           publishedVersions: [],
+          retiredVersions: [],
         };
         map.set(key, entry);
       }
@@ -131,14 +149,31 @@ export function FlowAndRulesDesigner({
         if (!entry.draft || fv.versionNumber > entry.draft.versionNumber) {
           entry.draft = fv;
         }
+      } else if (fv.status === 'retirada') {
+        entry.retiredVersions.push(fv);
       } else if (fv.status === 'publicada') {
         entry.publishedVersions.push(fv);
       }
     }
     for (const entry of map.values()) {
       entry.publishedVersions.sort((a, b) => b.versionNumber - a.versionNumber);
-      entry.latestPublished = entry.publishedVersions[0];
-      entry.label = entry.draft?.name ?? entry.latestPublished?.name ?? entry.flowKey;
+      entry.retiredVersions.sort((a, b) => b.versionNumber - a.versionNumber);
+      const allNonDraft = [...entry.publishedVersions, ...entry.retiredVersions].sort(
+        (a, b) => b.versionNumber - a.versionNumber
+      );
+      const topNonDraft = allNonDraft[0];
+      if (topNonDraft?.status === 'retirada') {
+        entry.latestRetired = topNonDraft;
+        entry.latestPublished = undefined;
+      } else {
+        entry.latestPublished = entry.publishedVersions[0];
+        entry.latestRetired = entry.retiredVersions[0];
+      }
+      entry.label =
+        entry.draft?.name ??
+        entry.latestPublished?.name ??
+        entry.latestRetired?.name ??
+        entry.flowKey;
     }
     return Array.from(map.values());
   })();
@@ -155,12 +190,19 @@ export function FlowAndRulesDesigner({
   const [showNewConvForm, setShowNewConvForm] = useState(false);
   const [newConvName, setNewConvName] = useState('');
 
+  const [productionSummary, setProductionSummary] = useState<ProductionSummary | null>(null);
+  const [loadingProduction, setLoadingProduction] = useState(false);
+  const [showPublishedModal, setShowPublishedModal] = useState(false);
+  const [publishConfirmModal, setPublishConfirmModal] = useState<'entry' | 'flow' | null>(null);
+  const [retireTargetFlow, setRetireTargetFlow] = useState<FlowVersion | null>(null);
+  const [retireReason, setRetireReason] = useState('');
+
   const activeGroup =
     flowGroups.find((g) => g.flowKey === selectedFlowKey) ??
     flowGroups.find((g) => g.flowKey === defaultFlowKey) ??
     flowGroups[0];
   const effectiveFlowKey = activeGroup?.flowKey ?? defaultFlowKey;
-  const draftFlow = activeGroup?.draft ?? activeGroup?.latestPublished;
+  const draftFlow = activeGroup?.draft ?? activeGroup?.latestPublished ?? activeGroup?.latestRetired;
 
   function resolveProductFlowKey(prod: BusinessProduct): string {
     if (prod.targetType === 'handoff') return '';
@@ -254,6 +296,19 @@ export function FlowAndRulesDesigner({
     }>
   >([]);
 
+  async function reloadProductionSummary(): Promise<ProductionSummary | null> {
+    setLoadingProduction(true);
+    try {
+      const summary = await nalasApi.getProductionSummary(ctx);
+      setProductionSummary(summary);
+      return summary;
+    } catch {
+      return null;
+    } finally {
+      setLoadingProduction(false);
+    }
+  }
+
   useEffect(() => {
     setSelectedFlowKey(defaultFlowKey);
     setPendingFlowKey(null);
@@ -265,6 +320,10 @@ export function FlowAndRulesDesigner({
     setRulesValidationError(null);
     setShowNewConvForm(false);
     setNewConvName('');
+    setPublishConfirmModal(null);
+    setRetireTargetFlow(null);
+    setRetireReason('');
+    void reloadProductionSummary();
   }, [business.id]);
 
   const draftSignature = draftFlow
@@ -596,6 +655,7 @@ export function FlowAndRulesDesigner({
       });
       setEntryDirty(false);
       await onRefresh();
+      await reloadProductionSummary();
       onNotice(
         'Borrador de saludo y menú guardado. WhatsApp sigue usando la versión publicada hasta que la publiques.'
       );
@@ -639,18 +699,29 @@ export function FlowAndRulesDesigner({
     }
   }
 
-  async function handlePublishEntryMenu() {
+  async function handleConfirmPublishEntryMenu() {
     setBusy(true);
     setEntryError(null);
     try {
-      await nalasApi.publishEntryMenu(ctx, {
+      const publishedBiz = await nalasApi.publishEntryMenu(ctx, {
         entryConfig,
         products: entryProducts,
       });
+      const verified = await nalasApi.getProductionSummary(ctx);
+      if (
+        publishedBiz.entryConfig?.publishedAt &&
+        verified.entryMenu.publishedAt !== publishedBiz.entryConfig.publishedAt
+      ) {
+        throw new Error(
+          'No se pudo verificar el menú publicado al releer el estado desde el servidor.'
+        );
+      }
+      setProductionSummary(verified);
       setEntryDirty(false);
+      setPublishConfirmModal(null);
       await onRefresh();
       onNotice(
-        'Saludo y menú de entrada publicados. WhatsApp y nuevas conversaciones aplican estos cambios.'
+        'Saludo y menú publicados y verificados en el servidor. Aplica a chats nuevos; los chats ya iniciados conservan su versión.'
       );
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'No se pudo publicar el saludo y menú.';
@@ -690,6 +761,7 @@ export function FlowAndRulesDesigner({
         });
         setRulesDirty(false);
         await onRefresh();
+        await reloadProductionSummary();
         onNotice(
           'Criterios guardados en borrador. Tocá «Publicar criterios» para aplicarlos a nuevas conversaciones.'
         );
@@ -715,6 +787,7 @@ export function FlowAndRulesDesigner({
       setDraftDirty(false);
       setValidationMessages(res.issues);
       await onRefresh();
+      await reloadProductionSummary();
       onNotice('Cambios guardados en el borrador de esta conversación. Tus conversaciones publicadas siguen intactas.');
     } catch (e) {
       onError(e instanceof Error ? e.message : 'No se pudieron guardar los cambios.');
@@ -765,7 +838,7 @@ export function FlowAndRulesDesigner({
     }
   }
 
-  async function handlePublishFlow() {
+  async function handleConfirmPublishFlow() {
     setBusy(true);
     try {
       await nalasApi.saveFlowDraft(ctx, {
@@ -776,11 +849,23 @@ export function FlowAndRulesDesigner({
         flowKey: effectiveFlowKey,
       });
       const res = await nalasApi.publishFlow(ctx, effectiveFlowKey);
+      const verified = await nalasApi.getProductionSummary(ctx);
+      const verifiedConv = verified.conversations.find((c) => c.flowKey === effectiveFlowKey);
+      if (
+        !verifiedConv?.latestPublished ||
+        verifiedConv.latestPublished.versionNumber !== res.published.versionNumber
+      ) {
+        throw new Error(
+          'No se pudo verificar la versión publicada al releer el estado desde el servidor.'
+        );
+      }
+      setProductionSummary(verified);
       setDraftDirty(false);
       setValidationMessages([]);
+      setPublishConfirmModal(null);
       await onRefresh();
       onNotice(
-        `Conversación «${res.published.name}» publicada (versión ${res.published.versionNumber}) para nuevas personas. Las conversaciones ya iniciadas conservan su versión.`
+        `Conversación «${res.published.name}» publicada y verificada (v${res.published.versionNumber}) para nuevas personas. Los chats ya iniciados conservan su versión.`
       );
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'No se pudo publicar la conversación.';
@@ -796,9 +881,34 @@ export function FlowAndRulesDesigner({
     try {
       await nalasApi.rollbackFlow(ctx, flowVersionId);
       await onRefresh();
+      await reloadProductionSummary();
       onNotice('Conversación anterior restaurada para nuevas sesiones.');
     } catch (e) {
       onError(e instanceof Error ? e.message : 'No se pudo restaurar la versión.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleConfirmRetireFlow() {
+    if (!retireTargetFlow) return;
+    setBusy(true);
+    try {
+      const res = await nalasApi.retireFlowVersion(
+        ctx,
+        retireTargetFlow.id,
+        retireReason.trim() || undefined
+      );
+      const verified = await nalasApi.getProductionSummary(ctx);
+      setProductionSummary(verified);
+      setRetireTargetFlow(null);
+      setRetireReason('');
+      await onRefresh();
+      onNotice(
+        `Versión v${res.retiredFlow.versionNumber} retirada de producción. Chats abiertos pausados para revisión: ${res.affectedConversationIds.length}.`
+      );
+    } catch (e) {
+      onError(e instanceof Error ? e.message : 'No se pudo retirar la versión.');
     } finally {
       setBusy(false);
     }
@@ -816,6 +926,7 @@ export function FlowAndRulesDesigner({
       });
       setRulesDirty(false);
       await onRefresh();
+      await reloadProductionSummary();
       onNotice(`Criterios publicados (v${pub.versionNumber}). Las oportunidades pasadas conservan su estado.`);
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'No se pudieron publicar los criterios.';
@@ -847,7 +958,52 @@ export function FlowAndRulesDesigner({
     }
   }
 
-  const hasFlowDraft = draftDirty || draftFlow?.status === 'borrador';
+  const publishedEntrySnapshot = JSON.stringify({
+    enabled: Boolean(business.entryConfig?.enabled),
+    greetingPrompt: business.entryConfig?.greetingPrompt ?? '',
+    products: (business.products ?? []).map((p) => ({
+      id: p.id,
+      name: p.name,
+      optionLabel: p.optionLabel,
+      targetType: p.targetType ?? 'flow',
+      flowKey: p.flowKey ?? '',
+      active: Boolean(p.active),
+    })),
+  });
+  const currentEditorEntrySnapshot = JSON.stringify({
+    enabled: Boolean(entryConfig.enabled),
+    greetingPrompt: entryConfig.greetingPrompt ?? '',
+    products: entryProducts.map((p) => ({
+      id: p.id,
+      name: p.name,
+      optionLabel: p.optionLabel,
+      targetType: p.targetType ?? 'flow',
+      flowKey: resolveProductFlowKey(p),
+      active: Boolean(p.active),
+    })),
+  });
+  const hasEntryDraft =
+    entryDirty ||
+    Boolean(productionSummary?.entryMenu.hasPendingDraft) ||
+    currentEditorEntrySnapshot !== publishedEntrySnapshot;
+
+  const publishedGroupFlow = activeGroup?.latestPublished;
+  const draftDiffersFromPublishedFlow = Boolean(
+    draftFlow &&
+      publishedGroupFlow &&
+      (draftFlow.name.replace(/\s*\(Borrador.*\)/i, '').replace(/\s+v\d+$/i, '').trim() !==
+        publishedGroupFlow.name.replace(/\s+v\d+$/i, '').trim() ||
+        JSON.stringify(draftFlow.steps) !== JSON.stringify(publishedGroupFlow.steps) ||
+        JSON.stringify(draftFlow.outOfScriptRules) !==
+          JSON.stringify(publishedGroupFlow.outOfScriptRules) ||
+        JSON.stringify(draftFlow.humanHandoffConfig ?? null) !==
+          JSON.stringify(publishedGroupFlow.humanHandoffConfig ?? null))
+  );
+  const hasFlowDraft =
+    draftDirty ||
+    !publishedGroupFlow ||
+    draftDiffersFromPublishedFlow;
+
   const hasUnpublishedRulesetDraft = Boolean(
     draftRuleset &&
       (!activeRuleset ||
@@ -908,26 +1064,30 @@ export function FlowAndRulesDesigner({
           {subTab === 'inicio' ? (
             <span
               className={`text-sm font-medium ${
-                entryDirty || Boolean(business.entryDraft) ? 'text-[#8C542C]' : 'text-[#116B70]'
+                hasEntryDraft ? 'text-[#8C542C]' : 'text-[#116B70]'
               }`}
             >
               {entryDirty
                 ? 'Borrador · Tenés cambios sin guardar en el menú'
-                : business.entryDraft
+                : hasEntryDraft
                   ? 'Borrador · Menú pendiente de publicar'
                   : 'Publicado · Menú de entrada activo'}
             </span>
           ) : subTab === 'flujo' ? (
             <span
               className={`text-sm font-medium ${
-                hasFlowDraft ? 'text-[#8C542C]' : 'text-[#116B70]'
+                hasFlowDraft || (!activeGroup?.latestPublished && activeGroup?.latestRetired)
+                  ? 'text-[#8C542C]'
+                  : 'text-[#116B70]'
               }`}
             >
               {draftDirty
                 ? 'Borrador · Tenés cambios sin guardar'
-                : draftFlow?.status === 'borrador'
+                : hasFlowDraft
                   ? 'Borrador · Tus cambios todavía no están publicados'
-                  : 'Publicada · Conversación activa'}
+                  : !activeGroup?.latestPublished && activeGroup?.latestRetired
+                    ? `Retirada · Edición v${activeGroup.latestRetired.versionNumber} fuera de producción`
+                    : `Publicada · Edición v${publishedGroupFlow?.versionNumber ?? ''} activa`}
             </span>
           ) : (
             <div className="flex flex-wrap items-center gap-2">
@@ -988,9 +1148,259 @@ export function FlowAndRulesDesigner({
         </div>
       </div>
 
+      {/* Vista En producción (fuente única del servidor) */}
+      <section className="bg-white border border-[#E2E7EB] rounded-[13px] p-5 space-y-4">
+        <div className="flex flex-wrap items-start justify-between gap-3 border-b border-[#EDF0F2] pb-3.5">
+          <div className="flex items-start gap-2.5">
+            <Radio className="w-5 h-5 text-[#167D83] mt-0.5 shrink-0" />
+            <div>
+              <h2 className="text-base font-semibold text-[#25364A]">En producción</h2>
+              <p className="text-xs text-[#5A6877] mt-0.5">
+                Resumen leído del servidor sobre lo que hoy ejecuta WhatsApp en {business.name}. Guardar un borrador nunca cambia esta vista hasta publicar.
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            disabled={!productionSummary || loadingProduction}
+            onClick={() => setShowPublishedModal(true)}
+            className="inline-flex items-center gap-1.5 min-h-[38px] px-3.5 py-1.5 text-xs font-semibold text-[#116B70] bg-[#EAF5F2] border border-[#D4EAE4] rounded-[8px] hover:bg-[#DCEFE9] disabled:opacity-50 whitespace-nowrap"
+          >
+            <Eye className="w-3.5 h-3.5" />
+            <span>Ver contenido publicado exacto</span>
+          </button>
+        </div>
+
+        {loadingProduction && !productionSummary ? (
+          <div className="text-xs text-[#5A6877] py-2">Consultando configuración publicada en el servidor…</div>
+        ) : productionSummary ? (
+          <div className="space-y-4">
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+              <div className="p-3.5 rounded-[10px] bg-[#F7F8FA] border border-[#E2E7EB] space-y-1">
+                <div className="text-[11px] font-semibold uppercase tracking-wide text-[#5A6877]">
+                  Canal y número conectado
+                </div>
+                {productionSummary.primaryChannel ? (
+                  <>
+                    <div className="text-sm font-semibold text-[#25364A]">
+                      {productionSummary.primaryChannel.displayName}
+                    </div>
+                    <div className="text-xs text-[#5A6877] tabular-nums">
+                      {productionSummary.primaryChannel.phoneNumber ?? 'Número pendiente de verificación'}
+                    </div>
+                    <div className="pt-1 flex flex-wrap items-center gap-1.5">
+                      <span
+                        className={`inline-block rounded-md px-2 py-0.5 text-[11px] font-semibold ${
+                          productionSummary.primaryChannel.outboundEnabled
+                            ? 'bg-[#EAF5F2] text-[#116B70]'
+                            : 'bg-[#FFF0E3] text-[#8C542C]'
+                        }`}
+                      >
+                        {productionSummary.primaryChannel.outboundLabel}
+                      </span>
+                      <span className="inline-block rounded-md px-2 py-0.5 text-[11px] font-medium bg-white border border-[#DCE3E8] text-[#5A6877]">
+                        {productionSummary.primaryChannel.connectionStatus}
+                      </span>
+                    </div>
+                  </>
+                ) : (
+                  <div className="text-xs text-[#5A6877]">Sin canal WhatsApp configurado.</div>
+                )}
+              </div>
+
+              <div className="p-3.5 rounded-[10px] bg-[#F7F8FA] border border-[#E2E7EB] space-y-1">
+                <div className="text-[11px] font-semibold uppercase tracking-wide text-[#5A6877]">
+                  Saludo y menú publicado
+                </div>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span
+                    className={`inline-block rounded-md px-2 py-0.5 text-[11px] font-semibold ${
+                      productionSummary.entryMenu.enabled
+                        ? 'bg-[#EAF5F2] text-[#116B70]'
+                        : 'bg-[#EDF1F3] text-[#5A6877]'
+                    }`}
+                  >
+                    {productionSummary.entryMenu.enabled ? 'Menú activo' : 'Menú desactivado'}
+                  </span>
+                  {productionSummary.entryMenu.hasPendingDraft && (
+                    <span className="inline-block rounded-md px-2 py-0.5 text-[11px] font-semibold bg-[#FFF0E3] text-[#8C542C]">
+                      Hay borrador sin publicar
+                    </span>
+                  )}
+                </div>
+                <div className="text-xs text-[#25364A] line-clamp-2">
+                  {productionSummary.entryMenu.greetingPrompt || 'Sin saludo publicado.'}
+                </div>
+                <div className="text-[11px] text-[#5A6877]">
+                  {productionSummary.entryMenu.publishedAt
+                    ? `Publicado el ${new Date(productionSummary.entryMenu.publishedAt).toLocaleString('es-ES')}${
+                        productionSummary.entryMenu.publishedByName
+                          ? ` por ${productionSummary.entryMenu.publishedByName}`
+                          : ''
+                      }`
+                    : 'Sin registro histórico de fecha/autor'}
+                </div>
+              </div>
+
+              <div className="p-3.5 rounded-[10px] bg-[#F7F8FA] border border-[#E2E7EB] space-y-1">
+                <div className="text-[11px] font-semibold uppercase tracking-wide text-[#5A6877]">
+                  Estado de entrada directa
+                </div>
+                <div className="text-sm font-semibold text-[#25364A]">
+                  {productionSummary.defaultFallbackFlow.name}
+                  {productionSummary.defaultFallbackFlow.versionNumber
+                    ? ` · v${productionSummary.defaultFallbackFlow.versionNumber}`
+                    : ''}
+                </div>
+                <div className="text-xs text-[#5A6877]">
+                  {productionSummary.defaultFallbackFlow.isValid
+                    ? 'Conversación publicada válida como respaldo'
+                    : productionSummary.defaultFallbackFlow.reason ?? 'Requiere revisión antes de atender sin menú'}
+                </div>
+              </div>
+            </div>
+
+            {productionSummary.entryMenu.validationErrors.length > 0 && (
+              <div className="bg-red-50 border border-red-200 rounded-[10px] p-3 text-xs text-red-800 space-y-1">
+                <div className="font-semibold flex items-center gap-1.5">
+                  <AlertTriangle className="w-4 h-4 shrink-0" />
+                  <span>Atención: inconsistencia detectada en el menú publicado</span>
+                </div>
+                {productionSummary.entryMenu.validationErrors.map((err, i) => (
+                  <div key={i}>• {err}</div>
+                ))}
+              </div>
+            )}
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <div className="border border-[#E2E7EB] rounded-[10px] p-3.5 space-y-2">
+                <div className="text-xs font-semibold text-[#25364A]">
+                  Opciones activas del menú publicado
+                </div>
+                {productionSummary.entryMenu.options.filter((o) => o.active).length === 0 ? (
+                  <div className="text-xs text-[#5A6877]">No hay opciones activas publicadas.</div>
+                ) : (
+                  <div className="divide-y divide-[#EDF0F2]">
+                    {productionSummary.entryMenu.options
+                      .filter((o) => o.active)
+                      .map((opt, idx) => (
+                        <div key={opt.id} className="py-2 flex items-center justify-between gap-2 text-xs">
+                          <div className="min-w-0">
+                            <span className="font-semibold text-[#25364A]">
+                              {idx + 1}. {opt.optionLabel}
+                            </span>
+                            <div className="text-[#5A6877] truncate">
+                              {opt.targetType === 'handoff'
+                                ? `Deriva a persona (${opt.handoffLabel ?? 'Atención humana'})`
+                                : opt.targetFlowName && opt.targetFlowVersionNumber
+                                  ? `Destino: ${opt.targetFlowName} · v${opt.targetFlowVersionNumber}`
+                                  : opt.destinationReason ?? 'Sin conversación publicada válida'}
+                            </div>
+                          </div>
+                          <span
+                            className={`shrink-0 rounded-md px-2 py-0.5 text-[11px] font-semibold ${
+                              opt.destinationStatus === 'valida' ||
+                              opt.destinationStatus === 'atencion_humana'
+                                ? 'bg-[#EAF5F2] text-[#116B70]'
+                                : 'bg-red-50 text-red-700 border border-red-200'
+                            }`}
+                          >
+                            {opt.destinationStatus === 'valida'
+                              ? `v${opt.targetFlowVersionNumber}`
+                              : opt.destinationStatus === 'atencion_humana'
+                                ? 'Persona'
+                                : opt.destinationStatus === 'retirada'
+                                  ? 'Retirada'
+                                  : 'Bloqueada'}
+                          </span>
+                        </div>
+                      ))}
+                  </div>
+                )}
+              </div>
+
+              <div className="border border-[#E2E7EB] rounded-[10px] p-3.5 space-y-2">
+                <div className="text-xs font-semibold text-[#25364A]">
+                  Conversaciones en producción
+                </div>
+                {productionSummary.conversations.length === 0 ? (
+                  <div className="text-xs text-[#5A6877]">No hay conversaciones configuradas.</div>
+                ) : (
+                  <div className="divide-y divide-[#EDF0F2]">
+                    {productionSummary.conversations.map((conv) => (
+                      <div key={conv.flowKey} className="py-2 flex flex-wrap items-center justify-between gap-2 text-xs">
+                        <div className="min-w-0">
+                          <div className="font-semibold text-[#25364A] truncate">
+                            {conv.label}
+                          </div>
+                          <div className="text-[#5A6877]">
+                            {conv.latestPublished ? (
+                              <>
+                                v{conv.latestPublished.versionNumber} ·{' '}
+                                {conv.latestPublished.publishedAt
+                                  ? `${new Date(conv.latestPublished.publishedAt).toLocaleDateString('es-ES')}${
+                                      conv.latestPublished.publishedByName
+                                        ? ` · ${conv.latestPublished.publishedByName}`
+                                        : ''
+                                    }`
+                                  : 'Sin registro histórico'}
+                              </>
+                            ) : conv.latestRetired ? (
+                              `Retirada (v${conv.latestRetired.versionNumber})`
+                            ) : (
+                              'Solo borrador'
+                            )}
+                          </div>
+                        </div>
+                        <div className="flex flex-wrap items-center gap-1.5 tabular-nums">
+                          {conv.hasDraft && (
+                            <span className="rounded-md px-2 py-0.5 text-[11px] font-semibold bg-[#FFF0E3] text-[#8C542C]">
+                              Borrador pendiente
+                            </span>
+                          )}
+                          {conv.outdatedOpenChatsCount > 0 && (
+                            <span className="rounded-md px-2 py-0.5 text-[11px] font-semibold bg-[#FFF0E3] text-[#8C542C]">
+                              {conv.outdatedOpenChatsCount} desactualizado{conv.outdatedOpenChatsCount === 1 ? '' : 's'}
+                            </span>
+                          )}
+                          {conv.pausedOpenChatsCount > 0 && (
+                            <span className="rounded-md px-2 py-0.5 text-[11px] font-semibold bg-red-50 text-red-700">
+                              {conv.pausedOpenChatsCount} en pausa
+                            </span>
+                          )}
+                          <span className="rounded-md px-2 py-0.5 text-[11px] font-semibold bg-[#EDF1F3] text-[#25364A]">
+                            {conv.openChatsCount} abierto{conv.openChatsCount === 1 ? '' : 's'}
+                          </span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        ) : null}
+      </section>
+
       {/* Sub-tab 0: Saludo inicial y menú de entrada */}
       {subTab === 'inicio' && (
         <div className="space-y-6">
+          {hasEntryDraft && (
+            <div className="bg-[#FFF0E3] border border-[#F2D7BF] rounded-[12px] p-4 flex flex-wrap items-center justify-between gap-3 text-sm text-[#8C542C]">
+              <div className="flex items-start gap-2.5">
+                <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+                <div>
+                  <div className="font-semibold">
+                    BORRADOR — estos cambios todavía no se usan en WhatsApp
+                  </div>
+                  <div className="text-xs mt-0.5">
+                    Guardar actualiza solo este borrador. WhatsApp sigue ejecutando el saludo y menú publicado hasta que confirmes «Publicar saludo y menú».
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
           {entryError && (
             <div className="bg-red-50 border border-red-200 rounded-[12px] p-4 text-sm text-red-800">
               <div className="font-semibold mb-0.5">No se pudo publicar el saludo y menú</div>
@@ -1142,7 +1552,9 @@ export function FlowAndRulesDesigner({
                           </label>
                           {missingPublishedTarget && (
                             <span className="text-xs font-medium text-[#8C542C] bg-[#FFF0E3] px-2 py-0.5 rounded">
-                              Requiere conversación publicada en {business.name}
+                              {linkedGroup && !linkedGroup.latestPublished && linkedGroup.latestRetired
+                                ? `Versión retirada (v${linkedGroup.latestRetired.versionNumber}) · Publicá una nueva edición`
+                                : `Requiere conversación publicada en ${business.name}`}
                             </span>
                           )}
                         </div>
@@ -1297,7 +1709,7 @@ export function FlowAndRulesDesigner({
               <button
                 type="button"
                 disabled={busy}
-                onClick={handlePublishEntryMenu}
+                onClick={() => setPublishConfirmModal('entry')}
                 className="min-h-[44px] px-5 py-2 text-sm font-semibold text-white bg-[#167D83] rounded-[10px] hover:bg-[#116B70]"
               >
                 Publicar saludo y menú
@@ -1310,6 +1722,36 @@ export function FlowAndRulesDesigner({
       {/* Sub-tab 1: Conversation Builder (multi-conversación por negocio) */}
       {subTab === 'flujo' && (
         <div className="space-y-6">
+          {hasFlowDraft && (
+            <div className="bg-[#FFF0E3] border border-[#F2D7BF] rounded-[12px] p-4 flex items-start gap-2.5 text-sm text-[#8C542C]">
+              <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+              <div>
+                <div className="font-semibold">
+                  BORRADOR — estos cambios todavía no se usan en WhatsApp
+                </div>
+                <div className="text-xs mt-0.5">
+                  Guardar cambios actualiza solo el borrador de esta conversación.
+                  {publishedGroupFlow
+                    ? ` WhatsApp sigue usando la edición v${publishedGroupFlow.versionNumber} para chats nuevos.`
+                    : ' Esta conversación todavía no tiene ninguna edición publicada para WhatsApp.'}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {!activeGroup?.latestPublished && activeGroup?.latestRetired && (
+            <div className="bg-red-50 border border-red-200 rounded-[12px] p-4 flex items-start gap-2.5 text-sm text-red-800">
+              <Ban className="w-4 h-4 mt-0.5 shrink-0" />
+              <div>
+                <div className="font-semibold">
+                  Versión v{activeGroup.latestRetired.versionNumber} retirada de producción
+                </div>
+                <div className="text-xs mt-0.5">
+                  Esta conversación fue retirada y no ejecuta versiones anteriores de forma automática. Si una persona escribe aquí, el chat queda en pausa para revisión humana hasta que publiques una nueva versión o reinicies el chat.
+                </div>
+              </div>
+            </div>
+          )}
           <section className="bg-white border border-[#E2E7EB] rounded-[13px] p-5 space-y-4">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div>
@@ -1751,7 +2193,7 @@ export function FlowAndRulesDesigner({
                     <button
                       type="button"
                       disabled={busy}
-                      onClick={handlePublishFlow}
+                      onClick={() => setPublishConfirmModal('flow')}
                       className="min-h-[44px] px-5 py-2 text-sm font-semibold text-white bg-[#167D83] rounded-[10px] hover:bg-[#116B70]"
                     >
                       Publicar conversación
@@ -1977,13 +2419,18 @@ export function FlowAndRulesDesigner({
                 </div>
               </section>
 
-              {/* Published version history */}
+              {/* Published and retired version history */}
               <section className="bg-white border border-[#E2E7EB] rounded-[13px] p-6 space-y-3">
                 <h3 className="text-base font-semibold text-[#25364A]">
-                  Ediciones publicadas ({activeGroup?.label ?? (flowName.trim() || 'Conversación')})
+                  Ediciones publicadas y retiradas ({activeGroup?.label ?? (flowName.trim() || 'Conversación')})
                 </h3>
                 <div className="divide-y divide-[#EDF0F2]">
                   {(() => {
+                    const historyVersions = [
+                      ...publishedFlows,
+                      ...(activeGroup?.retiredVersions ?? []),
+                    ].sort((a, b) => b.versionNumber - a.versionNumber);
+
                     const linkedProd = (business.products ?? []).find(
                       (p) =>
                         p.targetType !== 'handoff' &&
@@ -1991,44 +2438,90 @@ export function FlowAndRulesDesigner({
                         p.flowVersionId
                     );
                     const activePubIdForGroup =
-                      publishedFlows.find((x) => x.id === business.activeFlowVersionId)?.id ??
-                      publishedFlows.find((x) => x.id === linkedProd?.flowVersionId)?.id ??
-                      publishedFlows[0]?.id;
-                    return publishedFlows.map((fv) => {
-                      const isActive = fv.id === activePubIdForGroup;
+                      activeGroup?.latestPublished
+                        ? publishedFlows.find((x) => x.id === business.activeFlowVersionId)?.id ??
+                          publishedFlows.find((x) => x.id === linkedProd?.flowVersionId)?.id ??
+                          activeGroup.latestPublished.id
+                        : undefined;
+
+                    if (historyVersions.length === 0) {
                       return (
-                      <div
-                        key={fv.id}
-                        className="py-3 flex flex-wrap items-center justify-between gap-3 text-sm"
-                      >
-                        <div>
-                          <div className="font-medium text-[#25364A]">
-                            {fv.name}{' '}
-                            <span className="text-[#5A6877]">· Edición {fv.versionNumber}</span>
+                        <p className="text-sm text-[#5A6877] py-2">
+                          Todavía no hay ediciones publicadas para esta conversación.
+                        </p>
+                      );
+                    }
+
+                    return historyVersions.map((fv) => {
+                      const isRetired = fv.status === 'retirada';
+                      const isActive = !isRetired && fv.id === activePubIdForGroup;
+                      return (
+                        <div
+                          key={fv.id}
+                          className="py-3 flex flex-wrap items-center justify-between gap-3 text-sm"
+                        >
+                          <div className="space-y-0.5">
+                            <div className="font-medium text-[#25364A]">
+                              {fv.name}{' '}
+                              <span className="text-[#5A6877]">· Edición v{fv.versionNumber}</span>
+                            </div>
+                            <div className="text-xs text-[#5A6877]">
+                              {fv.steps.length} preguntas
+                              {fv.publishedAt
+                                ? ` · Publicada el ${new Date(fv.publishedAt).toLocaleDateString('es-ES')}${
+                                    fv.publishedByName ? ` por ${fv.publishedByName}` : ''
+                                  }`
+                                : ' · Sin registro histórico de publicación'}
+                            </div>
+                            {isRetired && (
+                              <div className="text-xs text-red-700">
+                                Retirada
+                                {fv.retiredAt
+                                  ? ` el ${new Date(fv.retiredAt).toLocaleString('es-ES')}`
+                                  : ''}
+                                {fv.retiredByName ? ` por ${fv.retiredByName}` : ''}
+                                {fv.retiredReason ? ` · Motivo: ${fv.retiredReason}` : ''}
+                              </div>
+                            )}
                           </div>
-                          <div className="text-xs text-[#5A6877]">
-                            {fv.steps.length} preguntas
-                            {fv.publishedAt
-                              ? ` · Publicada el ${new Date(fv.publishedAt).toLocaleDateString('es-ES')}`
-                              : ''}
+                          <div className="flex flex-wrap items-center gap-2">
+                            {isRetired ? (
+                              <span className="inline-block rounded-md px-2.5 py-1 text-xs font-semibold bg-red-50 text-red-700 border border-red-200">
+                                Retirada
+                              </span>
+                            ) : (
+                              <>
+                                {isActive ? (
+                                  <span className="inline-block rounded-md px-2.5 py-1 text-xs font-semibold bg-[#EAF5F2] text-[#116B70]">
+                                    En uso
+                                  </span>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    disabled={busy}
+                                    onClick={() => handleRollback(fv.id)}
+                                    className="inline-flex items-center gap-1.5 min-h-[38px] px-3 py-1.5 text-xs font-medium text-[#116B70] bg-[#EAF5F2] border border-[#D4EAE4] rounded-[8px] hover:bg-[#DCEFE9] whitespace-nowrap"
+                                  >
+                                    <RotateCcw className="w-3.5 h-3.5" />
+                                    <span>Volver a esta edición</span>
+                                  </button>
+                                )}
+                                <button
+                                  type="button"
+                                  disabled={busy}
+                                  onClick={() => {
+                                    setRetireTargetFlow(fv);
+                                    setRetireReason('');
+                                  }}
+                                  className="inline-flex items-center gap-1.5 min-h-[38px] px-3 py-1.5 text-xs font-medium text-red-700 bg-white border border-red-200 rounded-[8px] hover:bg-red-50 whitespace-nowrap"
+                                >
+                                  <Ban className="w-3.5 h-3.5" />
+                                  <span>Retirar de producción</span>
+                                </button>
+                              </>
+                            )}
                           </div>
                         </div>
-                        {isActive ? (
-                          <span className="inline-block rounded-md px-2.5 py-1 text-xs font-semibold bg-[#EAF5F2] text-[#116B70]">
-                            En uso
-                          </span>
-                        ) : (
-                          <button
-                            type="button"
-                            disabled={busy}
-                            onClick={() => handleRollback(fv.id)}
-                            className="inline-flex items-center gap-1.5 min-h-[40px] px-3 py-1.5 text-xs font-medium text-[#116B70] bg-[#EAF5F2] border border-[#D4EAE4] rounded-[8px] hover:bg-[#DCEFE9] whitespace-nowrap"
-                          >
-                            <RotateCcw className="w-3.5 h-3.5" />
-                            <span>Volver a esta edición</span>
-                          </button>
-                        )}
-                      </div>
                       );
                     });
                   })()}
@@ -2042,6 +2535,19 @@ export function FlowAndRulesDesigner({
       {/* Sub-tab 2: Classification Rules */}
       {subTab === 'reglas' && (
         <div className="space-y-6">
+          {hasRulesDraft && (
+            <div className="bg-[#FFF0E3] border border-[#F2D7BF] rounded-[12px] p-4 flex items-start gap-2.5 text-sm text-[#8C542C]">
+              <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+              <div>
+                <div className="font-semibold">
+                  BORRADOR — estos criterios todavía no se usan en WhatsApp
+                </div>
+                <div className="text-xs mt-0.5">
+                  Guardá para conservar tu borrador o tocá «Publicar criterios» para aplicarlos a nuevas conversaciones.
+                </div>
+              </div>
+            </div>
+          )}
           {rulesValidationError && (
             <div className="bg-red-50 border border-red-200 rounded-[12px] p-4 text-sm text-red-800">
               <div className="font-semibold mb-0.5">No se pudieron guardar los criterios</div>
@@ -2470,6 +2976,425 @@ export function FlowAndRulesDesigner({
               </div>
             </div>
           )}
+        </div>
+      )}
+
+      {/* Modal 1: Read-only exact published content inspector */}
+      {showPublishedModal && productionSummary && (
+        <div className="fixed inset-0 z-50 bg-[#1B2531]/45 flex items-center justify-center p-4">
+          <div className="bg-white border border-[#E2E7EB] rounded-[14px] max-w-3xl w-full max-h-[88vh] flex flex-col overflow-hidden">
+            <div className="px-6 py-4 border-b border-[#EDF0F2] flex items-center justify-between gap-3">
+              <div>
+                <h3 className="text-lg font-semibold text-[#25364A]">
+                  Contenido publicado exacto en WhatsApp
+                </h3>
+                <p className="text-xs text-[#5A6877] mt-0.5">
+                  Solo lectura · Estado real servido por el servidor el{' '}
+                  {new Date(productionSummary.checkedAt).toLocaleString('es-ES')}.
+                </p>
+              </div>
+              <button
+                type="button"
+                aria-label="Cerrar vista publicada"
+                onClick={() => setShowPublishedModal(false)}
+                className="p-2 text-[#5A6877] hover:text-[#25364A] rounded-[8px]"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-6 overflow-y-auto space-y-6 text-sm">
+              <div className="border border-[#E2E7EB] rounded-[11px] p-4 space-y-2.5 bg-[#F7F8FA]/60">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="font-semibold text-[#25364A]">Saludo inicial y menú</span>
+                  <span className="text-xs text-[#5A6877]">
+                    {productionSummary.entryMenu.publishedAt
+                      ? `Publicado el ${new Date(productionSummary.entryMenu.publishedAt).toLocaleString('es-ES')}${
+                          productionSummary.entryMenu.publishedByName
+                            ? ` · ${productionSummary.entryMenu.publishedByName}`
+                            : ''
+                        }`
+                      : 'Sin registro histórico'}
+                  </span>
+                </div>
+                <div className="text-xs text-[#5A6877]">
+                  Estado: <strong>{productionSummary.entryMenu.enabled ? 'Activo' : 'Desactivado'}</strong>
+                </div>
+                <div className="bg-white border border-[#E2E7EB] rounded-[8px] p-3 text-xs text-[#25364A] whitespace-pre-wrap">
+                  {productionSummary.entryMenu.greetingPrompt || 'Sin saludo'}
+                </div>
+                <div className="space-y-1.5">
+                  {productionSummary.entryMenu.options
+                    .filter((o) => o.active)
+                    .map((opt, idx) => (
+                      <div key={opt.id} className="text-xs bg-white border border-[#E2E7EB] rounded-[8px] px-3 py-2 flex items-center justify-between gap-2">
+                        <span className="font-medium text-[#25364A]">
+                          {idx + 1}. {opt.optionLabel}
+                        </span>
+                        <span className="text-[#5A6877]">
+                          {opt.targetType === 'handoff'
+                            ? `Atención humana (${opt.handoffLabel ?? 'Sin detalle'})`
+                            : opt.targetFlowName && opt.targetFlowVersionNumber
+                              ? `${opt.targetFlowName} · v${opt.targetFlowVersionNumber}`
+                              : opt.destinationReason ?? 'Destino inválido'}
+                        </span>
+                      </div>
+                    ))}
+                </div>
+              </div>
+
+              {productionSummary.conversations.map((conv) => (
+                <div key={conv.flowKey} className="border border-[#E2E7EB] rounded-[11px] p-4 space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#EDF0F2] pb-2">
+                    <div className="font-semibold text-[#25364A]">
+                      {conv.label}
+                      {conv.latestPublished ? ` · v${conv.latestPublished.versionNumber}` : ''}
+                    </div>
+                    <div className="text-xs text-[#5A6877]">
+                      {conv.latestPublished?.publishedAt
+                        ? `Publicado el ${new Date(conv.latestPublished.publishedAt).toLocaleString('es-ES')}${
+                            conv.latestPublished.publishedByName
+                              ? ` · ${conv.latestPublished.publishedByName}`
+                              : ''
+                          }`
+                        : conv.latestPublished
+                          ? 'Sin registro histórico'
+                          : 'Sin edición publicada'}
+                    </div>
+                  </div>
+
+                  {!conv.latestPublished ? (
+                    <div className="text-xs text-[#5A6877]">
+                      {conv.latestRetired
+                        ? `Última edición v${conv.latestRetired.versionNumber} retirada de producción.`
+                        : 'Esta conversación solo tiene borrador.'}
+                    </div>
+                  ) : (
+                    <div className="space-y-3">
+                      <div className="space-y-2">
+                        {conv.latestPublished.steps.map((st, idx) => (
+                          <div key={st.id} className="p-3 bg-[#F7F8FA] border border-[#E2E7EB] rounded-[8px] text-xs space-y-1">
+                            <div className="font-semibold text-[#25364A]">
+                              {idx + 1}. {st.title?.trim() || `Pregunta ${idx + 1}`} ({STEP_TYPE_LABELS[st.type]})
+                            </div>
+                            <div className="text-[#25364A] whitespace-pre-wrap">{st.prompt}</div>
+                            {st.options && st.options.length > 0 && (
+                              <div className="text-[#5A6877] pt-0.5">
+                                Opciones: {st.options.map((o) => o.label).join(' · ')}
+                              </div>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+
+                      {conv.latestPublished.outOfScriptRules.length > 0 && (
+                        <div className="text-xs space-y-1">
+                          <div className="font-semibold text-[#25364A]">Respuestas rápidas publicadas</div>
+                          {conv.latestPublished.outOfScriptRules.map((rule) => (
+                            <div key={rule.id} className="p-2.5 bg-[#F7F8FA] border border-[#E2E7EB] rounded-[8px]">
+                              <div className="text-[#5A6877]">Palabras: {rule.keywords.join(', ')}</div>
+                              <div className="text-[#25364A] mt-0.5">{rule.response}</div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      {conv.latestPublished.humanHandoffConfig && (
+                        <div className="text-xs bg-[#F7F8FA] border border-[#E2E7EB] rounded-[8px] p-3 space-y-1">
+                          <div className="font-semibold text-[#25364A]">Mensajes de atención humana publicados</div>
+                          <div>Botón: {conv.latestPublished.humanHandoffConfig.buttonLabel}</div>
+                          <div>Confirmación: {conv.latestPublished.humanHandoffConfig.requestConfirmationMessage}</div>
+                          <div>Confirmación final: {conv.latestPublished.humanHandoffConfig.finalConfirmationMessage}</div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+
+            <div className="px-6 py-3.5 border-t border-[#EDF0F2] flex justify-end">
+              <button
+                type="button"
+                onClick={() => setShowPublishedModal(false)}
+                className="min-h-[40px] px-4 py-1.5 text-sm font-semibold text-white bg-[#167D83] rounded-[9px] hover:bg-[#116B70]"
+              >
+                Cerrar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modal 2: Confirm publish entry greeting & menu */}
+      {publishConfirmModal === 'entry' && (() => {
+        const activeDraftOptions = entryProducts.filter((p) => p.active);
+        const blockingProblems: string[] = [];
+        if (entryConfig.enabled && !entryConfig.greetingPrompt.trim()) {
+          blockingProblems.push('El saludo inicial no puede estar vacío.');
+        }
+        if (entryConfig.enabled && activeDraftOptions.length === 0) {
+          blockingProblems.push('Debés mantener al menos una opción activa en el menú.');
+        }
+        for (const opt of activeDraftOptions) {
+          if (opt.targetType === 'handoff') continue;
+          const k = resolveProductFlowKey(opt);
+          const grp = flowGroups.find((g) => g.flowKey === k);
+          if (!k || !grp || !grp.latestPublished) {
+            blockingProblems.push(
+              `La opción «${opt.optionLabel || opt.name}» no apunta a una conversación publicada válida en ${business.name}.`
+            );
+          }
+        }
+        return (
+          <div className="fixed inset-0 z-50 bg-[#1B2531]/45 flex items-center justify-center p-4">
+            <div className="bg-white border border-[#E2E7EB] rounded-[14px] max-w-xl w-full p-6 space-y-4">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <h3 className="text-lg font-semibold text-[#25364A]">
+                    Confirmar publicación de saludo y menú
+                  </h3>
+                  <p className="text-xs text-[#5A6877] mt-0.5">
+                    Revisá exactamente lo que empezará a ejecutarse en WhatsApp.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setPublishConfirmModal(null)}
+                  className="p-1.5 text-[#5A6877] hover:text-[#25364A]"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <div className="p-3.5 bg-[#F7F8FA] border border-[#E2E7EB] rounded-[10px] space-y-2 text-xs">
+                <div>
+                  <span className="font-semibold text-[#25364A]">Estado:</span>{' '}
+                  {entryConfig.enabled ? 'Menú inicial activo' : 'Menú inicial desactivado'}
+                </div>
+                <div>
+                  <span className="font-semibold text-[#25364A]">Saludo a publicar:</span>
+                  <div className="mt-1 p-2.5 bg-white border border-[#E2E7EB] rounded-[8px] text-[#25364A] whitespace-pre-wrap">
+                    {entryConfig.greetingPrompt || '(Vacío)'}
+                  </div>
+                </div>
+                <div>
+                  <span className="font-semibold text-[#25364A]">
+                    Opciones activas ({activeDraftOptions.length}):
+                  </span>
+                  <ul className="mt-1 space-y-1">
+                    {activeDraftOptions.map((opt, idx) => {
+                      const k = resolveProductFlowKey(opt);
+                      const grp = flowGroups.find((g) => g.flowKey === k);
+                      return (
+                        <li key={opt.id} className="text-[#25364A]">
+                          {idx + 1}. <strong>{opt.optionLabel || opt.name}</strong> →{' '}
+                          {opt.targetType === 'handoff'
+                            ? 'Atención humana'
+                            : grp?.latestPublished
+                              ? `${grp.label} (v${grp.latestPublished.versionNumber})`
+                              : 'Sin conversación publicada'}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                </div>
+              </div>
+
+              <div className="p-3 bg-[#EAF5F2] border border-[#D4EAE4] rounded-[10px] text-xs text-[#116B70]">
+                <strong>Alcance:</strong> aplica de inmediato a chats nuevos y contactos que inicien en el menú. Los chats ya iniciados con una conversación abierta conservan su versión hasta reinicio manual.
+              </div>
+
+              {blockingProblems.length > 0 && (
+                <div className="p-3 bg-red-50 border border-red-200 rounded-[10px] text-xs text-red-800 space-y-1">
+                  <div className="font-semibold">No podés publicar hasta corregir lo siguiente:</div>
+                  {blockingProblems.map((p, i) => (
+                    <div key={i}>• {p}</div>
+                  ))}
+                </div>
+              )}
+
+              <div className="flex flex-wrap justify-end gap-2.5 pt-2">
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => setPublishConfirmModal(null)}
+                  className="min-h-[42px] px-4 py-2 text-sm font-medium text-[#25364A] bg-white border border-[#DCE3E8] rounded-[9px] hover:bg-[#F7F8FA]"
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="button"
+                  disabled={busy || blockingProblems.length > 0}
+                  onClick={handleConfirmPublishEntryMenu}
+                  className="inline-flex items-center gap-1.5 min-h-[42px] px-4 py-2 text-sm font-semibold text-white bg-[#167D83] rounded-[9px] hover:bg-[#116B70] disabled:opacity-45"
+                >
+                  <CheckCircle2 className="w-4 h-4" />
+                  <span>{busy ? 'Publicando...' : 'Confirmar y publicar'}</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* Modal 3: Confirm publish conversation */}
+      {publishConfirmModal === 'flow' && (() => {
+        const currentPubVersion = activeGroup?.latestPublished?.versionNumber ?? null;
+        const maxKnownVersion = Math.max(
+          0,
+          draftFlow?.versionNumber ?? 0,
+          ...(activeGroup?.publishedVersions ?? []).map((f) => f.versionNumber),
+          ...(activeGroup?.retiredVersions ?? []).map((f) => f.versionNumber)
+        );
+        const nextVersionNumber = maxKnownVersion + 1;
+        const linkedMenuOptions = (business.products ?? []).filter(
+          (p) => p.active && p.targetType !== 'handoff' && resolveProductFlowKey(p) === effectiveFlowKey
+        );
+        return (
+          <div className="fixed inset-0 z-50 bg-[#1B2531]/45 flex items-center justify-center p-4">
+            <div className="bg-white border border-[#E2E7EB] rounded-[14px] max-w-xl w-full p-6 space-y-4">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <h3 className="text-lg font-semibold text-[#25364A]">
+                    Confirmar publicación de conversación
+                  </h3>
+                  <p className="text-xs text-[#5A6877] mt-0.5">
+                    Verificá el cambio de versión antes de ponerlo en WhatsApp.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setPublishConfirmModal(null)}
+                  className="p-1.5 text-[#5A6877] hover:text-[#25364A]"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <div className="p-3.5 bg-[#F7F8FA] border border-[#E2E7EB] rounded-[10px] space-y-2 text-xs">
+                <div>
+                  <span className="font-semibold text-[#25364A]">Conversación:</span>{' '}
+                  {flowName.trim() || activeGroup?.label || 'Conversación'}
+                </div>
+                <div className="flex flex-wrap items-center gap-4 tabular-nums">
+                  <span>
+                    <strong className="text-[#25364A]">Versión actual en producción:</strong>{' '}
+                    {currentPubVersion !== null ? `v${currentPubVersion}` : 'Sin versión publicada'}
+                  </span>
+                  <span>
+                    <strong className="text-[#116B70]">Nueva versión a publicar:</strong>{' '}
+                    v{nextVersionNumber}
+                  </span>
+                </div>
+                <div>
+                  <span className="font-semibold text-[#25364A]">Preguntas incluidas:</span>{' '}
+                  {steps.length}
+                </div>
+                <div>
+                  <span className="font-semibold text-[#25364A]">Opciones del menú vinculadas:</span>{' '}
+                  {linkedMenuOptions.length > 0
+                    ? linkedMenuOptions.map((o) => o.optionLabel || o.name).join(', ')
+                    : 'Ninguna opción activa del menú publicado apunta hoy a esta conversación'}
+                </div>
+              </div>
+
+              <div className="p-3 bg-[#EAF5F2] border border-[#D4EAE4] rounded-[10px] text-xs text-[#116B70]">
+                <strong>Alcance:</strong> v{nextVersionNumber} aplicará a chats nuevos. Los chats abiertos en curso conservarán su versión fijada hasta que alguien los reinicie desde Atención.
+              </div>
+
+              <div className="flex flex-wrap justify-end gap-2.5 pt-2">
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => setPublishConfirmModal(null)}
+                  className="min-h-[42px] px-4 py-2 text-sm font-medium text-[#25364A] bg-white border border-[#DCE3E8] rounded-[9px] hover:bg-[#F7F8FA]"
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="button"
+                  disabled={busy || steps.length === 0}
+                  onClick={handleConfirmPublishFlow}
+                  className="inline-flex items-center gap-1.5 min-h-[42px] px-4 py-2 text-sm font-semibold text-white bg-[#167D83] rounded-[9px] hover:bg-[#116B70] disabled:opacity-45"
+                >
+                  <CheckCircle2 className="w-4 h-4" />
+                  <span>{busy ? 'Publicando...' : `Confirmar y publicar v${nextVersionNumber}`}</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* Modal 4: Confirm retire live version */}
+      {retireTargetFlow && (
+        <div className="fixed inset-0 z-50 bg-[#1B2531]/45 flex items-center justify-center p-4">
+          <div className="bg-white border border-[#E2E7EB] rounded-[14px] max-w-xl w-full p-6 space-y-4">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h3 className="text-lg font-semibold text-[#25364A]">
+                  Retirar edición v{retireTargetFlow.versionNumber} de producción
+                </h3>
+                <p className="text-xs text-[#5A6877] mt-0.5">
+                  Conversación: {retireTargetFlow.name}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setRetireTargetFlow(null)}
+                className="p-1.5 text-[#5A6877] hover:text-[#25364A]"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-3.5 bg-red-50 border border-red-200 rounded-[10px] text-xs text-red-800 space-y-1.5">
+              <div className="font-semibold">Efecto inmediato en WhatsApp:</div>
+              <div>
+                • La edición v{retireTargetFlow.versionNumber} dejará de ejecutarse tanto en chats nuevos como en chats abiertos.
+              </div>
+              <div>
+                • Los chats abiertos que estaban usando esta edición quedarán en pausa para revisión humana y no se enviará ninguna respuesta equivocada.
+              </div>
+              <div>
+                • Nala nunca retrocede silenciosamente a una edición más antigua (como v1).
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-xs font-semibold text-[#25364A] mb-1">
+                Motivo del retiro (opcional)
+              </label>
+              <input
+                type="text"
+                value={retireReason}
+                onChange={(e) => setRetireReason(e.target.value)}
+                placeholder="Ej: Flujo desactualizado o contenido por corregir"
+                className="w-full min-h-[40px] text-sm border border-[#DCE3E8] rounded-[8px] px-3 py-1.5"
+              />
+            </div>
+
+            <div className="flex flex-wrap justify-end gap-2.5 pt-2">
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => setRetireTargetFlow(null)}
+                className="min-h-[42px] px-4 py-2 text-sm font-medium text-[#25364A] bg-white border border-[#DCE3E8] rounded-[9px] hover:bg-[#F7F8FA]"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={handleConfirmRetireFlow}
+                className="inline-flex items-center gap-1.5 min-h-[42px] px-4 py-2 text-sm font-semibold text-white bg-red-700 rounded-[9px] hover:bg-red-800 disabled:opacity-45"
+              >
+                <Ban className="w-4 h-4" />
+                <span>{busy ? 'Retirando...' : `Retirar v${retireTargetFlow.versionNumber}`}</span>
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

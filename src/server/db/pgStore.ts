@@ -1025,6 +1025,12 @@ export async function saveStoreToPg(client: PoolClient, store: NalasStore): Prom
       outOfScriptPrompt: f.outOfScriptPrompt,
       hideInternalCategorizationInClosure: f.hideInternalCategorizationInClosure,
       humanHandoffConfig: f.humanHandoffConfig,
+      publishedByUserId: f.publishedByUserId,
+      publishedByName: f.publishedByName,
+      retiredAt: f.retiredAt,
+      retiredByUserId: f.retiredByUserId,
+      retiredByName: f.retiredByName,
+      retiredReason: f.retiredReason,
     };
     await client.query(
       `INSERT INTO nalas_flow_versions (
@@ -1233,6 +1239,9 @@ export async function saveStoreToPg(client: PoolClient, store: NalasStore): Prom
       awaitingHumanContactName: s.awaitingHumanContactName,
       awaitingHumanContactPhone: s.awaitingHumanContactPhone,
       awaitingHumanTaskId: s.awaitingHumanTaskId,
+      pausedForReview: s.pausedForReview,
+      pausedReason: s.pausedReason,
+      pausedAt: s.pausedAt,
     };
     await client.query(
       `INSERT INTO nalas_sessions (
@@ -2327,6 +2336,9 @@ export async function persistWasapFlowConversationBundlePg(
       awaitingHumanContactName: s.awaitingHumanContactName,
       awaitingHumanContactPhone: s.awaitingHumanContactPhone,
       awaitingHumanTaskId: s.awaitingHumanTaskId,
+      pausedForReview: s.pausedForReview,
+      pausedReason: s.pausedReason,
+      pausedAt: s.pausedAt,
     };
     queriesExecuted += 1;
     w3.push(

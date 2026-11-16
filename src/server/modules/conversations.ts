@@ -5,17 +5,20 @@ import {
   resolveHumanHandoffConfig,
 } from '../../shared/humanHandoff.ts';
 import type {
+  Business,
   Contact,
   Conversation,
   Environment,
+  FlowVersion,
   HumanHandoffConfig,
   Message,
   NalasStore,
+  RulesetVersion,
   Session,
   Task,
 } from '../../shared/types.ts';
 import { runBasicEngine } from './basicEngine.ts';
-import { getFlowKey, resolvePublishedFlowForKey } from './config.ts';
+import { getFlowKey, inspectPublishedFlowTarget, resolvePublishedFlowForKey } from './config.ts';
 import { appendAudit } from './consumptionAndAudit.ts';
 import { normalizeAndQueueOutgoingMessage } from './integrations.ts';
 import { runProEngine } from './proEngine.ts';
@@ -262,6 +265,14 @@ export function startOrGetSimulatorConversation(
   let pinnedFlowId = biz.activeFlowVersionId;
   let pinnedRulesetId = biz.activeRulesetVersionId;
   const targetFlowKey = params.flowKey?.trim();
+  const activeBizFlow = store.flowVersions.find(
+    (f) => f.id === biz.activeFlowVersionId && f.businessId === biz.id
+  );
+  const preferredForTargetKey =
+    targetFlowKey && activeBizFlow && getFlowKey(activeBizFlow) === targetFlowKey
+      ? activeBizFlow.id
+      : undefined;
+
   if (params.useDraft || params.useEntryDraft) {
     if (env !== 'prueba') {
       throw new Error('Probar borrador solo está permitido en el entorno Prueba.');
@@ -286,7 +297,7 @@ export function startOrGetSimulatorConversation(
           store,
           biz.id,
           targetFlowKey,
-          biz.activeFlowVersionId
+          preferredForTargetKey
         );
         if (pub) pinnedFlowId = pub.id;
       }
@@ -295,7 +306,7 @@ export function startOrGetSimulatorConversation(
         store,
         biz.id,
         targetFlowKey,
-        biz.activeFlowVersionId
+        preferredForTargetKey
       );
       if (pub) pinnedFlowId = pub.id;
     }
@@ -311,7 +322,7 @@ export function startOrGetSimulatorConversation(
       store,
       biz.id,
       targetFlowKey,
-      biz.activeFlowVersionId
+      preferredForTargetKey
     );
     if (pub) {
       pinnedFlowId = pub.id;
@@ -376,6 +387,396 @@ export function startOrGetSimulatorConversation(
   return { conversation, session, contact };
 }
 
+export function pauseConversationForReview(
+  store: NalasStore,
+  params: {
+    conv: Conversation;
+    contact: Contact;
+    session?: Session;
+    reason: string;
+    auditAction?: string;
+    titlePrefix?: string;
+  }
+): Task {
+  const { conv, contact, session, reason } = params;
+  const now = new Date().toISOString();
+
+  conv.control = 'esperando_humano';
+  conv.updatedAt = now;
+
+  if (session) {
+    session.pausedForReview = true;
+    session.pausedReason = reason;
+    session.pausedAt = now;
+    session.awaitingEntryProductSelection = false;
+    session.awaitingUnconfiguredProductAction = false;
+    session.updatedAt = now;
+  }
+
+  for (const evt of store.outboxEvents) {
+    if (
+      evt.businessId === conv.businessId &&
+      evt.conversationId === conv.id &&
+      (evt.deliveryStatus === 'pendiente' || evt.deliveryStatus === 'fallido')
+    ) {
+      evt.nextRetryAt = undefined;
+      evt.lastError = `Pausado y excluido: ${reason}`;
+      evt.updatedAt = now;
+    }
+  }
+
+  let task = store.tasks.find(
+    (t) =>
+      t.businessId === conv.businessId &&
+      t.conversationId === conv.id &&
+      t.status !== 'resuelta'
+  );
+  if (!task) {
+    const validPhone = normalizeInternationalPhone(contact.phone);
+    const validEmail = isValidEmailAddress(contact.email) ? contact.email!.trim() : null;
+    const hasUsableContact = Boolean(validPhone || validEmail);
+    const displayName = hasValidContactName(contact.fullName)
+      ? contact.fullName!.trim()
+      : 'Visitante sin nombre';
+
+    task = {
+      id: `task_${Date.now()}_rev_${Math.random().toString(36).slice(2, 6)}`,
+      businessId: conv.businessId,
+      environment: conv.environment,
+      conversationId: conv.id,
+      contactId: contact.id,
+      productId: conv.productId ?? session?.productId,
+      productName: conv.productName ?? session?.productName,
+      title: `${params.titlePrefix ?? 'Revisión requerida'} — ${displayName}`,
+      contextSummary: reason,
+      hasUsableContact,
+      contactWarning: hasUsableContact
+        ? undefined
+        : 'Sin teléfono ni correo utilizable: no se ha enviado notificación externa ni se promete localizar al contacto.',
+      status: 'pendiente',
+      createdAt: now,
+      updatedAt: now,
+    };
+    store.tasks.unshift(task);
+  }
+
+  appendAudit(store, {
+    businessId: conv.businessId,
+    environment: conv.environment,
+    actorUserId: 'sistema',
+    module: 'conversaciones',
+    action: params.auditAction ?? 'bloqueo_flujo_invalido_o_retirado',
+    detail: `Conversación ${conv.id} pausada para revisión: ${reason}`,
+    correlationId: conv.id,
+  });
+
+  return task;
+}
+
+export function validateLiveFlowForConversation(
+  store: NalasStore,
+  conv: Conversation,
+  session: Session,
+  business: Business
+):
+  | { ok: true; flow?: FlowVersion; ruleset: RulesetVersion }
+  | { ok: false; reason: string } {
+  const ruleset = store.rulesetVersions.find(
+    (r) => r.id === session.pinnedRulesetVersionId && r.businessId === conv.businessId
+  );
+  if (!ruleset) {
+    return {
+      ok: false,
+      reason: 'Conjunto de criterios inválido o perteneciente a otro negocio.',
+    };
+  }
+
+  const useDraftEntry =
+    conv.environment === 'prueba' && Boolean(session.useEntryDraft) && Boolean(business.entryDraft);
+  const entryCfg = useDraftEntry ? business.entryDraft?.entryConfig : business.entryConfig;
+  const entryProducts = useDraftEntry
+    ? business.entryDraft?.products ?? []
+    : business.products ?? [];
+
+  const isEntryMenuStart =
+    !session.currentStepId && !session.productId && Boolean(entryCfg?.enabled);
+
+  if (isEntryMenuStart) {
+    if (!entryCfg?.greetingPrompt?.trim()) {
+      return {
+        ok: false,
+        reason: 'El saludo del menú general publicado está vacío.',
+      };
+    }
+
+    const activeProducts = entryProducts.filter((p) => p.active && Boolean(p.optionLabel?.trim()));
+    const hasPlayableOption = activeProducts.some((p) => {
+      if (p.targetType === 'handoff') return true;
+      if (useDraftEntry && p.flowKey) {
+        const draftOrPub =
+          store.flowVersions.find(
+            (f) =>
+              f.businessId === business.id &&
+              f.status === 'borrador' &&
+              getFlowKey(f) === p.flowKey &&
+              f.steps.length > 0
+          ) ??
+          inspectPublishedFlowTarget(store, business.id, {
+            flowKey: p.flowKey,
+            flowVersionId: p.flowVersionId,
+          }).flow;
+        return Boolean(draftOrPub);
+      }
+      if (p.flowVersionId || p.flowKey) {
+        return inspectPublishedFlowTarget(store, business.id, {
+          flowKey: p.flowKey,
+          flowVersionId: p.flowVersionId,
+        }).ok;
+      }
+      return false;
+    });
+
+    if (!hasPlayableOption) {
+      return {
+        ok: false,
+        reason:
+          'El menú general publicado no tiene ninguna opción activa con destino publicado válido.',
+      };
+    }
+
+    // Fallback flow reference for metadata/handoff messages if pinned flow still exists in business
+    const fallbackFlow = store.flowVersions.find(
+      (f) => f.id === session.pinnedFlowVersionId && f.businessId === conv.businessId
+    );
+    const placeholderFlow: FlowVersion = fallbackFlow ?? {
+      id: session.pinnedFlowVersionId || 'entry_menu_context',
+      businessId: conv.businessId,
+      flowKey: 'entry_menu',
+      versionNumber: 1,
+      name: 'Menú general',
+      status: 'publicada',
+      steps: [],
+      outOfScriptRules: [],
+      createdAt: business.createdAt,
+    };
+    return { ok: true, flow: placeholderFlow, ruleset };
+  }
+
+  const flow = store.flowVersions.find((f) => f.id === session.pinnedFlowVersionId);
+  if (!flow) {
+    return {
+      ok: false,
+      reason: 'La versión de conversación fijada en este chat ya no existe.',
+    };
+  }
+  if (flow.businessId !== conv.businessId) {
+    return {
+      ok: false,
+      reason: 'Destino bloqueado por pertenecer a otro negocio.',
+    };
+  }
+  if (flow.status === 'retirada') {
+    return {
+      ok: false,
+      reason:
+        flow.retiredReason ||
+        `La versión v${flow.versionNumber} de "${flow.name}" fue retirada de producción.`,
+    };
+  }
+  if (conv.environment === 'produccion' && flow.status !== 'publicada') {
+    return {
+      ok: false,
+      reason: `La conversación "${flow.name}" es un borrador y no puede ejecutarse en producción.`,
+    };
+  }
+  if (flow.steps.length === 0) {
+    return {
+      ok: false,
+      reason: `La conversación "${flow.name}" no tiene pasos configurados.`,
+    };
+  }
+
+  return { ok: true, flow, ruleset };
+}
+
+export function restartConversationWithPublished(
+  store: NalasStore,
+  businessId: string,
+  actorUserId: string,
+  conversationId: string
+): {
+  conversation: Conversation;
+  session: Session;
+  pausedOutboxCount: number;
+} {
+  const conv = store.conversations.find(
+    (c) => c.id === conversationId && c.businessId === businessId
+  );
+  if (!conv) {
+    const err = new Error('Conversación no encontrada en este negocio.');
+    (err as Error & { statusCode?: number }).statusCode = 404;
+    throw err;
+  }
+  const biz = store.businesses.find((b) => b.id === businessId);
+  if (!biz) throw new Error('Negocio no encontrado.');
+  const assistant = store.assistants.find(
+    (a) => a.id === conv.assistantId && a.businessId === businessId
+  );
+  if (!assistant) throw new Error('Asistente no encontrado para esta conversación.');
+  const session = store.sessions.find((s) => s.conversationId === conv.id);
+  if (!session) throw new Error('Sesión de conversación no encontrada.');
+
+  const activeRuleset = store.rulesetVersions.find(
+    (r) =>
+      r.id === biz.activeRulesetVersionId &&
+      r.businessId === businessId &&
+      r.status === 'publicada'
+  );
+  if (!activeRuleset) {
+    const err = new Error(
+      'No hay un conjunto de criterios publicado activo en este negocio para reiniciar el chat.'
+    );
+    (err as Error & { statusCode?: number }).statusCode = 400;
+    throw err;
+  }
+
+  const entryEnabled = Boolean(biz.entryConfig?.enabled);
+  let targetFlowId: string | undefined;
+
+  if (entryEnabled) {
+    if (!biz.entryConfig?.greetingPrompt?.trim()) {
+      const err = new Error(
+        'El menú general publicado tiene el saludo vacío. Publicalo correctamente antes de reiniciar chats.'
+      );
+      (err as Error & { statusCode?: number }).statusCode = 400;
+      throw err;
+    }
+    const activeProducts = (biz.products ?? []).filter(
+      (p) => p.active && Boolean(p.optionLabel?.trim())
+    );
+    let firstValidFlowId: string | undefined;
+    let hasValidTarget = false;
+    for (const prod of activeProducts) {
+      if (prod.targetType === 'handoff') {
+        hasValidTarget = true;
+        continue;
+      }
+      const insp = inspectPublishedFlowTarget(store, businessId, {
+        flowKey: prod.flowKey,
+        flowVersionId: prod.flowVersionId,
+      });
+      if (insp.ok && insp.flow) {
+        hasValidTarget = true;
+        if (!firstValidFlowId) firstValidFlowId = insp.flow.id;
+      }
+    }
+    if (!hasValidTarget) {
+      const err = new Error(
+        'El menú general publicado no tiene ninguna opción activa con destino publicado válido. Revisá Mi asistente antes de reiniciar este chat.'
+      );
+      (err as Error & { statusCode?: number }).statusCode = 400;
+      throw err;
+    }
+    const activeCheck = inspectPublishedFlowTarget(store, businessId, {
+      flowVersionId: biz.activeFlowVersionId,
+    });
+    if (activeCheck.ok && activeCheck.flow) {
+      targetFlowId = activeCheck.flow.id;
+    } else if (firstValidFlowId) {
+      targetFlowId = firstValidFlowId;
+    } else {
+      const anyPublished = store.flowVersions
+        .filter(
+          (f) => f.businessId === businessId && f.status === 'publicada' && f.steps.length > 0
+        )
+        .sort((a, b) => b.versionNumber - a.versionNumber)[0];
+      targetFlowId = anyPublished?.id ?? biz.activeFlowVersionId;
+    }
+  } else {
+    const activeCheck = inspectPublishedFlowTarget(store, businessId, {
+      flowVersionId: biz.activeFlowVersionId,
+    });
+    if (!activeCheck.ok || !activeCheck.flow) {
+      const err = new Error(
+        activeCheck.message ??
+          'No hay una conversación publicada activa en este negocio para reiniciar el chat.'
+      );
+      (err as Error & { statusCode?: number }).statusCode = 400;
+      throw err;
+    }
+    targetFlowId = activeCheck.flow.id;
+  }
+
+  const now = new Date().toISOString();
+  let pausedOutboxCount = 0;
+  for (const evt of store.outboxEvents) {
+    if (
+      evt.businessId === businessId &&
+      evt.conversationId === conv.id &&
+      (evt.deliveryStatus === 'pendiente' || evt.deliveryStatus === 'fallido')
+    ) {
+      evt.nextRetryAt = undefined;
+      evt.lastError = 'Pausado y excluido por reinicio manual con versión publicada.';
+      evt.updatedAt = now;
+      pausedOutboxCount += 1;
+    }
+  }
+
+  conv.pinnedFlowVersionId = targetFlowId;
+  conv.pinnedRulesetVersionId = activeRuleset.id;
+  conv.pinnedProPolicyVersionId = biz.activeProPolicyVersionId;
+  conv.productId = undefined;
+  conv.productName = undefined;
+  conv.assignedUserId = undefined;
+  conv.control = 'bot';
+  conv.activeEngine =
+    assistant.activeMode === 'PRO' && biz.subscription.proApproved ? 'PRO' : 'BASICA';
+  conv.updatedAt = now;
+
+  session.pinnedFlowVersionId = targetFlowId;
+  session.pinnedRulesetVersionId = activeRuleset.id;
+  session.pinnedProPolicyVersionId = biz.activeProPolicyVersionId;
+  session.productId = undefined;
+  session.productName = undefined;
+  session.currentStepId = null;
+  session.stepHistory = [];
+  session.captureStatus = 'borrador';
+  session.answers = {};
+  session.enteredViaEntryMenu = false;
+  session.useEntryDraft = false;
+  session.awaitingEntryProductSelection = false;
+  session.awaitingUnconfiguredProductAction = false;
+  session.awaitingOutOfScriptChoice = false;
+  session.awaitingContextSubmode = null;
+  session.awaitingCorrectionFieldSelection = false;
+  session.correctionReturnToStepId = null;
+  session.correctionQueue = [];
+  session.awaitingHumanContactName = false;
+  session.awaitingHumanContactPhone = false;
+  session.awaitingHumanTaskId = undefined;
+  session.pausedForReview = false;
+  session.pausedReason = undefined;
+  session.pausedAt = undefined;
+  session.confirmedIdempotencyKey = undefined;
+  session.updatedAt = now;
+
+  appendAudit(store, {
+    businessId,
+    environment: conv.environment,
+    actorUserId,
+    module: 'conversaciones',
+    action: 'reiniciar_chat_version_publicada',
+    detail: `Conversación ${conv.id} reiniciada con la configuración publicada vigente (${targetFlowId}). Historial y contacto conservados; salidas previas excluidas: ${pausedOutboxCount}; mensajes enviados al reiniciar: 0.`,
+    correlationId: conv.id,
+  });
+
+  return {
+    conversation: conv,
+    session,
+    pausedOutboxCount,
+  };
+}
+
 export function sendInitialBasicGreeting(
   store: NalasStore,
   conversationId: string
@@ -383,25 +784,45 @@ export function sendInitialBasicGreeting(
   const conv = store.conversations.find((c) => c.id === conversationId);
   if (!conv || conv.activeEngine !== 'BASICA') return undefined;
 
+  const biz = store.businesses.find((b) => b.id === conv.businessId);
   const conn = store.channelConnections.find((c) => c.id === conv.connectionId);
   const contact = store.contacts.find((c) => c.id === conv.contactId);
   const session = store.sessions.find((s) => s.conversationId === conv.id);
-  const flow = session
-    ? store.flowVersions.find((f) => f.id === session.pinnedFlowVersionId)
-    : undefined;
-  const ruleset = session
-    ? store.rulesetVersions.find((r) => r.id === session.pinnedRulesetVersionId)
-    : undefined;
-  if (!conn || !contact || !session || !flow || !ruleset) return undefined;
+  if (!biz || !conn || !contact || !session) return undefined;
+
+  const validation = validateLiveFlowForConversation(store, conv, session, biz);
+  if (!validation.ok || !validation.flow) {
+    pauseConversationForReview(store, {
+      conv,
+      contact,
+      session,
+      reason: validation.ok ? 'Flujo no disponible.' : validation.reason,
+      titlePrefix: 'Flujo inválido o retirado',
+    });
+    return undefined;
+  }
 
   const basicOut = runBasicEngine({
     store,
     session,
     contact,
-    flow,
-    ruleset,
+    flow: validation.flow,
+    ruleset: validation.ruleset,
     inputText: '',
   });
+
+  if (basicOut.configInvalid) {
+    pauseConversationForReview(store, {
+      conv,
+      contact,
+      session,
+      reason:
+        basicOut.configInvalidReason ??
+        'La configuración publicada para el inicio del chat es inválida o está incompleta.',
+      titlePrefix: 'Menú o conversación sin publicar',
+    });
+    return undefined;
+  }
 
   const botMsg: Message = {
     id: `msg_${Date.now()}_bas_${Math.random().toString(36).slice(2, 5)}`,
@@ -837,19 +1258,53 @@ export async function processInboundMessage(
   }
 
   // Motor BÁSICA (Strictly 0 AI calls!)
-  const flow = store.flowVersions.find((f) => f.id === session.pinnedFlowVersionId)!;
-  const ruleset = store.rulesetVersions.find((r) => r.id === session.pinnedRulesetVersionId)!;
+  const validation = validateLiveFlowForConversation(store, conv, session, biz);
+  if (!validation.ok || !validation.flow) {
+    const reviewTask = pauseConversationForReview(store, {
+      conv,
+      contact,
+      session,
+      reason: validation.ok ? 'Versión de flujo no disponible.' : validation.reason,
+      titlePrefix: 'Flujo inválido o retirado',
+    });
+    return {
+      deduplicated: false,
+      botReplied: false,
+      aiCalled: false,
+      handoffTask: reviewTask,
+      reason: validation.ok ? 'Versión de flujo no disponible.' : validation.reason,
+    };
+  }
 
   const basicOut = runBasicEngine({
     store,
     session,
     contact,
-    flow,
-    ruleset,
+    flow: validation.flow,
+    ruleset: validation.ruleset,
     inputText: params.text,
     selectedOptionId: params.selectedOptionId,
     idempotencyKey: params.idempotencyKey,
   });
+
+  if (basicOut.configInvalid) {
+    const reviewTask = pauseConversationForReview(store, {
+      conv,
+      contact,
+      session,
+      reason:
+        basicOut.configInvalidReason ??
+        'Destino de conversación inválido, borrador o retirado.',
+      titlePrefix: 'Flujo inválido o retirado',
+    });
+    return {
+      deduplicated: false,
+      botReplied: false,
+      aiCalled: false,
+      handoffTask: reviewTask,
+      reason: basicOut.configInvalidReason ?? 'Destino de conversación inválido.',
+    };
+  }
 
   let handoffTask: Task | undefined;
   let finalReplyText = basicOut.replyText;

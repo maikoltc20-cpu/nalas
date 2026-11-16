@@ -7,8 +7,10 @@ import type {
   Environment,
   FlowStep,
   HumanHandoffConfig,
+  NalasStore,
   Opportunity,
   OutOfScriptRule,
+  ProductionChannelSummary,
   ProPolicyVersion,
   RulesetVersion,
 } from '../shared/types.ts';
@@ -42,10 +44,12 @@ import {
 } from './modules/commercial.ts';
 import {
   createFlowConversation,
+  getAssistantProductionSummary,
   getFlowKey,
   publishEntryMenu,
   publishFlowDraft,
   publishRuleset,
+  retireFlowVersion,
   rollbackFlowVersion,
   saveEntryMenuDraft,
   saveFlowDraft,
@@ -70,9 +74,11 @@ import {
 import { resolveSafeAppBaseUrl } from './modules/urlHelper.ts';
 import {
   processInboundMessage,
+  restartConversationWithPublished,
   runSerializedForConversation,
   sendInitialBasicGreeting,
   startOrGetSimulatorConversation,
+  validateLiveFlowForConversation,
 } from './modules/conversations.ts';
 import {
   listAvailableAdapters,
@@ -1154,6 +1160,109 @@ webApp.post('/api/flows/draft', async (c) => {
   }
 });
 
+async function buildRuntimeProductionSummaryInput(
+  store: NalasStore,
+  businessId: string,
+  requestOrigin?: string
+): Promise<{
+  channels: ProductionChannelSummary[];
+  runtime: {
+    wasapflowOutboundEnabled: boolean;
+    metaOutboundEnabled: boolean;
+    metaTestOutboundEnabled: boolean;
+  };
+}> {
+  const prodConns = store.channelConnections.filter(
+    (cn) => cn.businessId === businessId && cn.environment === 'produccion'
+  );
+  const hasWasapFlow = prodConns.some((cn) => cn.id === WASAPFLOW_CONNECTION_ID);
+  const hasMeta = prodConns.some((cn) => cn.id !== WASAPFLOW_CONNECTION_ID);
+
+  const [wasapOverview, metaCfg] = await Promise.all([
+    hasWasapFlow ? getWasapFlowOverview(requestOrigin).catch(() => null) : Promise.resolve(null),
+    hasMeta ? getMetaIntegrationConfig(requestOrigin).catch(() => null) : Promise.resolve(null),
+  ]);
+
+  const wasapflowOutboundEnabled = Boolean(wasapOverview?.outboundEnabled);
+  const metaOutboundEnabled = Boolean(metaCfg?.outboundEnabled ?? isMetaOutboundEnabled());
+  const metaTestOutboundEnabled = Boolean(metaCfg?.channelBindings?.testChannel?.outboundEnabled);
+
+  const channels = prodConns.map((conn): ProductionChannelSummary => {
+    if (conn.id === WASAPFLOW_CONNECTION_ID) {
+      const state = wasapOverview?.connectionState;
+      const connected = state?.status === 'conectado' || conn.status === 'activa';
+      return {
+        connectionId: conn.id,
+        provider: 'wasapflow',
+        displayName: conn.displayName,
+        phoneNumber: state?.displayPhoneNumber || conn.destinationAddress || null,
+        connectionStatus: connected ? 'conectado' : state?.status === 'error' ? 'error' : 'pendiente',
+        outboundEnabled: wasapflowOutboundEnabled,
+        outboundLabel: wasapflowOutboundEnabled ? 'Envíos activos' : 'Envíos pausados',
+        detail: state?.statusReason ?? conn.implementationStatus,
+      };
+    }
+
+    if (conn.id === 'conn_nexo_wa_prod') {
+      const state = metaCfg?.embeddedSignup?.connectionState;
+      return {
+        connectionId: conn.id,
+        provider: 'meta',
+        displayName: conn.displayName,
+        phoneNumber: state?.displayPhoneNumber || conn.destinationAddress || null,
+        connectionStatus:
+          state?.status === 'conectado'
+            ? 'conectado'
+            : state?.status === 'error'
+              ? 'error'
+              : conn.status === 'activa'
+                ? 'conectado'
+                : 'pendiente',
+        outboundEnabled: metaOutboundEnabled,
+        outboundLabel: metaOutboundEnabled ? 'Envíos activos' : 'Envíos pausados',
+        detail: conn.implementationStatus,
+      };
+    }
+
+    return {
+      connectionId: conn.id,
+      provider: conn.adapterId.includes('wa') ? 'meta' : 'otro',
+      displayName: conn.displayName,
+      phoneNumber: conn.destinationAddress || null,
+      connectionStatus: conn.status === 'activa' ? 'conectado' : 'pendiente',
+      outboundEnabled: metaOutboundEnabled,
+      outboundLabel: metaOutboundEnabled ? 'Envíos activos' : 'Envíos pausados',
+      detail: conn.implementationStatus,
+    };
+  });
+
+  return {
+    channels,
+    runtime: {
+      wasapflowOutboundEnabled,
+      metaOutboundEnabled,
+      metaTestOutboundEnabled,
+    },
+  };
+}
+
+webApp.get('/api/assistant/production-summary', async (c) => {
+  try {
+    const { userId, businessId } = getActorContext(c);
+    const store = await readStore();
+    resolveActorContext(store, userId, businessId);
+    const runtimeInput = await buildRuntimeProductionSummaryInput(
+      store,
+      businessId,
+      resolveSafeAppBaseUrl(c.req.url)
+    );
+    const summary = getAssistantProductionSummary(store, businessId, runtimeInput);
+    return c.json(summary);
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
 webApp.post('/api/flows/publish', async (c) => {
   try {
     const { userId, businessId } = getActorContext(c);
@@ -1168,7 +1277,24 @@ webApp.post('/api/flows/publish', async (c) => {
         typeof body.flowKey === 'string' ? body.flowKey : undefined
       );
     });
-    return c.json(result);
+    const verifiedStore = await readStore();
+    const persisted = verifiedStore.flowVersions.find(
+      (f) => f.id === result.published.id && f.businessId === businessId && f.status === 'publicada'
+    );
+    if (!persisted) {
+      throw new Error('No se pudo verificar la versión publicada después de guardarla en el servidor.');
+    }
+    const runtimeInput = await buildRuntimeProductionSummaryInput(
+      verifiedStore,
+      businessId,
+      resolveSafeAppBaseUrl(c.req.url)
+    );
+    const verifiedSummary = getAssistantProductionSummary(
+      verifiedStore,
+      businessId,
+      runtimeInput
+    );
+    return c.json({ published: persisted, nextDraft: result.nextDraft, verifiedSummary });
   } catch (err) {
     return errorResponse(err);
   }
@@ -1214,7 +1340,15 @@ webApp.post('/api/entry-menu/publish', async (c) => {
           : undefined
       );
     });
-    return c.json(updated);
+    const verifiedStore = await readStore();
+    const persistedBiz = verifiedStore.businesses.find((b) => b.id === businessId);
+    if (
+      !persistedBiz ||
+      persistedBiz.entryConfig?.publishedAt !== updated.entryConfig?.publishedAt
+    ) {
+      throw new Error('No se pudo verificar el menú publicado después de guardarlo en el servidor.');
+    }
+    return c.json(persistedBiz);
   } catch (err) {
     return errorResponse(err);
   }
@@ -1230,6 +1364,49 @@ webApp.post('/api/flows/:flowVersionId/rollback', async (c) => {
       return rollbackFlowVersion(store, businessId, userId, flowVersionId);
     });
     return c.json(biz);
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.post('/api/flows/:flowVersionId/retire', async (c) => {
+  try {
+    const { userId, businessId } = getActorContext(c);
+    const flowVersionId = c.req.param('flowVersionId');
+    const body = (await c.req.json().catch(() => ({}))) as { reason?: string };
+    const result = await withStoreTransaction((store) => {
+      const ctx = resolveActorContext(store, userId, businessId);
+      assertPermission(ctx, 'activateVersions');
+      return retireFlowVersion(
+        store,
+        businessId,
+        userId,
+        flowVersionId,
+        typeof body.reason === 'string' ? body.reason : undefined
+      );
+    });
+    const verifiedStore = await readStore();
+    const persistedRetired = verifiedStore.flowVersions.find(
+      (f) => f.id === flowVersionId && f.businessId === businessId && f.status === 'retirada'
+    );
+    if (!persistedRetired) {
+      throw new Error('No se pudo verificar el retiro de la versión en el servidor.');
+    }
+    const runtimeInput = await buildRuntimeProductionSummaryInput(
+      verifiedStore,
+      businessId,
+      resolveSafeAppBaseUrl(c.req.url)
+    );
+    const verifiedSummary = getAssistantProductionSummary(
+      verifiedStore,
+      businessId,
+      runtimeInput
+    );
+    return c.json({
+      ...result,
+      retiredFlow: persistedRetired,
+      verifiedSummary,
+    });
   } catch (err) {
     return errorResponse(err);
   }
@@ -2179,9 +2356,27 @@ webApp.post('/api/conversations/:conversationId/handoff/resume-bot', async (c) =
         );
         const biz = store.businesses.find((b) => b.id === businessId)!;
         const assistant = store.assistants.find((a) => a.id === found.assistantId)!;
+        const ses = store.sessions.find((s) => s.conversationId === found.id);
 
-        found.activeEngine =
+        const nextEngine =
           assistant.activeMode === 'PRO' && biz.subscription.proApproved ? 'PRO' : 'BASICA';
+
+        if (nextEngine === 'BASICA' && ses) {
+          const check = validateLiveFlowForConversation(store, found, ses, biz);
+          if (!check.ok) {
+            const err = new Error(
+              `No podés reanudar el bot directamente: ${check.reason} Usá "Reiniciar con la versión publicada".`
+            );
+            (err as Error & { statusCode?: number }).statusCode = 400;
+            throw err;
+          }
+          ses.pausedForReview = false;
+          ses.pausedReason = undefined;
+          ses.pausedAt = undefined;
+          ses.updatedAt = new Date().toISOString();
+        }
+
+        found.activeEngine = nextEngine;
         found.control = 'bot';
         found.updatedAt = new Date().toISOString();
 
@@ -2198,6 +2393,23 @@ webApp.post('/api/conversations/:conversationId/handoff/resume-bot', async (c) =
       })
     );
     return c.json(conv);
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.post('/api/conversations/:conversationId/restart-published', async (c) => {
+  try {
+    const { userId, businessId } = getActorContext(c);
+    const conversationId = c.req.param('conversationId');
+    const result = await runSerializedForConversation(conversationId, () =>
+      withStoreTransaction((store) => {
+        const ctx = resolveActorContext(store, userId, businessId);
+        assertPermission(ctx, 'handleHumanQueue');
+        return restartConversationWithPublished(store, businessId, userId, conversationId);
+      })
+    );
+    return c.json(result);
   } catch (err) {
     return errorResponse(err);
   }

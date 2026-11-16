@@ -22,6 +22,7 @@ import type {
   Opportunity,
   OutboxEvent,
   OutOfScriptRule,
+  ProductionSummary,
   ProPolicyVersion,
   RulesetVersion,
   Session,
@@ -281,8 +282,15 @@ export const nalasApi = {
       { method: 'POST', body: JSON.stringify(payload) }
     );
   },
+  getProductionSummary(ctx: ApiContext) {
+    return apiFetch<ProductionSummary>('/api/assistant/production-summary', ctx);
+  },
   publishFlow(ctx: ApiContext, flowKey?: string) {
-    return apiFetch<{ published: FlowVersion; nextDraft: FlowVersion }>('/api/flows/publish', ctx, {
+    return apiFetch<{
+      published: FlowVersion;
+      nextDraft: FlowVersion;
+      verifiedSummary?: ProductionSummary;
+    }>('/api/flows/publish', ctx, {
       method: 'POST',
       body: JSON.stringify(flowKey ? { flowKey } : {}),
     });
@@ -309,6 +317,17 @@ export const nalasApi = {
     return apiFetch(`/api/flows/${flowVersionId}/rollback`, ctx, {
       method: 'POST',
       body: JSON.stringify({}),
+    });
+  },
+  retireFlowVersion(ctx: ApiContext, flowVersionId: string, reason?: string) {
+    return apiFetch<{
+      retiredFlow: FlowVersion;
+      affectedConversationIds: string[];
+      pausedOutboxCount: number;
+      verifiedSummary?: ProductionSummary;
+    }>(`/api/flows/${flowVersionId}/retire`, ctx, {
+      method: 'POST',
+      body: JSON.stringify(reason ? { reason } : {}),
     });
   },
   saveRulesetDraft(
@@ -635,6 +654,16 @@ export const nalasApi = {
   },
   resumeBot(ctx: ApiContext, conversationId: string) {
     return apiFetch(`/api/conversations/${conversationId}/handoff/resume-bot`, ctx, {
+      method: 'POST',
+      body: JSON.stringify({}),
+    });
+  },
+  restartConversationWithPublished(ctx: ApiContext, conversationId: string) {
+    return apiFetch<{
+      conversation: Conversation;
+      session: Session;
+      pausedOutboxCount: number;
+    }>(`/api/conversations/${conversationId}/restart-published`, ctx, {
       method: 'POST',
       body: JSON.stringify({}),
     });

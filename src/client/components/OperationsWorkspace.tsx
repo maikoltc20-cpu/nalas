@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
   AlertCircle,
+  AlertTriangle,
   ArrowLeft,
   ArrowRight,
   Calendar,
@@ -13,6 +14,7 @@ import {
   MessageCircle,
   Pencil,
   Play,
+  RotateCcw,
   Search,
   Send,
   UserCheck,
@@ -454,6 +456,7 @@ export function OperationsWorkspace({
   const [leadsPage, setLeadsPage] = useState(1);
   const [tasksExpanded, setTasksExpanded] = useState(false);
   const [tasksPage, setTasksPage] = useState(1);
+  const [restartConfirmConvId, setRestartConfirmConvId] = useState<string | null>(null);
 
   useEffect(() => {
     setProductFilter('todos');
@@ -468,6 +471,7 @@ export function OperationsWorkspace({
     setLeadsFilter('sin_atender');
     setLeadsPage(1);
     setTasksPage(1);
+    setRestartConfirmConvId(null);
   }, [business.id, ctx.environment, view]);
 
   useEffect(() => {
@@ -510,6 +514,10 @@ export function OperationsWorkspace({
     () => new Map(scoped.sessions.map((s) => [s.conversationId, s])),
     [scoped.sessions]
   );
+  const flowVersionsById = useMemo(
+    () => new Map(scoped.flowVersions.map((f) => [f.id, f])),
+    [scoped.flowVersions]
+  );
   const oppByLeadId = useMemo(() => {
     const map = new Map<string, Opportunity>();
     for (const o of scoped.opportunities) {
@@ -519,6 +527,62 @@ export function OperationsWorkspace({
     }
     return map;
   }, [scoped.opportunities]);
+
+  function getConversationFlowMeta(conv: Conversation, session?: Session) {
+    const pinnedId = session?.pinnedFlowVersionId || conv.pinnedFlowVersionId;
+    const pinnedFlow = pinnedId ? flowVersionsById.get(pinnedId) : undefined;
+    const pinnedKey =
+      pinnedFlow?.flowKey?.trim() ||
+      (pinnedFlow?.businessId === 'biz_nexo' ? 'opting' : pinnedFlow ? 'default' : undefined);
+
+    const groupVersions = pinnedKey
+      ? scoped.flowVersions
+          .filter(
+            (f) =>
+              (f.flowKey?.trim() || (f.businessId === 'biz_nexo' ? 'opting' : 'default')) ===
+              pinnedKey
+          )
+          .filter((f) => f.status !== 'borrador')
+          .sort((a, b) => b.versionNumber - a.versionNumber)
+      : [];
+
+    const topNonDraft = groupVersions[0];
+    const currentPublished =
+      topNonDraft && topNonDraft.status === 'publicada' ? topNonDraft : undefined;
+    const latestIsRetired = topNonDraft?.status === 'retirada';
+
+    const conversationName =
+      conv.productName?.trim() ||
+      pinnedFlow?.name?.replace(/\s+v\d+$/i, '').trim() ||
+      currentPublished?.name?.replace(/\s+v\d+$/i, '').trim() ||
+      'Conversación general';
+
+    const isPinnedRetired = pinnedFlow?.status === 'retirada';
+    const isPausedForReview = Boolean(session?.pausedForReview);
+    const isOutdated = Boolean(
+      pinnedFlow &&
+        currentPublished &&
+        pinnedFlow.id !== currentPublished.id &&
+        !isPinnedRetired
+    );
+
+    return {
+      conversationName,
+      pinnedFlow,
+      currentPublished,
+      latestIsRetired,
+      isPinnedRetired,
+      isPausedForReview,
+      pausedReason: session?.pausedReason,
+      isOutdated,
+      pinnedLabel: pinnedFlow ? `v${pinnedFlow.versionNumber}` : 'Sin versión',
+      currentPublishedLabel: currentPublished
+        ? `v${currentPublished.versionNumber}`
+        : latestIsRetired
+          ? 'Retirada'
+          : 'Sin publicar',
+    };
+  }
 
   const queryLower = searchQuery.trim().toLowerCase();
   const matchesProduct = (name?: string) =>
@@ -715,6 +779,26 @@ export function OperationsWorkspace({
       onNotice('Conversación devuelta al asistente.');
     } catch (e) {
       onError(e instanceof Error ? e.message : 'No se pudo devolver al asistente.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleConfirmRestartPublished(convId: string) {
+    setBusy(true);
+    try {
+      await nalasApi.restartConversationWithPublished(ctx, convId);
+      setRestartConfirmConvId(null);
+      await onRefresh();
+      onNotice(
+        'Chat reiniciado con la versión publicada vigente. Historial conservado y 0 mensajes enviados.'
+      );
+    } catch (e) {
+      onError(
+        e instanceof Error
+          ? e.message
+          : 'No se pudo reiniciar el chat con la versión publicada.'
+      );
     } finally {
       setBusy(false);
     }
@@ -1086,6 +1170,8 @@ export function OperationsWorkspace({
                   const hasOpp =
                     scoped.opportunities.some((o) => o.conversationId === conv.id) ||
                     scoped.leads.some((l) => l.conversationId === conv.id);
+                  const convSession = sessionsByConversationId.get(conv.id);
+                  const flowMeta = getConversationFlowMeta(conv, convSession);
 
                   return (
                     <button
@@ -1112,6 +1198,10 @@ export function OperationsWorkspace({
                           })}
                         </span>
                       </div>
+                      <div className="mt-1 text-[11px] text-[#5A6877] truncate tabular-nums">
+                        {flowMeta.conversationName} · Fijada: {flowMeta.pinnedLabel} · Publicada:{' '}
+                        {flowMeta.currentPublishedLabel}
+                      </div>
                       {lastMsg && (
                         <p className="mt-1 text-xs text-[#5A6877] line-clamp-1">
                           {lastMsg.text}
@@ -1133,6 +1223,21 @@ export function OperationsWorkspace({
                               ? 'Espera respuesta'
                               : 'Respondiendo vos'}
                         </span>
+                        {flowMeta.isPausedForReview && (
+                          <span className="inline-block rounded-md px-2 py-0.5 text-xs font-medium bg-red-50 text-red-700 border border-red-200">
+                            Pausado por revisión
+                          </span>
+                        )}
+                        {flowMeta.isPinnedRetired && (
+                          <span className="inline-block rounded-md px-2 py-0.5 text-xs font-medium bg-red-50 text-red-700 border border-red-200">
+                            Versión retirada
+                          </span>
+                        )}
+                        {flowMeta.isOutdated && (
+                          <span className="inline-block rounded-md px-2 py-0.5 text-xs font-medium bg-[#FFF0E3] text-[#8C542C]">
+                            Versión anterior ({flowMeta.pinnedLabel})
+                          </span>
+                        )}
                         {hasOpp && (
                           <span className="inline-block rounded-md px-2 py-0.5 text-xs font-medium bg-[#EAF5F2] text-[#116B70]">
                             En Gestión
@@ -1156,65 +1261,124 @@ export function OperationsWorkspace({
               <div className="p-8 text-sm text-[#5A6877]">
                 Elegí una conversación para ver los mensajes y responder cuando lo necesités.
               </div>
-            ) : (
+            ) : (() => {
+              const selectedSession = sessionsByConversationId.get(selectedConv.id);
+              const selectedFlowMeta = getConversationFlowMeta(selectedConv, selectedSession);
+              return (
               <>
-                <div className="px-5 py-4 border-b border-[#E2E7EB] flex flex-wrap items-center justify-between gap-3">
-                  <div className="flex items-center gap-2.5 min-w-0">
-                    <button
-                      type="button"
-                      onClick={() => setMobileShowThread(false)}
-                      className="lg:hidden inline-flex items-center justify-center min-h-[40px] px-2.5 text-sm font-medium text-[#25364A] border border-[#DCE3E8] rounded-[8px]"
-                    >
-                      <ArrowLeft className="w-4 h-4 mr-1" />
-                      Lista
-                    </button>
-                    <div className="min-w-0">
-                      <h2 className="text-base font-semibold text-[#25364A] truncate">
-                        {selectedContact?.fullName || selectedContact?.phone || 'Visitante'}
-                        {selectedConv.productName ? ` · ${selectedConv.productName}` : ''}
-                      </h2>
-                      <span
-                        className={`inline-block mt-1 rounded-md px-2 py-0.5 text-xs font-medium ${
-                          selectedConv.control === 'bot'
-                            ? 'bg-[#EAF5F2] text-[#116B70]'
-                            : selectedConv.control === 'esperando_humano'
-                              ? 'bg-[#FFF0E3] text-[#8C542C]'
-                              : 'bg-[#F0ECF9] text-[#5D4886]'
-                        }`}
+                <div className="px-5 py-4 border-b border-[#E2E7EB] space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <button
+                        type="button"
+                        onClick={() => setMobileShowThread(false)}
+                        className="lg:hidden inline-flex items-center justify-center min-h-[40px] px-2.5 text-sm font-medium text-[#25364A] border border-[#DCE3E8] rounded-[8px]"
                       >
-                        {selectedConv.control === 'bot'
-                          ? 'Asistente atendiendo'
-                          : selectedConv.control === 'esperando_humano'
-                            ? 'Espera tu respuesta'
-                            : 'Atendiendo vos'}
-                      </span>
+                        <ArrowLeft className="w-4 h-4 mr-1" />
+                        Lista
+                      </button>
+                      <div className="min-w-0">
+                        <h2 className="text-base font-semibold text-[#25364A] truncate">
+                          {selectedContact?.fullName || selectedContact?.phone || 'Visitante'}
+                          {selectedConv.productName ? ` · ${selectedConv.productName}` : ''}
+                        </h2>
+                        <div className="mt-1 flex flex-wrap items-center gap-2">
+                          <span
+                            className={`inline-block rounded-md px-2 py-0.5 text-xs font-medium ${
+                              selectedConv.control === 'bot'
+                                ? 'bg-[#EAF5F2] text-[#116B70]'
+                                : selectedConv.control === 'esperando_humano'
+                                  ? 'bg-[#FFF0E3] text-[#8C542C]'
+                                  : 'bg-[#F0ECF9] text-[#5D4886]'
+                            }`}
+                          >
+                            {selectedConv.control === 'bot'
+                              ? 'Asistente atendiendo'
+                              : selectedConv.control === 'esperando_humano'
+                                ? 'Espera tu respuesta'
+                                : 'Atendiendo vos'}
+                          </span>
+                          <span className="text-xs text-[#5A6877] tabular-nums">
+                            {selectedFlowMeta.conversationName} · Fijada:{' '}
+                            <strong className="text-[#25364A]">{selectedFlowMeta.pinnedLabel}</strong>{' '}
+                            · Publicada actual:{' '}
+                            <strong className="text-[#25364A]">
+                              {selectedFlowMeta.currentPublishedLabel}
+                            </strong>
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2">
+                      {selectedConv.control !== 'humano_activo' && (
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onClick={() => handleTakeover(selectedConv.id)}
+                          className="inline-flex items-center gap-1.5 min-h-[40px] px-3.5 py-2 text-xs font-semibold text-white bg-[#167D83] rounded-[9px] hover:bg-[#116B70] whitespace-nowrap"
+                        >
+                          <UserCheck className="w-4 h-4" />
+                          <span>Responder yo</span>
+                        </button>
+                      )}
+                      {selectedConv.control !== 'bot' && (
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onClick={() => handleResumeBot(selectedConv.id)}
+                          className="inline-flex items-center gap-1.5 min-h-[40px] px-3.5 py-2 text-xs font-medium text-[#116B70] bg-[#EAF5F2] border border-[#D4EAE4] rounded-[9px] hover:bg-[#DCEFE9] whitespace-nowrap"
+                        >
+                          <Play className="w-4 h-4" />
+                          <span>Devolver al asistente</span>
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => setRestartConfirmConvId(selectedConv.id)}
+                        className="inline-flex items-center gap-1.5 min-h-[40px] px-3.5 py-2 text-xs font-medium text-[#25364A] bg-white border border-[#DCE3E8] rounded-[9px] hover:bg-[#F7F8FA] whitespace-nowrap"
+                      >
+                        <RotateCcw className="w-3.5 h-3.5 text-[#167D83]" />
+                        <span>Reiniciar con la versión publicada</span>
+                      </button>
                     </div>
                   </div>
 
-                  <div className="flex flex-wrap items-center gap-2">
-                    {selectedConv.control !== 'humano_activo' && (
-                      <button
-                        type="button"
-                        disabled={busy}
-                        onClick={() => handleTakeover(selectedConv.id)}
-                        className="inline-flex items-center gap-1.5 min-h-[44px] px-4 py-2 text-sm font-semibold text-white bg-[#167D83] rounded-[9px] hover:bg-[#116B70] whitespace-nowrap"
-                      >
-                        <UserCheck className="w-4 h-4" />
-                        <span>Responder yo</span>
-                      </button>
-                    )}
-                    {selectedConv.control !== 'bot' && (
-                      <button
-                        type="button"
-                        disabled={busy}
-                        onClick={() => handleResumeBot(selectedConv.id)}
-                        className="inline-flex items-center gap-1.5 min-h-[44px] px-4 py-2 text-sm font-medium text-[#116B70] bg-[#EAF5F2] border border-[#D4EAE4] rounded-[9px] hover:bg-[#DCEFE9] whitespace-nowrap"
-                      >
-                        <Play className="w-4 h-4" />
-                        <span>Devolver al asistente</span>
-                      </button>
-                    )}
-                  </div>
+                  {(selectedFlowMeta.isPausedForReview ||
+                    selectedFlowMeta.isPinnedRetired ||
+                    selectedFlowMeta.isOutdated) && (
+                    <div
+                      className={`p-3 rounded-[9px] border text-xs flex items-start gap-2 ${
+                        selectedFlowMeta.isPausedForReview || selectedFlowMeta.isPinnedRetired
+                          ? 'bg-red-50 border-red-200 text-red-800'
+                          : 'bg-[#FFF0E3] border-[#F2D7BF] text-[#8C542C]'
+                      }`}
+                    >
+                      <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+                      <div className="space-y-0.5">
+                        {selectedFlowMeta.isPausedForReview && (
+                          <div className="font-semibold">
+                            Chat pausado por revisión de configuración
+                            {selectedFlowMeta.pausedReason ? `: ${selectedFlowMeta.pausedReason}` : '.'}
+                          </div>
+                        )}
+                        {selectedFlowMeta.isPinnedRetired && (
+                          <div className="font-semibold">
+                            La edición fijada ({selectedFlowMeta.pinnedLabel}) fue retirada de producción y no volverá a una versión anterior automáticamente.
+                          </div>
+                        )}
+                        {selectedFlowMeta.isOutdated && (
+                          <div className="font-semibold">
+                            Este chat continúa con {selectedFlowMeta.pinnedLabel}, pero ya se publicó {selectedFlowMeta.currentPublishedLabel}.
+                          </div>
+                        )}
+                        <div>
+                          Usá «Reiniciar con la versión publicada» para migrarlo sin enviar mensajes automáticos al instante.
+                        </div>
+                      </div>
+                    </div>
+                  )}
                 </div>
 
                 <div className="flex-1 p-5 space-y-3 overflow-y-auto max-h-[420px] bg-[#F4F7F8]">
@@ -1273,7 +1437,8 @@ export function OperationsWorkspace({
                   </button>
                 </form>
               </>
-            )}
+              );
+            })()}
           </section>
 
           {/* Person summary panel */}
@@ -1363,6 +1528,58 @@ export function OperationsWorkspace({
             )}
           </aside>
         </div>
+
+        {/* Confirmar reinicio con versión publicada */}
+        {restartConfirmConvId && (
+          <div className="fixed inset-0 z-50 bg-[#1B2531]/45 flex items-center justify-center p-4">
+            <div className="bg-white border border-[#E2E7EB] rounded-[14px] max-w-lg w-full p-6 space-y-4">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <h3 className="text-lg font-semibold text-[#25364A]">
+                    Reiniciar chat con la versión publicada
+                  </h3>
+                  <p className="text-xs text-[#5A6877] mt-0.5">
+                    Este cambio actualiza solo la sesión de este chat sin enviar mensajes por WhatsApp ahora.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setRestartConfirmConvId(null)}
+                  className="p-1.5 text-[#5A6877] hover:text-[#25364A]"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <div className="p-3.5 bg-[#F7F8FA] border border-[#E2E7EB] rounded-[10px] text-xs text-[#25364A] space-y-1.5">
+                <div>• Conserva íntegros los mensajes anteriores y los datos del contacto.</div>
+                <div>• Excluye envíos pendientes o fallidos anteriores que pudieran haber quedado pendientes.</div>
+                <div>• Reinicia el punto del flujo y fija la configuración publicada vigente.</div>
+                <div>• Envía <strong>0 mensajes</strong> en este momento; cuando el cliente vuelva a escribir, recibirá el saludo o menú publicado actual.</div>
+              </div>
+
+              <div className="flex flex-wrap justify-end gap-2.5 pt-2">
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => setRestartConfirmConvId(null)}
+                  className="min-h-[42px] px-4 py-2 text-sm font-medium text-[#25364A] bg-white border border-[#DCE3E8] rounded-[9px] hover:bg-[#F7F8FA]"
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => handleConfirmRestartPublished(restartConfirmConvId)}
+                  className="inline-flex items-center gap-1.5 min-h-[42px] px-4 py-2 text-sm font-semibold text-white bg-[#167D83] rounded-[9px] hover:bg-[#116B70] disabled:opacity-45"
+                >
+                  <RotateCcw className="w-4 h-4" />
+                  <span>{busy ? 'Reiniciando...' : 'Confirmar reinicio'}</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     );
   }
