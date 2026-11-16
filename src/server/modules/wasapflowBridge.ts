@@ -1,20 +1,31 @@
-import type { ChannelConnection, Message, NalasStore, StructuredOption } from '../../shared/types.ts';
+import type {
+  ChannelConnection,
+  Environment,
+  Message,
+  NalasStore,
+  OutboxEvent,
+  StructuredOption,
+} from '../../shared/types.ts';
 import {
-  claimDueOutboxIdsPg,
   claimInboundEventPg,
+  claimWasapFlowOutboxTargetsPg,
   findOwnBotMessageByProviderIdPg,
   getIntegrationSettingPg,
+  getWasapFlowOutboxByIdPg,
   insertAuditEventPg,
   isPostgresConfigured,
   loadWasapFlowConversationBundlePg,
+  markWasapFlowOutboxPausedPg,
   persistWasapFlowConversationBundlePg,
+  persistWasapFlowOutboxResultPg,
   type PgQueryClient,
+  readIntegrationSettingOnClientPg,
   readWasapFlowBridgeStateAndConnPg,
+  resolveWasapFlowOutboxTargetsPg,
   setIntegrationSettingOnClientPg,
   setIntegrationSettingPg,
   updateWasapFlowStatusPg,
   upsertChannelConnectionPg,
-  withPgClient,
   withPgWebhookTransaction,
 } from '../db/pgStore.ts';
 import { getEnv, getRequestId, isWorkerRuntime, scheduleBackgroundTask } from '../runtimeContext.ts';
@@ -138,6 +149,39 @@ export function logWasapFlowStage(
 ): void {
   const line = JSON.stringify({
     tag: 'wasapflow_webhook',
+    ...payload,
+  });
+  if (level === 'error') {
+    console.error(line);
+  } else {
+    console.info(line);
+  }
+}
+
+export function sanitizeOutboundErrorForLog(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  return raw
+    .replace(/postgres(?:ql)?:\/\/\S+/gi, 'postgresql://[redacted]')
+    .replace(/Bearer\s+\S+/gi, 'Bearer [redacted]')
+    .replace(/x-partner-key[:=]\s*\S+/gi, 'x-partner-key:[redacted]')
+    .replace(/\+?\d[\d\s\-().]{6,}\d/g, '[redacted_number]')
+    .slice(0, 140);
+}
+
+export function logWasapFlowOutboundStage(
+  level: 'info' | 'error',
+  payload: {
+    requestId: string;
+    stage: string;
+    trigger: 'webhook' | 'cron' | 'manual_retry';
+    outboundEnabled: boolean;
+    outboxId?: string;
+    durationMs?: number;
+    [key: string]: unknown;
+  }
+): void {
+  const line = JSON.stringify({
+    tag: 'wasapflow_outbound',
     ...payload,
   });
   if (level === 'error') {
@@ -812,7 +856,18 @@ export async function verifyAndLinkWasapFlowNumber(params: {
     return nextState;
   }
 
+  const previousState = await readWasapFlowBridgeState(targetBusinessId);
+  const nextDisplayPhone = matchedClient.phone_number || NEXO_EXPECTED_PROD_DISPLAY_PHONE;
+  const isSameBinding =
+    previousState.status === 'conectado' &&
+    Boolean(previousState.connectedAt) &&
+    previousState.wabaId === matchedClient.waba_id &&
+    previousState.phoneNumberId === matchedClient.phone_number_id &&
+    normalizePhoneDigits(previousState.displayPhoneNumber ?? '') ===
+      normalizePhoneDigits(nextDisplayPhone);
+
   const nowIso = new Date().toISOString();
+  const effectiveConnectedAt = isSameBinding ? previousState.connectedAt! : nowIso;
 
   await withStoreTransaction((store) => {
     const conn = ensureWasapFlowChannelConnection(store, targetBusinessId);
@@ -823,8 +878,10 @@ export async function verifyAndLinkWasapFlowNumber(params: {
     conn.supportsButtons = true;
     conn.maxButtons = 10;
 
-    // Garantizar que mensajes viejos acumulados antes de esta vinculación nunca se despachen
-    markPreExistingWasapFlowOutboxExcluded(store, targetBusinessId, nowIso);
+    // Solo excluir mensajes previos cuando se establece una vinculación nueva o cambia la línea
+    if (!isSameBinding) {
+      markPreExistingWasapFlowOutboxExcluded(store, targetBusinessId, effectiveConnectedAt);
+    }
 
     appendAudit(store, {
       businessId: targetBusinessId,
@@ -833,7 +890,7 @@ export async function verifyAndLinkWasapFlowNumber(params: {
       module: 'integraciones',
       action: 'wasapflow_vinculado_nexo',
       correlationId: conn.id,
-      detail: `WasapFlow confirmado por API (/clients) para ${NEXO_EXPECTED_PROD_DISPLAY_PHONE} (WABA ${matchedClient.waba_id}, PhoneID ${matchedClient.phone_number_id}, modo ${matchedClient.connection_mode || 'coexistence'}, estado ${matchedClient.connection_state || 'connected'}). Meta directo y META_OUTBOUND_ENABLED=false conservados sin cambios.`,
+      detail: `WasapFlow ${isSameBinding ? 're-verificado manteniendo connectedAt' : 'confirmado'} por API (/clients) para ${NEXO_EXPECTED_PROD_DISPLAY_PHONE} (WABA ${matchedClient.waba_id}, PhoneID ${matchedClient.phone_number_id}, modo ${matchedClient.connection_mode || 'coexistence'}, estado ${matchedClient.connection_state || 'connected'}). Meta directo y META_OUTBOUND_ENABLED=false conservados sin cambios.`,
     });
   });
 
@@ -843,12 +900,12 @@ export async function verifyAndLinkWasapFlowNumber(params: {
     connectionId: WASAPFLOW_CONNECTION_ID,
     wabaId: matchedClient.waba_id,
     phoneNumberId: matchedClient.phone_number_id,
-    displayPhoneNumber: matchedClient.phone_number || NEXO_EXPECTED_PROD_DISPLAY_PHONE,
+    displayPhoneNumber: nextDisplayPhone,
     verifiedName: matchedClient.display_name,
     connectionMode: matchedClient.connection_mode || 'coexistence',
     connectionState: matchedClient.connection_state || 'connected',
     qualityRating: matchedClient.quality_rating,
-    connectedAt: nowIso,
+    connectedAt: effectiveConnectedAt,
     statusReason: `WasapFlow conectado con el número real ${NEXO_EXPECTED_PROD_DISPLAY_PHONE} (modo ${matchedClient.connection_mode || 'coexistence'}). Envío saliente por WasapFlow ${isWasapFlowOutboundEnabled() ? 'ACTIVO' : 'PAUSADO (WASAPFLOW_OUTBOUND_ENABLED=false)'}.`,
   });
 }
@@ -1198,144 +1255,457 @@ async function resolveWasapFlowOutboxTargetById(
   };
 }
 
-export async function dispatchWasapFlowOutboxTargets(
-  targets: WasapFlowOutboxTarget[],
-  options?: { allowExplicitPausedRetry?: boolean }
-): Promise<{ processed: number; succeeded: number; failed: number; pausedOutbound: boolean }> {
-  if (targets.length === 0) {
+export type WasapFlowDispatchTrigger = 'webhook' | 'cron' | 'manual_retry';
+
+export interface WasapFlowDispatchOptions {
+  trigger: WasapFlowDispatchTrigger;
+  requestId?: string;
+  outboxIds?: string[];
+  limit?: number;
+  allowExplicitPausedRetry?: boolean;
+  leaseSeconds?: number;
+  pgClient?: PgQueryClient;
+  fetchImpl?: typeof fetch;
+}
+
+interface ClaimedDispatchItem {
+  target: WasapFlowOutboxTarget;
+  attempts: number;
+  maxAttempts: number;
+}
+
+const WASAPFLOW_PAUSED_REASON =
+  'Envío saliente por WasapFlow pausado (WASAPFLOW_OUTBOUND_ENABLED=false). Evento persistido en outbox y excluido de despacho automático.';
+const WASAPFLOW_PRE_CONNECTION_REASON =
+  'Pausado y excluido de despacho automático (mensaje acumulado previo a la vinculación actual de WasapFlow).';
+
+function isLineVerifiedForOutbound(state: WasapFlowBridgeState): boolean {
+  return (
+    state.status === 'conectado' &&
+    Boolean(state.wabaId) &&
+    Boolean(state.phoneNumberId) &&
+    isExpectedProdDisplayPhone(state.displayPhoneNumber) &&
+    !isTestWhatsAppAsset({
+      wabaId: state.wabaId,
+      phoneNumberId: state.phoneNumberId,
+      displayPhoneNumber: state.displayPhoneNumber,
+    })
+  );
+}
+
+async function persistWasapFlowAttemptOutcome(params: {
+  usePg: boolean;
+  pgClient?: PgQueryClient;
+  item: ClaimedDispatchItem;
+  outcome: 'aceptado' | 'fallido';
+  providerMessageId?: string;
+  nextRetryAt?: string | null;
+  lastError?: string | null;
+  auditAction?: string;
+  auditDetail?: string;
+}): Promise<OutboxEvent['deliveryStatus']> {
+  const {
+    usePg,
+    pgClient,
+    item,
+    outcome,
+    providerMessageId,
+    nextRetryAt,
+    lastError,
+    auditAction,
+    auditDetail,
+  } = params;
+
+  if (usePg) {
+    const res = await withPgWebhookTransaction(
+      (client) =>
+        persistWasapFlowOutboxResultPg(client, {
+          outboxId: item.target.outboxId,
+          messageId: item.target.messageId,
+          businessId: item.target.businessId,
+          environment: item.target.environment,
+          outcome,
+          providerMessageId,
+          nextRetryAt,
+          lastError,
+          auditAction,
+          auditDetail,
+        }),
+      pgClient
+    );
+    return res.persistedStatus;
+  }
+
+  let persistedStatus: OutboxEvent['deliveryStatus'] = outcome;
+  await withStoreTransaction((store) => {
+    const ob = store.outboxEvents.find((o) => o.id === item.target.outboxId);
+    const msg = store.messages.find((m) => m.id === item.target.messageId);
+    const now = new Date().toISOString();
+
+    if (ob) {
+      if (ob.deliveryStatus === 'entregado') {
+        persistedStatus = 'entregado';
+      } else if (ob.deliveryStatus === 'aceptado' && outcome === 'fallido') {
+        persistedStatus = 'aceptado';
+      } else {
+        ob.deliveryStatus = outcome;
+        ob.nextRetryAt = outcome === 'aceptado' ? undefined : nextRetryAt ?? undefined;
+        ob.lastError = outcome === 'aceptado' ? undefined : lastError ?? undefined;
+        persistedStatus = outcome;
+      }
+      if (providerMessageId && !ob.providerMessageId) {
+        ob.providerMessageId = providerMessageId;
+      }
+      ob.updatedAt = now;
+    }
+
+    if (msg) {
+      if (msg.deliveryStatus !== 'entregado' && !(msg.deliveryStatus === 'aceptado' && outcome === 'fallido')) {
+        msg.deliveryStatus = outcome;
+      }
+      if (providerMessageId && !msg.providerEventId) {
+        msg.providerEventId = providerMessageId;
+      }
+    }
+
+    if (auditAction && auditDetail) {
+      appendAudit(store, {
+        businessId: item.target.businessId,
+        environment: item.target.environment,
+        actorUserId: 'integraciones',
+        module: 'integraciones',
+        action: auditAction,
+        detail: auditDetail,
+        correlationId: item.target.outboxId,
+      });
+    }
+  });
+  return persistedStatus;
+}
+
+export async function claimAndDispatchWasapFlowOutbox(
+  options: WasapFlowDispatchOptions
+): Promise<{
+  claimedCount: number;
+  processed: number;
+  succeeded: number;
+  failed: number;
+  pausedOutbound: boolean;
+}> {
+  const trigger = options.trigger;
+  const requestId = options.requestId || getRequestId() || `wf_out_${randomHex(4)}`;
+  const outboundEnabled = isWasapFlowOutboundEnabled();
+  const usePg = Boolean(options.pgClient) || isPostgresConfigured();
+  const targetBusinessId = getMetaTargetBusinessId();
+  const requestedIds = options.outboxIds?.filter(Boolean);
+  const limit = Math.max(1, options.limit ?? (requestedIds?.length || 10));
+  const leaseSeconds = Math.max(30, options.leaseSeconds ?? 300);
+
+  logWasapFlowOutboundStage('info', {
+    requestId,
+    stage: 'outbound_dispatch_start',
+    trigger,
+    outboundEnabled,
+    backend: usePg ? 'postgres' : 'local_json_dev',
+    requestedCount: requestedIds?.length,
+    limit,
+  });
+
+  if (!outboundEnabled) {
+    if (requestedIds && requestedIds.length > 0 && !options.allowExplicitPausedRetry) {
+      if (usePg) {
+        await withPgWebhookTransaction(
+          (client) =>
+            markWasapFlowOutboxPausedPg(client, {
+              outboxIds: requestedIds,
+              lastError: WASAPFLOW_PAUSED_REASON,
+            }),
+          options.pgClient
+        );
+      } else {
+        await withStoreTransaction((store) => {
+          const now = new Date().toISOString();
+          for (const outId of requestedIds) {
+            const ob = store.outboxEvents.find((o) => o.id === outId);
+            if (!ob || ob.deliveryStatus === 'aceptado' || ob.deliveryStatus === 'entregado') {
+              continue;
+            }
+            ob.deliveryStatus = 'pendiente';
+            ob.nextRetryAt = undefined;
+            ob.lastError = WASAPFLOW_PAUSED_REASON;
+            ob.updatedAt = now;
+            const msg = store.messages.find((m) => m.id === ob.messageId);
+            if (msg && msg.deliveryStatus !== 'aceptado' && msg.deliveryStatus !== 'entregado') {
+              msg.deliveryStatus = 'pendiente';
+            }
+          }
+        });
+      }
+    }
+
+    logWasapFlowOutboundStage('info', {
+      requestId,
+      stage: 'outbound_paused_skip',
+      trigger,
+      outboundEnabled: false,
+      requestedCount: requestedIds?.length ?? 0,
+    });
+
     return {
+      claimedCount: 0,
       processed: 0,
       succeeded: 0,
       failed: 0,
-      pausedOutbound: !isWasapFlowOutboundEnabled(),
+      pausedOutbound: true,
     };
   }
 
-  const outboundEnabled = isWasapFlowOutboundEnabled();
-  const state = await readWasapFlowBridgeState();
+  const claimStartMs = Date.now();
+  let state: WasapFlowBridgeState = buildDefaultWasapFlowState(targetBusinessId);
+  const claimedItems: ClaimedDispatchItem[] = [];
+  let excludedPreConnectionCount = 0;
+
+  if (usePg) {
+    await withPgWebhookTransaction(async (client) => {
+      const rawState = await readIntegrationSettingOnClientPg(client, WASAPFLOW_STATE_SETTING_KEY);
+      state = parseAndSanitizeWasapFlowState(rawState, targetBusinessId);
+
+      const { claimed, excludedPreConnectionIds } = await claimWasapFlowOutboxTargetsPg(client, {
+        businessId: targetBusinessId,
+        connectionId: WASAPFLOW_CONNECTION_ID,
+        limit,
+        targetOutboxIds: requestedIds,
+        minCreatedAt: state.connectedAt,
+        allowExplicitPausedRetry: Boolean(options.allowExplicitPausedRetry),
+        leaseSeconds,
+      });
+      excludedPreConnectionCount = excludedPreConnectionIds.length;
+
+      if (claimed.length === 0) return;
+
+      const resolvedRows = await resolveWasapFlowOutboxTargetsPg(client, claimed);
+      for (const entry of resolvedRows) {
+        claimedItems.push({
+          attempts: entry.row.attempts,
+          maxAttempts: entry.row.maxAttempts,
+          target: {
+            outboxId: entry.row.id,
+            messageId: entry.row.messageId,
+            businessId: entry.row.businessId,
+            connectionId: entry.row.connectionId,
+            environment: entry.row.environment,
+            toRecipient: entry.rawRecipient,
+            useUserIdField: isBsuidIdentifier(entry.rawRecipient),
+            text: entry.text,
+            options: entry.options,
+            allowMultiple: entry.allowMultiple,
+            createdAt: entry.row.createdAt,
+          },
+        });
+      }
+    }, options.pgClient);
+  } else {
+    state = await readWasapFlowBridgeState(targetBusinessId);
+    const baselineMs = state.connectedAt ? new Date(state.connectedAt).getTime() : 0;
+    const nowMs = Date.now();
+    const nowIso = new Date(nowMs).toISOString();
+    const leaseUntilIso = new Date(nowMs + leaseSeconds * 1000).toISOString();
+    const requestedSet = requestedIds ? new Set(requestedIds) : null;
+
+    await withStoreTransaction(async (store) => {
+      if (requestedSet && Number.isFinite(baselineMs) && baselineMs > 0) {
+        for (const o of store.outboxEvents) {
+          if (
+            !requestedSet.has(o.id) ||
+            o.connectionId !== WASAPFLOW_CONNECTION_ID ||
+            o.businessId !== targetBusinessId
+          ) {
+            continue;
+          }
+          if (o.deliveryStatus !== 'pendiente' && o.deliveryStatus !== 'fallido') continue;
+          const createdMs = new Date(o.createdAt).getTime();
+          if (Number.isFinite(createdMs) && createdMs < baselineMs) {
+            o.nextRetryAt = undefined;
+            o.lastError = WASAPFLOW_PRE_CONNECTION_REASON;
+            o.updatedAt = nowIso;
+            excludedPreConnectionCount += 1;
+          }
+        }
+      }
+
+      const eligible = store.outboxEvents
+        .filter((o) => {
+          if (o.connectionId !== WASAPFLOW_CONNECTION_ID || o.businessId !== targetBusinessId) {
+            return false;
+          }
+          if (requestedSet && !requestedSet.has(o.id)) return false;
+          if (o.deliveryStatus !== 'pendiente' && o.deliveryStatus !== 'fallido') return false;
+          const createdMs = new Date(o.createdAt).getTime();
+          if (baselineMs > 0 && Number.isFinite(createdMs) && createdMs < baselineMs) {
+            return false;
+          }
+          if (!options.allowExplicitPausedRetry) {
+            const maxAtt = o.maxAttempts ?? 3;
+            if (o.attempts >= maxAtt) return false;
+            if (!o.nextRetryAt || new Date(o.nextRetryAt).getTime() > nowMs) return false;
+            if (isQuarantinedOutboxError(o.lastError)) return false;
+          }
+          return true;
+        })
+        .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
+        .slice(0, limit);
+
+      for (const ob of eligible) {
+        ob.attempts += 1;
+        ob.maxAttempts = ob.maxAttempts ?? 3;
+        ob.nextRetryAt = leaseUntilIso;
+        ob.updatedAt = nowIso;
+
+        const target = await resolveWasapFlowOutboxTargetById(store, ob.id);
+        claimedItems.push({
+          attempts: ob.attempts,
+          maxAttempts: ob.maxAttempts,
+          target: target ?? {
+            outboxId: ob.id,
+            messageId: ob.messageId,
+            businessId: ob.businessId,
+            connectionId: ob.connectionId,
+            environment: ob.environment,
+            toRecipient: '',
+            useUserIdField: false,
+            text: ob.payloadText,
+            createdAt: ob.createdAt,
+          },
+        });
+      }
+    });
+  }
+
+  logWasapFlowOutboundStage('info', {
+    requestId,
+    stage: 'outbound_claim_result',
+    trigger,
+    outboundEnabled,
+    claimedCount: claimedItems.length,
+    claimedOutboxIds: claimedItems.map((c) => c.target.outboxId),
+    excludedPreConnectionCount,
+    durationMs: Date.now() - claimStartMs,
+  });
+
+  if (claimedItems.length === 0) {
+    return {
+      claimedCount: 0,
+      processed: 0,
+      succeeded: 0,
+      failed: 0,
+      pausedOutbound: false,
+    };
+  }
+
   const partnerKey = getWasapFlowPartnerKey();
+  const canUseVerifiedLine = isLineVerifiedForOutbound(state);
+  const fetchFn = options.fetchImpl ?? globalThis.fetch;
 
   let succeeded = 0;
   let failed = 0;
-  let pausedCount = 0;
 
-  for (const item of targets) {
-    if (item.connectionId !== WASAPFLOW_CONNECTION_ID) {
-      continue;
-    }
+  for (const item of claimedItems) {
+    const outboxId = item.target.outboxId;
 
-    if (!outboundEnabled) {
-      pausedCount += 1;
-      await withStoreTransaction((store) => {
-        const now = new Date().toISOString();
-        const ob = store.outboxEvents.find((o) => o.id === item.outboxId);
-        const msg = store.messages.find((m) => m.id === item.messageId);
-        if (ob) {
-          ob.deliveryStatus = 'pendiente';
-          ob.nextRetryAt = undefined;
-          ob.lastError =
-            'Envío saliente por WasapFlow pausado (WASAPFLOW_OUTBOUND_ENABLED=false). Evento persistido en outbox y excluido de despacho automático.';
-          ob.updatedAt = now;
-        }
-        if (msg) msg.deliveryStatus = 'pendiente';
-      });
-      continue;
-    }
-
-    // Seguridad: si el evento quedó marcado como pausado/excluido o ya fue aceptado/entregado,
-    // jamás despacharlo automáticamente al reactivar WASAPFLOW_OUTBOUND_ENABLED.
-    let skipReason: 'quarantined' | 'already_sent' | null = null;
-    await withStoreTransaction((store) => {
-      const ob = store.outboxEvents.find((o) => o.id === item.outboxId);
-      if (!ob) return;
-      if (ob.deliveryStatus === 'aceptado' || ob.deliveryStatus === 'entregado') {
-        skipReason = 'already_sent';
-        return;
-      }
-      if (!options?.allowExplicitPausedRetry && isQuarantinedOutboxError(ob.lastError)) {
-        ob.nextRetryAt = undefined;
-        ob.updatedAt = new Date().toISOString();
-        skipReason = 'quarantined';
-      }
-    });
-    if (skipReason) {
-      pausedCount += 1;
-      continue;
-    }
-
-    // Seguridad crítica: nunca despachar mensajes viejos acumulados previos a la vinculación activa
-    if (state.connectedAt) {
-      const baselineMs = new Date(state.connectedAt).getTime();
-      const createdMs = new Date(item.createdAt).getTime();
-      if (Number.isFinite(baselineMs) && Number.isFinite(createdMs) && createdMs < baselineMs) {
-        pausedCount += 1;
-        await withStoreTransaction((store) => {
-          const ob = store.outboxEvents.find((o) => o.id === item.outboxId);
-          if (ob) {
-            ob.nextRetryAt = undefined;
-            ob.lastError =
-              'Pausado y excluido de despacho automático (mensaje acumulado previo a la vinculación actual de WasapFlow).';
-            ob.updatedAt = new Date().toISOString();
-          }
-        });
-        continue;
-      }
-    }
-
-    const canUseVerifiedLine =
-      state.status === 'conectado' &&
-      Boolean(state.wabaId) &&
-      Boolean(state.phoneNumberId) &&
-      isExpectedProdDisplayPhone(state.displayPhoneNumber) &&
-      !isTestWhatsAppAsset({
-        wabaId: state.wabaId,
-        phoneNumberId: state.phoneNumberId,
-        displayPhoneNumber: state.displayPhoneNumber,
-      });
-
-    if (!partnerKey || !canUseVerifiedLine || !state.wabaId || !state.phoneNumberId) {
+    if (
+      !partnerKey ||
+      !canUseVerifiedLine ||
+      !state.wabaId ||
+      !state.phoneNumberId ||
+      !item.target.toRecipient
+    ) {
+      const reasonCode = !partnerKey
+        ? 'missing_partner_key'
+        : !canUseVerifiedLine || !state.wabaId || !state.phoneNumberId
+          ? 'line_not_verified'
+          : 'missing_recipient';
       const missingReason = !partnerKey
         ? 'Falta WASAPFLOW_PARTNER_KEY en las variables del servidor (no se recurre a credenciales de Meta).'
-        : `WasapFlow no tiene verificado el número real ${NEXO_EXPECTED_PROD_DISPLAY_PHONE}; envío rechazado.`;
-      await withStoreTransaction((store) => {
-        const ob = store.outboxEvents.find((o) => o.id === item.outboxId);
-        const msg = store.messages.find((m) => m.id === item.messageId);
-        if (ob) {
-          ob.attempts += 1;
-          ob.maxAttempts = ob.maxAttempts ?? 3;
-          ob.deliveryStatus = 'fallido';
-          ob.nextRetryAt =
-            ob.attempts < ob.maxAttempts ? computeNextRetryIso(ob.attempts) : undefined;
-          ob.lastError = missingReason;
-          ob.updatedAt = new Date().toISOString();
-        }
-        if (msg) msg.deliveryStatus = 'fallido';
-        appendAudit(store, {
-          businessId: item.businessId,
-          environment: item.environment,
-          actorUserId: 'integraciones',
-          module: 'integraciones',
-          action: 'wasapflow_error_envio',
-          detail: missingReason,
-          correlationId: item.outboxId,
-        });
+        : !canUseVerifiedLine || !state.wabaId || !state.phoneNumberId
+          ? `WasapFlow no tiene verificado el número real ${NEXO_EXPECTED_PROD_DISPLAY_PHONE}; envío rechazado.`
+          : 'No se encontró destinatario válido para el envío saliente de WasapFlow.';
+      const nextRetryAt =
+        item.attempts < item.maxAttempts ? computeNextRetryIso(item.attempts) : null;
+
+      logWasapFlowOutboundStage('error', {
+        requestId,
+        stage: 'outbound_precheck_rejected',
+        trigger,
+        outboundEnabled,
+        outboxId,
+        attempt: item.attempts,
+        reasonCode,
       });
+
+      const persistStartMs = Date.now();
+      const persistedStatus = await persistWasapFlowAttemptOutcome({
+        usePg,
+        pgClient: options.pgClient,
+        item,
+        outcome: 'fallido',
+        nextRetryAt,
+        lastError: missingReason,
+        auditAction: 'wasapflow_error_envio',
+        auditDetail: missingReason,
+      });
+      logWasapFlowOutboundStage('info', {
+        requestId,
+        stage: 'outbound_persist_result',
+        trigger,
+        outboundEnabled,
+        outboxId,
+        deliveryStatus: persistedStatus,
+        attempt: item.attempts,
+        nextRetryScheduled: Boolean(nextRetryAt),
+        durationMs: Date.now() - persistStartMs,
+      });
+
       failed += 1;
       continue;
     }
 
-    const reqSpec = buildWasapFlowOutboundRequest(item);
+    const reqSpec = buildWasapFlowOutboundRequest(item.target);
+    const endpointPath = reqSpec.endpoint.endsWith('/interactive')
+      ? '/bridge/v1/messages/interactive'
+      : '/bridge/v1/messages/send';
+    const idempotencyKey = item.target.outboxId;
+    const httpStartMs = Date.now();
+
+    logWasapFlowOutboundStage('info', {
+      requestId,
+      stage: 'outbound_http_start',
+      trigger,
+      outboundEnabled,
+      outboxId,
+      messageId: item.target.messageId,
+      attempt: item.attempts,
+      maxAttempts: item.maxAttempts,
+      idempotencyKey,
+      endpointPath,
+    });
+
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : undefined;
+    const timeoutHandle = controller
+      ? setTimeout(() => controller.abort(), 12_000)
+      : undefined;
+
     try {
-      const resp = await fetch(reqSpec.endpoint, {
+      const resp = await fetchFn(reqSpec.endpoint, {
         method: 'POST',
         headers: {
           'x-partner-key': partnerKey,
           'x-waba-id': state.wabaId,
           'x-phone-number-id': state.phoneNumberId,
-          'Idempotency-Key': item.outboxId,
+          'Idempotency-Key': idempotencyKey,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify(reqSpec.body),
+        signal: controller?.signal,
       });
 
       const rawText = await resp.text();
@@ -1352,82 +1722,169 @@ export async function dispatchWasapFlowOutboxTargets(
         parsed = {};
       }
 
-      await withStoreTransaction((store) => {
-        const ob = store.outboxEvents.find((o) => o.id === item.outboxId);
-        const msg = store.messages.find((m) => m.id === item.messageId);
-        const now = new Date().toISOString();
-
-        if (resp.ok && (parsed.success !== false)) {
-          const wamid = parsed.message_id;
-          if (ob) {
-            ob.attempts += 1;
-            ob.maxAttempts = ob.maxAttempts ?? 3;
-            ob.deliveryStatus = 'aceptado';
-            ob.providerMessageId = wamid;
-            ob.nextRetryAt = undefined;
-            ob.lastError = undefined;
-            ob.updatedAt = now;
-          }
-          if (msg) {
-            msg.deliveryStatus = 'aceptado';
-            if (wamid) msg.providerEventId = wamid;
-          }
-          succeeded += 1;
-        } else {
-          const errMsg =
-            parsed.error?.message || parsed.message || `WasapFlow HTTP ${resp.status}`;
-          if (ob) {
-            ob.attempts += 1;
-            ob.maxAttempts = ob.maxAttempts ?? 3;
-            ob.deliveryStatus = 'fallido';
-            ob.nextRetryAt =
-              ob.attempts < ob.maxAttempts ? computeNextRetryIso(ob.attempts) : undefined;
-            ob.lastError = errMsg;
-            ob.updatedAt = now;
-          }
-          if (msg) msg.deliveryStatus = 'fallido';
-          appendAudit(store, {
-            businessId: item.businessId,
-            environment: item.environment,
-            actorUserId: 'integraciones',
-            module: 'integraciones',
-            action: 'wasapflow_error_envio',
-            detail: `Fallo enviando mensaje saliente vía WasapFlow: ${errMsg}`,
-            correlationId: item.outboxId,
-          });
-          failed += 1;
-        }
+      const httpOk = resp.ok && parsed.success !== false;
+      logWasapFlowOutboundStage(httpOk ? 'info' : 'error', {
+        requestId,
+        stage: 'outbound_http_result',
+        trigger,
+        outboundEnabled,
+        outboxId,
+        httpStatus: resp.status,
+        ok: httpOk,
+        hasProviderMessageId: Boolean(parsed.message_id),
+        errorCode: parsed.error?.code,
+        durationMs: Date.now() - httpStartMs,
       });
+
+      const persistStartMs = Date.now();
+      if (httpOk) {
+        const persistedStatus = await persistWasapFlowAttemptOutcome({
+          usePg,
+          pgClient: options.pgClient,
+          item,
+          outcome: 'aceptado',
+          providerMessageId: parsed.message_id,
+          nextRetryAt: null,
+          lastError: null,
+        });
+        logWasapFlowOutboundStage('info', {
+          requestId,
+          stage: 'outbound_persist_result',
+          trigger,
+          outboundEnabled,
+          outboxId,
+          deliveryStatus: persistedStatus,
+          attempt: item.attempts,
+          nextRetryScheduled: false,
+          durationMs: Date.now() - persistStartMs,
+        });
+        succeeded += 1;
+      } else {
+        const errMsg =
+          parsed.error?.message || parsed.message || `WasapFlow HTTP ${resp.status}`;
+        const nextRetryAt =
+          item.attempts < item.maxAttempts ? computeNextRetryIso(item.attempts) : null;
+        const persistedStatus = await persistWasapFlowAttemptOutcome({
+          usePg,
+          pgClient: options.pgClient,
+          item,
+          outcome: 'fallido',
+          nextRetryAt,
+          lastError: errMsg,
+          auditAction: 'wasapflow_error_envio',
+          auditDetail: `Fallo enviando mensaje saliente vía WasapFlow: ${errMsg}`,
+        });
+        logWasapFlowOutboundStage('info', {
+          requestId,
+          stage: 'outbound_persist_result',
+          trigger,
+          outboundEnabled,
+          outboxId,
+          deliveryStatus: persistedStatus,
+          attempt: item.attempts,
+          nextRetryScheduled: Boolean(nextRetryAt),
+          errorReason: sanitizeOutboundErrorForLog(errMsg),
+          durationMs: Date.now() - persistStartMs,
+        });
+        failed += 1;
+      }
     } catch (err) {
       const errMsg =
         err instanceof Error ? err.message : 'Error de red enviando mensaje a WasapFlow';
-      await withStoreTransaction((store) => {
-        const ob = store.outboxEvents.find((o) => o.id === item.outboxId);
-        const msg = store.messages.find((m) => m.id === item.messageId);
-        if (ob) {
-          ob.attempts += 1;
-          ob.maxAttempts = ob.maxAttempts ?? 3;
-          ob.deliveryStatus = 'fallido';
-          ob.nextRetryAt =
-            ob.attempts < ob.maxAttempts ? computeNextRetryIso(ob.attempts) : undefined;
-          ob.lastError = errMsg;
-          ob.updatedAt = new Date().toISOString();
-        }
-        if (msg) msg.deliveryStatus = 'fallido';
+      logWasapFlowOutboundStage('error', {
+        requestId,
+        stage: 'outbound_http_result',
+        trigger,
+        outboundEnabled,
+        outboxId,
+        ok: false,
+        errorName: err instanceof Error ? err.name : 'FetchError',
+        errorReason: sanitizeOutboundErrorForLog(errMsg),
+        durationMs: Date.now() - httpStartMs,
+      });
+
+      const nextRetryAt =
+        item.attempts < item.maxAttempts ? computeNextRetryIso(item.attempts) : null;
+      const persistStartMs = Date.now();
+      const persistedStatus = await persistWasapFlowAttemptOutcome({
+        usePg,
+        pgClient: options.pgClient,
+        item,
+        outcome: 'fallido',
+        nextRetryAt,
+        lastError: errMsg,
+        auditAction: 'wasapflow_error_envio',
+        auditDetail: `Fallo enviando mensaje saliente vía WasapFlow: ${errMsg}`,
+      });
+      logWasapFlowOutboundStage('info', {
+        requestId,
+        stage: 'outbound_persist_result',
+        trigger,
+        outboundEnabled,
+        outboxId,
+        deliveryStatus: persistedStatus,
+        attempt: item.attempts,
+        nextRetryScheduled: Boolean(nextRetryAt),
+        durationMs: Date.now() - persistStartMs,
       });
       failed += 1;
+    } finally {
+      if (timeoutHandle !== undefined) {
+        clearTimeout(timeoutHandle);
+      }
     }
   }
 
   return {
-    processed: targets.length,
+    claimedCount: claimedItems.length,
+    processed: claimedItems.length,
     succeeded,
     failed,
-    pausedOutbound: pausedCount === targets.length,
+    pausedOutbound: false,
   };
 }
 
-export async function retrySingleWasapFlowOutbox(outboxId: string): Promise<OutboxEventSnapshot> {
+export async function dispatchWasapFlowOutboxTargets(
+  targets: WasapFlowOutboxTarget[],
+  options?: {
+    allowExplicitPausedRetry?: boolean;
+    requestId?: string;
+    pgClient?: PgQueryClient;
+    fetchImpl?: typeof fetch;
+  }
+): Promise<{ processed: number; succeeded: number; failed: number; pausedOutbound: boolean }> {
+  const wfTargets = targets.filter((t) => t.connectionId === WASAPFLOW_CONNECTION_ID);
+  if (wfTargets.length === 0) {
+    return {
+      processed: 0,
+      succeeded: 0,
+      failed: 0,
+      pausedOutbound: !isWasapFlowOutboundEnabled(),
+    };
+  }
+
+  const res = await claimAndDispatchWasapFlowOutbox({
+    trigger: options?.allowExplicitPausedRetry ? 'manual_retry' : 'webhook',
+    requestId: options?.requestId,
+    outboxIds: wfTargets.map((t) => t.outboxId),
+    limit: wfTargets.length,
+    allowExplicitPausedRetry: options?.allowExplicitPausedRetry,
+    pgClient: options?.pgClient,
+    fetchImpl: options?.fetchImpl,
+  });
+
+  return {
+    processed: res.processed,
+    succeeded: res.succeeded,
+    failed: res.failed,
+    pausedOutbound: res.pausedOutbound,
+  };
+}
+
+export async function retrySingleWasapFlowOutbox(
+  outboxId: string,
+  options?: { pgClient?: PgQueryClient; fetchImpl?: typeof fetch; requestId?: string }
+): Promise<OutboxEvent> {
   if (!isWasapFlowOutboundEnabled()) {
     const err = new Error(
       'Envío saliente por WasapFlow apagado (WASAPFLOW_OUTBOUND_ENABLED=false). Reintento manual bloqueado.'
@@ -1436,15 +1893,44 @@ export async function retrySingleWasapFlowOutbox(outboxId: string): Promise<Outb
     throw err;
   }
 
-  let target: WasapFlowOutboxTarget | null = null;
-  await withStoreTransaction(async (store) => {
-    target = await resolveWasapFlowOutboxTargetById(store, outboxId);
-  });
-  if (!target) {
-    throw new Error('Evento de salida WasapFlow no encontrado.');
+  const usePg = Boolean(options?.pgClient) || isPostgresConfigured();
+  if (usePg) {
+    const existing = await withPgWebhookTransaction(
+      (client) => getWasapFlowOutboxByIdPg(client, outboxId),
+      options?.pgClient
+    );
+    if (!existing || existing.connectionId !== WASAPFLOW_CONNECTION_ID) {
+      throw new Error('Evento de salida WasapFlow no encontrado.');
+    }
+    await claimAndDispatchWasapFlowOutbox({
+      trigger: 'manual_retry',
+      requestId: options?.requestId,
+      outboxIds: [outboxId],
+      limit: 1,
+      allowExplicitPausedRetry: true,
+      pgClient: options?.pgClient,
+      fetchImpl: options?.fetchImpl,
+    });
+    const latest = await withPgWebhookTransaction(
+      (client) => getWasapFlowOutboxByIdPg(client, outboxId),
+      options?.pgClient
+    );
+    if (!latest) {
+      throw new Error('Evento de salida WasapFlow no encontrado tras reintento.');
+    }
+    return latest;
   }
-  await dispatchWasapFlowOutboxTargets([target], { allowExplicitPausedRetry: true });
-  let latest: OutboxEventSnapshot | undefined;
+
+  await claimAndDispatchWasapFlowOutbox({
+    trigger: 'manual_retry',
+    requestId: options?.requestId,
+    outboxIds: [outboxId],
+    limit: 1,
+    allowExplicitPausedRetry: true,
+    fetchImpl: options?.fetchImpl,
+  });
+
+  let latest: OutboxEvent | undefined;
   await withStoreTransaction((store) => {
     latest = store.outboxEvents.find((o) => o.id === outboxId);
   });
@@ -1454,111 +1940,23 @@ export async function retrySingleWasapFlowOutbox(outboxId: string): Promise<Outb
   return latest;
 }
 
-type OutboxEventSnapshot = NalasStore['outboxEvents'][number];
-
-export async function processDueWasapFlowOutboxRetries(limit = 10): Promise<{
+export async function processDueWasapFlowOutboxRetries(
+  limit = 10,
+  options?: { pgClient?: PgQueryClient; fetchImpl?: typeof fetch; requestId?: string }
+): Promise<{
   claimedCount: number;
   processed: number;
   succeeded: number;
   failed: number;
   pausedOutbound: boolean;
 }> {
-  if (!isWasapFlowOutboundEnabled()) {
-    return {
-      claimedCount: 0,
-      processed: 0,
-      succeeded: 0,
-      failed: 0,
-      pausedOutbound: true,
-    };
-  }
-
-  const state = await readWasapFlowBridgeState();
-  if (state.status !== 'conectado' || !isExpectedProdDisplayPhone(state.displayPhoneNumber)) {
-    return {
-      claimedCount: 0,
-      processed: 0,
-      succeeded: 0,
-      failed: 0,
-      pausedOutbound: false,
-    };
-  }
-
-  const baselineMs = state.connectedAt ? new Date(state.connectedAt).getTime() : 0;
-
-  let dueIds: string[] = [];
-  if (isPostgresConfigured()) {
-    dueIds = await withPgClient(async (client) => {
-      await client.query('BEGIN');
-      try {
-        const ids = await claimDueOutboxIdsPg(client, limit, [WASAPFLOW_CONNECTION_ID]);
-        await client.query('COMMIT');
-        return ids;
-      } catch (err) {
-        await client.query('ROLLBACK').catch(() => {});
-        throw err;
-      }
-    });
-  } else {
-    const nowMs = Date.now();
-    const claimWindowIso = new Date(nowMs + 300_000).toISOString();
-    const nowIso = new Date(nowMs).toISOString();
-    await withStoreTransaction((store) => {
-      const selected = store.outboxEvents
-        .filter((o) => {
-          if (o.connectionId !== WASAPFLOW_CONNECTION_ID) return false;
-          if (o.deliveryStatus !== 'pendiente' && o.deliveryStatus !== 'fallido') return false;
-          const maxAtt = o.maxAttempts ?? 3;
-          if (o.attempts >= maxAtt) return false;
-          if (!o.nextRetryAt || new Date(o.nextRetryAt).getTime() > nowMs) return false;
-          if (isQuarantinedOutboxError(o.lastError)) return false;
-          if (baselineMs > 0 && new Date(o.createdAt).getTime() < baselineMs) return false;
-          return true;
-        })
-        .slice(0, limit);
-      for (const o of selected) {
-        o.nextRetryAt = claimWindowIso;
-        o.updatedAt = nowIso;
-      }
-      dueIds = selected.map((o) => o.id);
-    });
-  }
-
-  if (dueIds.length === 0) {
-    return {
-      claimedCount: 0,
-      processed: 0,
-      succeeded: 0,
-      failed: 0,
-      pausedOutbound: false,
-    };
-  }
-
-  const targets: WasapFlowOutboxTarget[] = [];
-  await withStoreTransaction(async (store) => {
-    for (const id of dueIds) {
-      const target = await resolveWasapFlowOutboxTargetById(store, id);
-      if (target) {
-        const createdMs = new Date(target.createdAt).getTime();
-        if (baselineMs > 0 && Number.isFinite(createdMs) && createdMs < baselineMs) {
-          const ob = store.outboxEvents.find((o) => o.id === id);
-          if (ob) {
-            ob.nextRetryAt = undefined;
-            ob.lastError =
-              'Pausado y excluido de despacho automático (mensaje acumulado previo a la vinculación actual de WasapFlow).';
-          }
-          continue;
-        }
-        targets.push(target);
-      }
-    }
+  return claimAndDispatchWasapFlowOutbox({
+    trigger: 'cron',
+    requestId: options?.requestId,
+    limit,
+    pgClient: options?.pgClient,
+    fetchImpl: options?.fetchImpl,
   });
-
-  const dispatchRes = await dispatchWasapFlowOutboxTargets(targets);
-  return {
-    claimedCount: dueIds.length,
-    ...dispatchRes,
-  };
 }
 
 export async function processWasapFlowWebhookEvent(
@@ -2528,12 +2926,14 @@ export async function processWasapFlowWebhookEvent(
         const newBotMsgs = miniStore.messages.filter(
           (m) =>
             m.conversationId === started.conversation.id &&
-            m.sender === 'bot_basica' &&
+            m.sender !== 'cliente' &&
+            m.sender !== 'agente_humano' &&
             !existingMsgIds.has(m.id)
         );
         const fallbackList: Message[] =
           newBotMsgs.length > 0 ? newBotMsgs : out.outgoingMessage ? [out.outgoingMessage] : [];
 
+        const eligibleDueIso = new Date(Date.now() - 5000).toISOString();
         const targets: WasapFlowOutboxTarget[] = [];
         for (const msg of fallbackList) {
           const ob = miniStore.outboxEvents.find((o) => o.messageId === msg.id);
@@ -2541,10 +2941,13 @@ export async function processWasapFlowWebhookEvent(
           if (!outboundEnabled) {
             ob.deliveryStatus = 'pendiente';
             ob.nextRetryAt = undefined;
-            ob.lastError =
-              'Envío saliente por WasapFlow pausado (WASAPFLOW_OUTBOUND_ENABLED=false). Evento persistido en outbox y excluido de despacho automático.';
+            ob.lastError = WASAPFLOW_PAUSED_REASON;
             msg.deliveryStatus = 'pendiente';
           } else {
+            ob.deliveryStatus = 'pendiente';
+            ob.nextRetryAt = eligibleDueIso;
+            ob.lastError = undefined;
+            msg.deliveryStatus = 'pendiente';
             targets.push({
               outboxId: ob.id,
               messageId: msg.id,
@@ -2595,7 +2998,15 @@ export async function processWasapFlowWebhookEvent(
       });
 
       if (backgroundTargets.length > 0 && outboundEnabled) {
-        scheduleBackgroundTask(dispatchWasapFlowOutboxTargets(backgroundTargets));
+        scheduleBackgroundTask(
+          claimAndDispatchWasapFlowOutbox({
+            trigger: 'webhook',
+            requestId,
+            outboxIds: backgroundTargets.map((t) => t.outboxId),
+            limit: backgroundTargets.length,
+            pgClient: options?.pgClient,
+          })
+        );
       }
       return summary;
     }
@@ -2724,7 +3135,8 @@ export async function processWasapFlowWebhookEvent(
         const newBotMsgs = store.messages.filter(
           (m) =>
             m.conversationId === convResolution.conversationId &&
-            m.sender === 'bot_basica' &&
+            m.sender !== 'cliente' &&
+            m.sender !== 'agente_humano' &&
             !existingMsgIds.has(m.id)
         );
         const fallbackList: Message[] =
@@ -2734,6 +3146,7 @@ export async function processWasapFlowWebhookEvent(
               ? [out.outgoingMessage]
               : [];
 
+        const eligibleDueIso = new Date(Date.now() - 5000).toISOString();
         const targets: WasapFlowOutboxTarget[] = [];
 
         for (const msg of fallbackList) {
@@ -2742,10 +3155,13 @@ export async function processWasapFlowWebhookEvent(
           if (!outboundEnabled) {
             ob.deliveryStatus = 'pendiente';
             ob.nextRetryAt = undefined;
-            ob.lastError =
-              'Envío saliente por WasapFlow pausado (WASAPFLOW_OUTBOUND_ENABLED=false). Evento persistido en outbox y excluido de despacho automático.';
+            ob.lastError = WASAPFLOW_PAUSED_REASON;
             msg.deliveryStatus = 'pendiente';
           } else {
+            ob.deliveryStatus = 'pendiente';
+            ob.nextRetryAt = eligibleDueIso;
+            ob.lastError = undefined;
+            msg.deliveryStatus = 'pendiente';
             targets.push({
               outboxId: ob.id,
               messageId: msg.id,
@@ -2789,7 +3205,14 @@ export async function processWasapFlowWebhookEvent(
       totalDurationMs: Date.now() - fnStartMs,
     });
     if (result.targets.length > 0 && outboundEnabled) {
-      scheduleBackgroundTask(dispatchWasapFlowOutboxTargets(result.targets));
+      scheduleBackgroundTask(
+        claimAndDispatchWasapFlowOutbox({
+          trigger: 'webhook',
+          requestId,
+          outboxIds: result.targets.map((t) => t.outboxId),
+          limit: result.targets.length,
+        })
+      );
     }
     return summary;
   }

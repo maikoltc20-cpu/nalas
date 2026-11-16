@@ -824,6 +824,7 @@ export async function processInboundMessage(
       connection: conn,
       message: botMsg,
       simulateOutboxFailure: params.simulateOutboxFailure,
+      deferRemoteDispatch: params.deferRemoteDispatch,
     });
 
     return {

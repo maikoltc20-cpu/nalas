@@ -2584,3 +2584,497 @@ export async function persistWasapFlowConversationBundlePg(
 
   return { queriesExecuted };
 }
+
+export async function readIntegrationSettingOnClientPg(
+  client: PgQueryClient,
+  key: string
+): Promise<string | null> {
+  const res = await client.query<{ setting_value: string }>(
+    `SELECT setting_value FROM nalas_integration_settings WHERE setting_key = $1 LIMIT 1`,
+    [key]
+  );
+  return res.rows[0]?.setting_value ?? null;
+}
+
+export interface ClaimedWasapFlowOutboxRow {
+  id: string;
+  businessId: string;
+  environment: Environment;
+  conversationId: string;
+  messageId: string;
+  connectionId: string;
+  payloadText: string;
+  deliveryStatus: OutboxEvent['deliveryStatus'];
+  providerMessageId?: string;
+  attempts: number;
+  maxAttempts: number;
+  nextRetryAt?: string;
+  lastError?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ResolvedWasapFlowOutboxRow {
+  row: ClaimedWasapFlowOutboxRow;
+  rawRecipient: string;
+  text: string;
+  options?: Message['options'];
+  allowMultiple?: boolean;
+}
+
+export async function claimWasapFlowOutboxTargetsPg(
+  client: PgQueryClient,
+  params: {
+    businessId: string;
+    connectionId: string;
+    limit: number;
+    targetOutboxIds?: string[];
+    minCreatedAt?: string;
+    allowExplicitPausedRetry?: boolean;
+    leaseSeconds?: number;
+  }
+): Promise<{
+  claimed: ClaimedWasapFlowOutboxRow[];
+  excludedPreConnectionIds: string[];
+}> {
+  const {
+    businessId,
+    connectionId,
+    limit,
+    targetOutboxIds,
+    minCreatedAt,
+    allowExplicitPausedRetry = false,
+    leaseSeconds = 300,
+  } = params;
+
+  const targetIdsParam =
+    targetOutboxIds && targetOutboxIds.length > 0 ? targetOutboxIds : null;
+  const minCreatedParam = minCreatedAt?.trim() || null;
+
+  const excludedPreConnectionIds: string[] = [];
+  if (targetIdsParam && minCreatedParam) {
+    const excludedRes = await client.query<{ id: string }>(
+      `UPDATE nalas_outbox_events
+       SET next_retry_at = NULL,
+           last_error = $4,
+           updated_at = NOW()
+       WHERE connection_id = $1
+         AND business_id = $2
+         AND id = ANY($3::text[])
+         AND delivery_status IN ('pendiente', 'fallido')
+         AND created_at < $5::timestamptz
+       RETURNING id`,
+      [
+        connectionId,
+        businessId,
+        targetIdsParam,
+        'Pausado y excluido de despacho automático (mensaje acumulado previo a la vinculación actual de WasapFlow).',
+        minCreatedParam,
+      ]
+    );
+    for (const r of excludedRes.rows) {
+      excludedPreConnectionIds.push(r.id);
+    }
+  }
+
+  const res = await client.query<{
+    id: string;
+    business_id: string;
+    environment: Environment;
+    conversation_id: string;
+    message_id: string;
+    connection_id: string;
+    payload_text: string;
+    delivery_status: OutboxEvent['deliveryStatus'];
+    provider_message_id: string | null;
+    attempts: number;
+    max_attempts: number | null;
+    next_retry_at: Date | string | null;
+    last_error: string | null;
+    created_at: Date | string;
+    updated_at: Date | string;
+  }>(
+    `WITH due AS (
+       SELECT o.id
+       FROM nalas_outbox_events o
+       WHERE o.connection_id = $1
+         AND o.business_id = $2
+         AND o.delivery_status IN ('pendiente', 'fallido')
+         AND ($3::boolean = TRUE OR o.attempts < COALESCE(o.max_attempts, 3))
+         AND (
+           ($3::boolean = TRUE AND $4::text[] IS NOT NULL)
+           OR (o.next_retry_at IS NOT NULL AND o.next_retry_at <= NOW())
+         )
+         AND ($3::boolean = TRUE OR (
+           COALESCE(o.last_error, '') NOT ILIKE '%pausado%'
+           AND COALESCE(o.last_error, '') NOT ILIKE '%excluido%'
+         ))
+         AND ($5::timestamptz IS NULL OR o.created_at >= $5::timestamptz)
+         AND ($4::text[] IS NULL OR o.id = ANY($4::text[]))
+       ORDER BY o.created_at ASC
+       FOR UPDATE OF o SKIP LOCKED
+       LIMIT $6
+     )
+     UPDATE nalas_outbox_events o
+     SET attempts = o.attempts + 1,
+         max_attempts = COALESCE(o.max_attempts, 3),
+         next_retry_at = NOW() + ($7::int * INTERVAL '1 second'),
+         updated_at = NOW()
+     FROM due
+     WHERE o.id = due.id
+     RETURNING o.id, o.business_id, o.environment, o.conversation_id, o.message_id,
+               o.connection_id, o.payload_text, o.delivery_status, o.provider_message_id,
+               o.attempts, o.max_attempts, o.next_retry_at, o.last_error, o.created_at, o.updated_at`,
+    [
+      connectionId,
+      businessId,
+      allowExplicitPausedRetry,
+      targetIdsParam,
+      minCreatedParam,
+      Math.max(1, limit),
+      Math.max(30, leaseSeconds),
+    ]
+  );
+
+  const claimed: ClaimedWasapFlowOutboxRow[] = res.rows.map((r) => ({
+    id: r.id,
+    businessId: r.business_id,
+    environment: r.environment,
+    conversationId: r.conversation_id,
+    messageId: r.message_id,
+    connectionId: r.connection_id,
+    payloadText: r.payload_text,
+    deliveryStatus: r.delivery_status,
+    providerMessageId: r.provider_message_id ?? undefined,
+    attempts: Number(r.attempts ?? 1),
+    maxAttempts: Number(r.max_attempts ?? 3),
+    nextRetryAt: toIsoPg(r.next_retry_at),
+    lastError: r.last_error ?? undefined,
+    createdAt: toIsoPg(r.created_at)!,
+    updatedAt: toIsoPg(r.updated_at)!,
+  }));
+
+  return { claimed, excludedPreConnectionIds };
+}
+
+export async function resolveWasapFlowOutboxTargetsPg(
+  client: PgQueryClient,
+  claimedRows: ClaimedWasapFlowOutboxRow[]
+): Promise<ResolvedWasapFlowOutboxRow[]> {
+  if (claimedRows.length === 0) return [];
+
+  const messageIds = Array.from(new Set(claimedRows.map((r) => r.messageId)));
+  const conversationIds = Array.from(new Set(claimedRows.map((r) => r.conversationId)));
+
+  const [msgsRes, convsRes] = await Promise.all([
+    client.query<{
+      id: string;
+      text: string;
+      options: Message['options'] | null;
+    }>(
+      `SELECT id, text, options
+       FROM nalas_messages
+       WHERE id = ANY($1::text[])`,
+      [messageIds]
+    ),
+    client.query<{
+      id: string;
+      business_id: string;
+      environment: Environment;
+      connection_id: string;
+      contact_id: string;
+      pinned_flow_version_id: string;
+    }>(
+      `SELECT id, business_id, environment, connection_id, contact_id, pinned_flow_version_id
+       FROM nalas_conversations
+       WHERE id = ANY($1::text[])`,
+      [conversationIds]
+    ),
+  ]);
+
+  const msgMap = new Map(msgsRes.rows.map((m) => [m.id, m]));
+  const convMap = new Map(convsRes.rows.map((cv) => [cv.id, cv]));
+
+  const contactIds = Array.from(new Set(convsRes.rows.map((cv) => cv.contact_id)));
+  const needsOptionCheck = msgsRes.rows.some((m) => Array.isArray(m.options) && m.options.length > 0);
+
+  const [contactsRes, identsRes, sessionsRes] = await Promise.all([
+    contactIds.length > 0
+      ? client.query<{ id: string; phone: string | null }>(
+          `SELECT id, phone FROM nalas_contacts WHERE id = ANY($1::text[])`,
+          [contactIds]
+        )
+      : Promise.resolve({ rows: [] as Array<{ id: string; phone: string | null }> }),
+    contactIds.length > 0
+      ? client.query<{
+          business_id: string;
+          environment: Environment;
+          connection_id: string;
+          contact_id: string;
+          external_user_id: string;
+        }>(
+          `SELECT business_id, environment, connection_id, contact_id, external_user_id
+           FROM nalas_channel_identities
+           WHERE contact_id = ANY($1::text[])`,
+          [contactIds]
+        )
+      : Promise.resolve({
+          rows: [] as Array<{
+            business_id: string;
+            environment: Environment;
+            connection_id: string;
+            contact_id: string;
+            external_user_id: string;
+          }>,
+        }),
+    needsOptionCheck
+      ? client.query<{
+          conversation_id: string;
+          pinned_flow_version_id: string;
+          current_step_id: string | null;
+        }>(
+          `SELECT conversation_id, pinned_flow_version_id, current_step_id
+           FROM nalas_sessions
+           WHERE conversation_id = ANY($1::text[])`,
+          [conversationIds]
+        )
+      : Promise.resolve({
+          rows: [] as Array<{
+            conversation_id: string;
+            pinned_flow_version_id: string;
+            current_step_id: string | null;
+          }>,
+        }),
+  ]);
+
+  const contactMap = new Map(contactsRes.rows.map((c) => [c.id, c]));
+  const identMap = new Map(
+    identsRes.rows.map((ci) => [
+      `${ci.business_id}:${ci.environment}:${ci.connection_id}:${ci.contact_id}`,
+      ci.external_user_id,
+    ])
+  );
+  const sessionMap = new Map(sessionsRes.rows.map((s) => [s.conversation_id, s]));
+
+  const flowIds = needsOptionCheck
+    ? Array.from(
+        new Set([
+          ...convsRes.rows.map((cv) => cv.pinned_flow_version_id),
+          ...sessionsRes.rows.map((s) => s.pinned_flow_version_id),
+        ].filter(Boolean))
+      )
+    : [];
+
+  const flowsRes =
+    flowIds.length > 0
+      ? await client.query<{ id: string; steps: FlowVersion['steps'] }>(
+          `SELECT id, steps FROM nalas_flow_versions WHERE id = ANY($1::text[])`,
+          [flowIds]
+        )
+      : { rows: [] as Array<{ id: string; steps: FlowVersion['steps'] }> };
+  const flowMap = new Map(flowsRes.rows.map((f) => [f.id, f.steps]));
+
+  const resolved: ResolvedWasapFlowOutboxRow[] = [];
+  for (const row of claimedRows) {
+    const conv = convMap.get(row.conversationId);
+    const msg = msgMap.get(row.messageId);
+    const contact = conv ? contactMap.get(conv.contact_id) : undefined;
+    const extId = conv
+      ? identMap.get(`${conv.business_id}:${conv.environment}:${conv.connection_id}:${conv.contact_id}`)
+      : undefined;
+    const rawRecipient =
+      extId?.trim() || contact?.phone?.replace(/[^\d]/g, '') || '';
+
+    const options = msg?.options ?? undefined;
+    let allowMultiple: boolean | undefined;
+    if (options && options.length > 0 && conv) {
+      const sess = sessionMap.get(conv.id);
+      const flowId = sess?.pinned_flow_version_id || conv.pinned_flow_version_id;
+      const steps = flowMap.get(flowId);
+      const currentStep = sess?.current_step_id
+        ? steps?.find((s) => s.id === sess.current_step_id)
+        : undefined;
+      if (currentStep?.type === 'seleccion_multiple') {
+        allowMultiple = true;
+      } else if (steps) {
+        const optIds = new Set(options.map((o) => o.id));
+        allowMultiple = steps.some(
+          (s) =>
+            s.type === 'seleccion_multiple' &&
+            (s.options?.length ?? 0) > 0 &&
+            s.options!.every((o) => optIds.has(o.id))
+        );
+      }
+    }
+
+    resolved.push({
+      row,
+      rawRecipient,
+      text: msg?.text ?? row.payloadText,
+      options,
+      allowMultiple,
+    });
+  }
+
+  return resolved;
+}
+
+export async function markWasapFlowOutboxPausedPg(
+  client: PgQueryClient,
+  params: {
+    outboxIds: string[];
+    lastError: string;
+  }
+): Promise<void> {
+  if (params.outboxIds.length === 0) return;
+  const nowIso = new Date().toISOString();
+  const res = await client.query<{ message_id: string }>(
+    `UPDATE nalas_outbox_events
+     SET delivery_status = CASE
+           WHEN delivery_status IN ('aceptado', 'entregado') THEN delivery_status
+           ELSE 'pendiente'
+         END,
+         next_retry_at = NULL,
+         last_error = CASE
+           WHEN delivery_status IN ('aceptado', 'entregado') THEN last_error
+           ELSE $2
+         END,
+         updated_at = $3::timestamptz
+     WHERE id = ANY($1::text[])
+     RETURNING message_id`,
+    [params.outboxIds, params.lastError, nowIso]
+  );
+  const messageIds = res.rows.map((r) => r.message_id).filter(Boolean);
+  if (messageIds.length > 0) {
+    await client.query(
+      `UPDATE nalas_messages
+       SET delivery_status = CASE
+             WHEN delivery_status IN ('aceptado', 'entregado') THEN delivery_status
+             ELSE 'pendiente'
+           END
+       WHERE id = ANY($1::text[])`,
+      [messageIds]
+    );
+  }
+}
+
+export async function persistWasapFlowOutboxResultPg(
+  client: PgQueryClient,
+  params: {
+    outboxId: string;
+    messageId: string;
+    businessId: string;
+    environment: Environment;
+    outcome: 'aceptado' | 'fallido';
+    providerMessageId?: string;
+    nextRetryAt?: string | null;
+    lastError?: string | null;
+    auditAction?: string;
+    auditDetail?: string;
+  }
+): Promise<{ persistedStatus: OutboxEvent['deliveryStatus'] }> {
+  const nowIso = new Date().toISOString();
+  const outRes = await client.query<{ delivery_status: OutboxEvent['deliveryStatus'] }>(
+    `UPDATE nalas_outbox_events
+     SET delivery_status = CASE
+           WHEN delivery_status = 'entregado' THEN 'entregado'
+           WHEN delivery_status = 'aceptado' AND $2 = 'fallido' THEN 'aceptado'
+           ELSE $2
+         END,
+         provider_message_id = COALESCE(provider_message_id, $3),
+         next_retry_at = CASE
+           WHEN delivery_status IN ('aceptado', 'entregado') OR $2 = 'aceptado' THEN NULL
+           ELSE $4::timestamptz
+         END,
+         last_error = CASE
+           WHEN delivery_status IN ('aceptado', 'entregado') THEN last_error
+           WHEN $2 = 'aceptado' THEN NULL
+           ELSE $5
+         END,
+         updated_at = $6::timestamptz
+     WHERE id = $1
+     RETURNING delivery_status`,
+    [
+      params.outboxId,
+      params.outcome,
+      params.providerMessageId ?? null,
+      params.nextRetryAt ?? null,
+      params.lastError ?? null,
+      nowIso,
+    ]
+  );
+
+  await client.query(
+    `UPDATE nalas_messages
+     SET delivery_status = CASE
+           WHEN delivery_status = 'entregado' THEN 'entregado'
+           WHEN delivery_status = 'aceptado' AND $2 = 'fallido' THEN 'aceptado'
+           ELSE $2
+         END,
+         provider_event_id = COALESCE(provider_event_id, $3)
+     WHERE id = $1`,
+    [params.messageId, params.outcome, params.providerMessageId ?? null]
+  );
+
+  if (params.auditAction && params.auditDetail) {
+    await insertAuditEventPg(client, {
+      businessId: params.businessId,
+      environment: params.environment,
+      actorUserId: 'integraciones',
+      module: 'integraciones',
+      action: params.auditAction,
+      detail: params.auditDetail,
+      correlationId: params.outboxId,
+    });
+  }
+
+  return {
+    persistedStatus: outRes.rows[0]?.delivery_status ?? params.outcome,
+  };
+}
+
+export async function getWasapFlowOutboxByIdPg(
+  client: PgQueryClient,
+  outboxId: string
+): Promise<OutboxEvent | null> {
+  const res = await client.query<{
+    id: string;
+    business_id: string;
+    environment: Environment;
+    conversation_id: string;
+    message_id: string;
+    connection_id: string;
+    payload_text: string;
+    delivery_status: OutboxEvent['deliveryStatus'];
+    provider_message_id: string | null;
+    attempts: number;
+    max_attempts: number | null;
+    next_retry_at: Date | string | null;
+    last_error: string | null;
+    created_at: Date | string;
+    updated_at: Date | string;
+  }>(
+    `SELECT * FROM nalas_outbox_events WHERE id = $1 LIMIT 1`,
+    [outboxId]
+  );
+  const r = res.rows[0];
+  if (!r) return null;
+  return {
+    id: r.id,
+    businessId: r.business_id,
+    environment: r.environment,
+    conversationId: r.conversation_id,
+    messageId: r.message_id,
+    connectionId: r.connection_id,
+    payloadText: r.payload_text,
+    deliveryStatus: r.delivery_status,
+    providerMessageId: r.provider_message_id ?? undefined,
+    attempts: Number(r.attempts ?? 0),
+    maxAttempts: Number(r.max_attempts ?? 3),
+    nextRetryAt: toIsoPg(r.next_retry_at),
+    lastError: r.last_error ?? undefined,
+    createdAt: toIsoPg(r.created_at)!,
+    updatedAt: toIsoPg(r.updated_at)!,
+  };
+}
+
