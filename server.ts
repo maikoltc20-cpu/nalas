@@ -6,72 +6,13 @@ import { getSessionSigningSecret } from './src/server/modules/auth.ts';
 import { getDatabaseInitStatus } from './src/server/modules/dbInit.ts';
 import { ensureMetaVerifyTokenInitialized } from './src/server/modules/metaWebhook.ts';
 import { getStorageBackendInfo, initializePersistence } from './src/server/modules/persistence.ts';
-import { runWithRuntimeContext } from './src/server/runtimeContext.ts';
-import { webApp } from './src/server/webApp.ts';
+import { mountApiMiddleware } from './src/server/nodeExpressApp.ts';
 
 const app = express();
 app.set('trust proxy', 1);
 
-// Delegate all /api/* requests to shared Web Standard router (identical behavior to Cloudflare Workers)
-app.use('/api', async (req, res, next) => {
-  try {
-    const chunks: Buffer[] = [];
-    if (req.method !== 'GET' && req.method !== 'HEAD') {
-      await new Promise<void>((resolve, reject) => {
-        req.on('data', (chunk: Buffer) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
-        req.on('end', () => resolve());
-        req.on('error', (err) => reject(err));
-      });
-    }
-    const rawBody = chunks.length > 0 ? Buffer.concat(chunks) : undefined;
-
-    const proto = req.header('x-forwarded-proto') || req.protocol || 'http';
-    const host = req.header('x-forwarded-host') || req.header('host') || 'localhost:3000';
-    const fullUrl = `${proto}://${host}${req.originalUrl}`;
-
-    const headers = new Headers();
-    for (const [key, val] of Object.entries(req.headers)) {
-      if (typeof val === 'string') {
-        headers.set(key, val);
-      } else if (Array.isArray(val)) {
-        for (const item of val) headers.append(key, item);
-      }
-    }
-
-    const webRequest = new Request(fullUrl, {
-      method: req.method,
-      headers,
-      body: rawBody ? new Uint8Array(rawBody.buffer, rawBody.byteOffset, rawBody.byteLength) : undefined,
-    });
-
-    const webResponse = await runWithRuntimeContext(
-      { env: process.env, isWorker: false },
-      () => webApp.fetch(webRequest)
-    );
-
-    res.status(webResponse.status);
-    const setCookies =
-      typeof webResponse.headers.getSetCookie === 'function'
-        ? webResponse.headers.getSetCookie()
-        : [];
-    webResponse.headers.forEach((value, key) => {
-      if (key.toLowerCase() === 'set-cookie') return;
-      res.setHeader(key, value);
-    });
-    if (setCookies.length > 0) {
-      res.setHeader('Set-Cookie', setCookies);
-    } else {
-      const singleCookie = webResponse.headers.get('set-cookie');
-      if (singleCookie) {
-        res.setHeader('Set-Cookie', singleCookie);
-      }
-    }
-    const respBuf = Buffer.from(await webResponse.arrayBuffer());
-    res.send(respBuf);
-  } catch (err) {
-    next(err);
-  }
-});
+// Delegate all /api and /api/* requests to shared Web Standard router without HTML fallback
+mountApiMiddleware(app);
 
 // ---------------------------------------------------------------------------
 // Start Server (Vite dev middleware in dev, static dist in production)
@@ -81,9 +22,15 @@ const PORT = Number(process.env.PORT) || 3000;
 
 async function start() {
   if (!isPostgresConfigured()) {
-    await initializePersistence();
-    await getSessionSigningSecret();
-    await ensureMetaVerifyTokenInitialized();
+    if (process.env.NODE_ENV !== 'production') {
+      await initializePersistence();
+      await getSessionSigningSecret();
+      await ensureMetaVerifyTokenInitialized();
+    } else {
+      console.error(
+        'NALAS en modo producción sin DATABASE_URL configurado. Los endpoints de sesión devolverán diagnóstico JSON controlado hasta configurar PostgreSQL.'
+      );
+    }
   } else {
     const status = await getDatabaseInitStatus().catch(() => null);
     if (status && !status.initialized) {
@@ -100,7 +47,11 @@ async function start() {
   } else {
     const distDir = path.resolve(process.cwd(), 'dist');
     app.use(express.static(distDir));
-    app.get('*', (_req, res) => {
+    app.get('*', (req, res) => {
+      if (req.path === '/api' || req.path.startsWith('/api/')) {
+        res.status(404).json({ error: 'Ruta API no encontrada.' });
+        return;
+      }
       res.sendFile(path.join(distDir, 'index.html'));
     });
   }

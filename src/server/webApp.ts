@@ -281,23 +281,54 @@ webApp.get('/api/auth/session', async (c) => {
   const storage = getStorageBackendInfo();
   const productionMode = isProductionAccessMode();
   if (isLocalDevPreviewBypassEnabled()) {
-    const store = await readStore();
-    const devOwner = resolveLocalDevOwnerUser(store);
-    return c.json({
-      authenticated: Boolean(devOwner),
-      user: devOwner,
-      initialized: true,
-      productionMode: false,
-      devPreviewDirectAccess: true,
-      dbError: null,
-      authIssue: null,
-      googleLoginEnabled: false,
-      googleIssue: null,
-      googleLinked: false,
-      demoQuickLoginEnabled: false,
-      demoUsers: [],
-      storage,
-    });
+    try {
+      const store = await readStore();
+      const devOwner = resolveLocalDevOwnerUser(store);
+      return c.json({
+        authenticated: Boolean(devOwner),
+        user: devOwner,
+        initialized: true,
+        productionMode: false,
+        devPreviewDirectAccess: true,
+        dbError: null,
+        authIssue: null,
+        googleLoginEnabled: false,
+        googleIssue: null,
+        googleLinked: false,
+        demoQuickLoginEnabled: false,
+        demoUsers: [],
+        storage,
+      });
+    } catch (err) {
+      const code = (err as { code?: string })?.code;
+      const isUninitialized = code === 'DB_NOT_INITIALIZED' || code === 'DB_UNINITIALIZED';
+      const message =
+        err instanceof Error
+          ? err.message
+          : 'Error verificando la sesión de desarrollo local.';
+      return c.json({
+        authenticated: false,
+        user: null,
+        initialized: !isUninitialized,
+        productionMode: false,
+        devPreviewDirectAccess: true,
+        dbError: message,
+        authIssue: {
+          code: isUninitialized ? 'DB_UNINITIALIZED' : 'DB_CONNECTION_ERROR',
+          title: isUninitialized
+            ? 'Base de datos pendiente de preparación inicial'
+            : 'Error de conexión al inicializar sesión de desarrollo',
+          message,
+          actionLabel: 'Reintentar',
+        },
+        googleLoginEnabled: false,
+        googleIssue: null,
+        googleLinked: false,
+        demoQuickLoginEnabled: false,
+        demoUsers: [],
+        storage,
+      });
+    }
   }
   try {
     const initStatus = await getDatabaseInitStatus();
@@ -2832,4 +2863,22 @@ webApp.patch('/api/tasks/:taskId/resolve', async (c) => {
   } catch (err) {
     return errorResponse(err);
   }
+});
+
+webApp.all('/api', (c) =>
+  c.json({ error: 'Ruta API no encontrada.' }, { status: 404 })
+);
+
+webApp.all('/api/*', (c) =>
+  c.json({ error: 'Ruta API no encontrada.' }, { status: 404 })
+);
+
+webApp.onError((err, c) => {
+  const rawStatus = (err as { statusCode?: number; status?: number })?.statusCode ??
+    (err as { status?: number })?.status;
+  const status =
+    typeof rawStatus === 'number' && rawStatus >= 400 && rawStatus <= 599 ? rawStatus : 500;
+  const message =
+    err instanceof Error ? err.message : 'Error interno del servidor';
+  return c.json({ error: message }, status as 400 | 401 | 403 | 404 | 500 | 503);
 });

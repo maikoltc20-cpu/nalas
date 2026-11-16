@@ -39,7 +39,8 @@ export default {
   async fetch(request: Request, env: WorkerEnv, ctx: WorkerExecContext): Promise<Response> {
     const url = new URL(request.url);
 
-    if (url.pathname.startsWith('/api/')) {
+    const isApiRoute = url.pathname === '/api' || url.pathname.startsWith('/api/');
+    if (isApiRoute) {
       const isWasapFlowWebhook = url.pathname === '/api/webhooks/wasapflow';
       const requestId = isWasapFlowWebhook ? buildSafeRequestId(request) : undefined;
       const startedAt = isWasapFlowWebhook ? Date.now() : 0;
@@ -91,8 +92,20 @@ export default {
                   errorName: err instanceof Error ? err.name : 'UnknownError',
                 })
               );
+            } else {
+              console.error('Worker /api unhandled error:', err);
             }
-            throw err;
+            const rawStatus = (err as { statusCode?: number })?.statusCode;
+            const status =
+              typeof rawStatus === 'number' && rawStatus >= 400 && rawStatus <= 599
+                ? rawStatus
+                : 500;
+            const message =
+              err instanceof Error ? err.message : 'Error interno procesando la petición API.';
+            return new Response(JSON.stringify({ error: message }), {
+              status,
+              headers: { 'Content-Type': 'application/json; charset=utf-8' },
+            });
           }
         }
       );

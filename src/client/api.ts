@@ -141,9 +141,30 @@ async function apiFetch<T>(
     headers,
   });
   const text = await res.text();
-  const data = text ? JSON.parse(text) : {};
+  const contentType = res.headers.get('content-type') || '';
+  let data: Record<string, unknown> = {};
+  if (text) {
+    try {
+      data = JSON.parse(text) as Record<string, unknown>;
+    } catch {
+      const trimmed = text.trimStart();
+      const looksHtml =
+        contentType.toLowerCase().includes('text/html') ||
+        trimmed.startsWith('<!') ||
+        trimmed.startsWith('<html');
+      const err = new Error(
+        looksHtml
+          ? `El servidor devolvió HTML inesperado en ${path} (HTTP ${res.status}, Content-Type: ${contentType || 'desconocido'}).`
+          : `Respuesta no JSON válida en ${path} (HTTP ${res.status}, Content-Type: ${contentType || 'desconocido'}).`
+      ) as Error & { status?: number };
+      err.status = res.status;
+      throw err;
+    }
+  }
   if (!res.ok) {
-    const err = new Error(data.error || `Error HTTP ${res.status}`) as Error & { status?: number };
+    const err = new Error(
+      (typeof data.error === 'string' && data.error) || `Error HTTP ${res.status}`
+    ) as Error & { status?: number };
     err.status = res.status;
     throw err;
   }
