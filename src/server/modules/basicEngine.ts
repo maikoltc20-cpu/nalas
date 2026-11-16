@@ -33,6 +33,8 @@ export interface BasicEngineOutput {
   confirmedLead?: Lead;
   cancelled?: boolean;
   categorization?: CategorizationResult;
+  completedInteraction?: boolean;
+  closureReason?: 'solicitud_confirmada' | 'cierre_flujo' | 'cancelada';
 }
 
 const GREETING_PATTERNS = [
@@ -886,7 +888,11 @@ function advanceFromStep(
       session.currentStepId = nextStep.id;
       session.updatedAt = new Date().toISOString();
       replyChunks.push(interpolateTemplate(nextStep.prompt, session));
-      return { replyText: replyChunks.join('\n\n') };
+      return {
+        replyText: replyChunks.join('\n\n'),
+        completedInteraction: true,
+        closureReason: 'cierre_flujo',
+      };
     }
 
     // If entering a context_builder step when prior context already exists
@@ -925,6 +931,8 @@ function advanceFromStep(
   session.updatedAt = new Date().toISOString();
   return {
     replyText: replyChunks.join('\n\n') || 'Flujo finalizado.',
+    completedInteraction: true,
+    closureReason: 'cierre_flujo',
   };
 }
 
@@ -1002,6 +1010,8 @@ export function runBasicEngine(params: {
         ),
         confirmedLead: existingLead,
         categorization: existingLead?.categorization,
+        completedInteraction: true,
+        closureReason: 'solicitud_confirmada',
       };
     }
     session.captureStatus = 'cancelada';
@@ -1015,6 +1025,8 @@ export function runBasicEngine(params: {
         flow.cancelMessage ??
         'Borrador cancelado. Si deseas iniciar nuevamente, escríbenos en cualquier momento.',
       cancelled: true,
+      completedInteraction: true,
+      closureReason: 'cancelada',
     };
   }
 
@@ -1037,6 +1049,8 @@ export function runBasicEngine(params: {
       ),
       confirmedLead: existingLead,
       categorization: existingLead?.categorization,
+      completedInteraction: true,
+      closureReason: 'solicitud_confirmada',
     };
   }
 
@@ -1517,6 +1531,8 @@ export function runBasicEngine(params: {
         ),
         confirmedLead: existingLead,
         categorization: existingLead.categorization,
+        completedInteraction: true,
+        closureReason: 'solicitud_confirmada',
       };
     }
 
@@ -1583,6 +1599,8 @@ export function runBasicEngine(params: {
         separateMessages,
         confirmedLead: newLead,
         categorization,
+        completedInteraction: true,
+        closureReason: 'solicitud_confirmada',
       };
     } catch {
       session.captureStatus = 'borrador';

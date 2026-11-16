@@ -119,8 +119,7 @@ export function findOpportunityForLead(
 ): Opportunity | undefined {
   return (
     opportunities.find((o) => o.leadId === lead.id) ??
-    opportunities.find((o) => o.conversationId === lead.conversationId) ??
-    opportunities.find((o) => o.contactId === lead.contactId)
+    opportunities.find((o) => o.conversationId === lead.conversationId)
   );
 }
 
@@ -169,14 +168,21 @@ export function buildCapturedContactEntries(params: {
 }): CapturedContactEntry[] {
   const entries: CapturedContactEntry[] = [];
   for (const contact of params.contacts) {
-    const lead = params.leads.find((l) => l.contactId === contact.id);
-    const contactConvs = params.conversations.filter((c) => c.contactId === contact.id);
+    const lead = [...params.leads]
+      .filter((l) => l.contactId === contact.id)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+    const contactConvs = params.conversations
+      .filter((c) => c.contactId === contact.id)
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
     const convIds = new Set(contactConvs.map((c) => c.id));
 
     const opportunity =
-      params.opportunities.find((o) => o.contactId === contact.id) ??
       (lead ? params.opportunities.find((o) => o.leadId === lead.id) : undefined) ??
-      params.opportunities.find((o) => o.conversationId && convIds.has(o.conversationId));
+      (lead?.conversationId
+        ? params.opportunities.find((o) => o.conversationId === lead.conversationId)
+        : undefined) ??
+      params.opportunities.find((o) => o.conversationId && convIds.has(o.conversationId)) ??
+      params.opportunities.find((o) => o.contactId === contact.id);
 
     const conversation =
       contactConvs[0] ??
@@ -784,6 +790,21 @@ export function OperationsWorkspace({
     }
   }
 
+  async function handleCloseHumanAttention(convId: string) {
+    setBusy(true);
+    try {
+      await nalasApi.closeHumanAttention(ctx, convId, 'Atención humana finalizada desde Atención');
+      await onRefresh();
+      onNotice(
+        'Atención cerrada y marcada como finalizada. Si el contacto vuelve a escribir, iniciará una interacción nueva.'
+      );
+    } catch (e) {
+      onError(e instanceof Error ? e.message : 'No se pudo cerrar la atención.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function handleConfirmRestartPublished(convId: string) {
     setBusy(true);
     try {
@@ -1074,12 +1095,23 @@ export function OperationsWorkspace({
     const botActiveCount = scoped.conversations.filter(
       (c) => c.status === 'abierta' && c.control === 'bot'
     ).length;
-    const waitingHumanCount = scoped.conversations.filter((c) => c.control !== 'bot').length;
+    const waitingHumanCount = scoped.conversations.filter(
+      (c) => c.status === 'abierta' && c.control !== 'bot'
+    ).length;
     const withOppCount = scoped.conversations.filter(
       (c) =>
         scoped.opportunities.some((o) => o.conversationId === c.id) ||
         scoped.leads.some((l) => l.conversationId === c.id)
     ).length;
+    const contactConvsMap = new Map<string, Conversation[]>();
+    for (const c of scoped.conversations) {
+      const arr = contactConvsMap.get(c.contactId) ?? [];
+      arr.push(c);
+      contactConvsMap.set(c.contactId, arr);
+    }
+    for (const arr of contactConvsMap.values()) {
+      arr.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    }
 
     return (
       <div className="space-y-6">
@@ -1167,11 +1199,16 @@ export function OperationsWorkspace({
                   const lastMsg = [...scoped.messages]
                     .reverse()
                     .find((m) => m.conversationId === conv.id);
+                  const convLeads = scoped.leads.filter((l) => l.conversationId === conv.id);
+                  const convLeadRef = convLeads[0]?.commercialReference;
                   const hasOpp =
                     scoped.opportunities.some((o) => o.conversationId === conv.id) ||
-                    scoped.leads.some((l) => l.conversationId === conv.id);
+                    convLeads.length > 0;
                   const convSession = sessionsByConversationId.get(conv.id);
                   const flowMeta = getConversationFlowMeta(conv, convSession);
+                  const contactThreadList = contactConvsMap.get(conv.contactId) ?? [conv];
+                  const threadIndex = contactThreadList.findIndex((c) => c.id === conv.id) + 1;
+                  const isClosed = conv.status === 'cerrada';
 
                   return (
                     <button
@@ -1190,6 +1227,7 @@ export function OperationsWorkspace({
                       <div className="flex items-center justify-between gap-2">
                         <span className="text-[15px] font-semibold text-[#25364A] truncate">
                           {cnt?.fullName || cnt?.phone || 'Visitante'}
+                          {contactThreadList.length > 1 ? ` · #${threadIndex}` : ''}
                         </span>
                         <span className="text-xs text-[#5A6877] tabular-nums shrink-0">
                           {new Date(conv.updatedAt).toLocaleTimeString('es-ES', {
@@ -1208,39 +1246,50 @@ export function OperationsWorkspace({
                         </p>
                       )}
                       <div className="mt-2 flex flex-wrap gap-1.5">
-                        <span
-                          className={`inline-block rounded-md px-2 py-0.5 text-xs font-medium ${
-                            conv.control === 'bot'
-                              ? 'bg-[#EAF5F2] text-[#116B70]'
+                        {isClosed ? (
+                          <span className="inline-block rounded-md px-2 py-0.5 text-xs font-medium bg-[#EDF1F3] text-[#25364A]">
+                            Finalizada
+                          </span>
+                        ) : (
+                          <span
+                            className={`inline-block rounded-md px-2 py-0.5 text-xs font-medium ${
+                              conv.control === 'bot'
+                                ? 'bg-[#EAF5F2] text-[#116B70]'
+                                : conv.control === 'esperando_humano'
+                                  ? 'bg-[#FFF0E3] text-[#8C542C]'
+                                  : 'bg-[#F0ECF9] text-[#5D4886]'
+                            }`}
+                          >
+                            {conv.control === 'bot'
+                              ? 'Asistente atendiendo'
                               : conv.control === 'esperando_humano'
-                                ? 'bg-[#FFF0E3] text-[#8C542C]'
-                                : 'bg-[#F0ECF9] text-[#5D4886]'
-                          }`}
-                        >
-                          {conv.control === 'bot'
-                            ? 'Asistente atendiendo'
-                            : conv.control === 'esperando_humano'
-                              ? 'Espera respuesta'
-                              : 'Respondiendo vos'}
-                        </span>
-                        {flowMeta.isPausedForReview && (
+                                ? 'Espera respuesta'
+                                : 'Respondiendo vos'}
+                          </span>
+                        )}
+                        {convLeadRef && (
+                          <span className="inline-block rounded-md px-2 py-0.5 text-xs font-medium bg-[#EDF1F3] text-[#25364A] font-mono">
+                            {convLeadRef}
+                          </span>
+                        )}
+                        {!isClosed && flowMeta.isPausedForReview && (
                           <span className="inline-block rounded-md px-2 py-0.5 text-xs font-medium bg-red-50 text-red-700 border border-red-200">
                             Pausado por revisión
                           </span>
                         )}
-                        {flowMeta.isPinnedRetired && (
+                        {!isClosed && flowMeta.isPinnedRetired && (
                           <span className="inline-block rounded-md px-2 py-0.5 text-xs font-medium bg-red-50 text-red-700 border border-red-200">
                             Versión retirada
                           </span>
                         )}
-                        {flowMeta.isOutdated && (
+                        {!isClosed && flowMeta.isOutdated && (
                           <span className="inline-block rounded-md px-2 py-0.5 text-xs font-medium bg-[#FFF0E3] text-[#8C542C]">
                             Versión anterior ({flowMeta.pinnedLabel})
                           </span>
                         )}
                         {hasOpp && (
                           <span className="inline-block rounded-md px-2 py-0.5 text-xs font-medium bg-[#EAF5F2] text-[#116B70]">
-                            En Gestión
+                            Con solicitud
                           </span>
                         )}
                       </div>
@@ -1264,6 +1313,7 @@ export function OperationsWorkspace({
             ) : (() => {
               const selectedSession = sessionsByConversationId.get(selectedConv.id);
               const selectedFlowMeta = getConversationFlowMeta(selectedConv, selectedSession);
+              const isSelectedClosed = selectedConv.status === 'cerrada';
               return (
               <>
                 <div className="px-5 py-4 border-b border-[#E2E7EB] space-y-3">
@@ -1283,21 +1333,27 @@ export function OperationsWorkspace({
                           {selectedConv.productName ? ` · ${selectedConv.productName}` : ''}
                         </h2>
                         <div className="mt-1 flex flex-wrap items-center gap-2">
-                          <span
-                            className={`inline-block rounded-md px-2 py-0.5 text-xs font-medium ${
-                              selectedConv.control === 'bot'
-                                ? 'bg-[#EAF5F2] text-[#116B70]'
+                          {isSelectedClosed ? (
+                            <span className="inline-block rounded-md px-2 py-0.5 text-xs font-medium bg-[#EDF1F3] text-[#25364A]">
+                              Interacción finalizada
+                            </span>
+                          ) : (
+                            <span
+                              className={`inline-block rounded-md px-2 py-0.5 text-xs font-medium ${
+                                selectedConv.control === 'bot'
+                                  ? 'bg-[#EAF5F2] text-[#116B70]'
+                                  : selectedConv.control === 'esperando_humano'
+                                    ? 'bg-[#FFF0E3] text-[#8C542C]'
+                                    : 'bg-[#F0ECF9] text-[#5D4886]'
+                              }`}
+                            >
+                              {selectedConv.control === 'bot'
+                                ? 'Asistente atendiendo'
                                 : selectedConv.control === 'esperando_humano'
-                                  ? 'bg-[#FFF0E3] text-[#8C542C]'
-                                  : 'bg-[#F0ECF9] text-[#5D4886]'
-                            }`}
-                          >
-                            {selectedConv.control === 'bot'
-                              ? 'Asistente atendiendo'
-                              : selectedConv.control === 'esperando_humano'
-                                ? 'Espera tu respuesta'
-                                : 'Atendiendo vos'}
-                          </span>
+                                  ? 'Espera tu respuesta'
+                                  : 'Atendiendo vos'}
+                            </span>
+                          )}
                           <span className="text-xs text-[#5A6877] tabular-nums">
                             {selectedFlowMeta.conversationName} · Fijada:{' '}
                             <strong className="text-[#25364A]">{selectedFlowMeta.pinnedLabel}</strong>{' '}
@@ -1310,44 +1366,71 @@ export function OperationsWorkspace({
                       </div>
                     </div>
 
-                    <div className="flex flex-wrap items-center gap-2">
-                      {selectedConv.control !== 'humano_activo' && (
+                    {!isSelectedClosed && (
+                      <div className="flex flex-wrap items-center gap-2">
+                        {selectedConv.control !== 'humano_activo' && (
+                          <button
+                            type="button"
+                            disabled={busy}
+                            onClick={() => handleTakeover(selectedConv.id)}
+                            className="inline-flex items-center gap-1.5 min-h-[40px] px-3.5 py-2 text-xs font-semibold text-white bg-[#167D83] rounded-[9px] hover:bg-[#116B70] whitespace-nowrap"
+                          >
+                            <UserCheck className="w-4 h-4" />
+                            <span>Responder yo</span>
+                          </button>
+                        )}
+                        {selectedConv.control !== 'bot' && (
+                          <>
+                            <button
+                              type="button"
+                              disabled={busy}
+                              onClick={() => handleCloseHumanAttention(selectedConv.id)}
+                              className="inline-flex items-center gap-1.5 min-h-[40px] px-3.5 py-2 text-xs font-semibold text-[#25364A] bg-[#F7F8FA] border border-[#DCE3E8] rounded-[9px] hover:bg-[#EDF1F3] whitespace-nowrap"
+                            >
+                              <CheckCircle2 className="w-4 h-4 text-[#167D83]" />
+                              <span>Cerrar atención</span>
+                            </button>
+                            <button
+                              type="button"
+                              disabled={busy}
+                              onClick={() => handleResumeBot(selectedConv.id)}
+                              className="inline-flex items-center gap-1.5 min-h-[40px] px-3.5 py-2 text-xs font-medium text-[#116B70] bg-[#EAF5F2] border border-[#D4EAE4] rounded-[9px] hover:bg-[#DCEFE9] whitespace-nowrap"
+                            >
+                              <Play className="w-4 h-4" />
+                              <span>Devolver al asistente</span>
+                            </button>
+                          </>
+                        )}
                         <button
                           type="button"
                           disabled={busy}
-                          onClick={() => handleTakeover(selectedConv.id)}
-                          className="inline-flex items-center gap-1.5 min-h-[40px] px-3.5 py-2 text-xs font-semibold text-white bg-[#167D83] rounded-[9px] hover:bg-[#116B70] whitespace-nowrap"
+                          onClick={() => setRestartConfirmConvId(selectedConv.id)}
+                          className="inline-flex items-center gap-1.5 min-h-[40px] px-3.5 py-2 text-xs font-medium text-[#25364A] bg-white border border-[#DCE3E8] rounded-[9px] hover:bg-[#F7F8FA] whitespace-nowrap"
                         >
-                          <UserCheck className="w-4 h-4" />
-                          <span>Responder yo</span>
+                          <RotateCcw className="w-3.5 h-3.5 text-[#167D83]" />
+                          <span>Reiniciar con la versión publicada</span>
                         </button>
-                      )}
-                      {selectedConv.control !== 'bot' && (
-                        <button
-                          type="button"
-                          disabled={busy}
-                          onClick={() => handleResumeBot(selectedConv.id)}
-                          className="inline-flex items-center gap-1.5 min-h-[40px] px-3.5 py-2 text-xs font-medium text-[#116B70] bg-[#EAF5F2] border border-[#D4EAE4] rounded-[9px] hover:bg-[#DCEFE9] whitespace-nowrap"
-                        >
-                          <Play className="w-4 h-4" />
-                          <span>Devolver al asistente</span>
-                        </button>
-                      )}
-                      <button
-                        type="button"
-                        disabled={busy}
-                        onClick={() => setRestartConfirmConvId(selectedConv.id)}
-                        className="inline-flex items-center gap-1.5 min-h-[40px] px-3.5 py-2 text-xs font-medium text-[#25364A] bg-white border border-[#DCE3E8] rounded-[9px] hover:bg-[#F7F8FA] whitespace-nowrap"
-                      >
-                        <RotateCcw className="w-3.5 h-3.5 text-[#167D83]" />
-                        <span>Reiniciar con la versión publicada</span>
-                      </button>
-                    </div>
+                      </div>
+                    )}
                   </div>
 
-                  {(selectedFlowMeta.isPausedForReview ||
-                    selectedFlowMeta.isPinnedRetired ||
-                    selectedFlowMeta.isOutdated) && (
+                  {isSelectedClosed && (
+                    <div className="p-3 rounded-[9px] border border-[#DCE3E8] bg-[#F7F8FA] text-xs text-[#25364A] flex items-start gap-2">
+                      <CheckCircle2 className="w-4 h-4 mt-0.5 shrink-0 text-[#167D83]" />
+                      <div>
+                        <span className="font-semibold">Interacción finalizada</span>
+                        {selectedSession?.completedAt
+                          ? ` el ${new Date(selectedSession.completedAt).toLocaleString('es-ES')}`
+                          : ''}
+                        . Se conserva este historial completo sin sobrescribirlo; si el cliente vuelve a escribir, se abrirá una interacción nueva con las versiones publicadas vigentes.
+                      </div>
+                    </div>
+                  )}
+
+                  {!isSelectedClosed &&
+                    (selectedFlowMeta.isPausedForReview ||
+                      selectedFlowMeta.isPinnedRetired ||
+                      selectedFlowMeta.isOutdated) && (
                     <div
                       className={`p-3 rounded-[9px] border text-xs flex items-start gap-2 ${
                         selectedFlowMeta.isPausedForReview || selectedFlowMeta.isPinnedRetired
@@ -1417,19 +1500,26 @@ export function OperationsWorkspace({
                   className="p-4 border-t border-[#E2E7EB] flex gap-2.5 bg-white"
                   onSubmit={(e) => {
                     e.preventDefault();
-                    handleSendHumanReply(selectedConv.id);
+                    if (!isSelectedClosed) {
+                      handleSendHumanReply(selectedConv.id);
+                    }
                   }}
                 >
                   <input
                     type="text"
                     value={humanReply}
+                    disabled={isSelectedClosed || busy}
                     onChange={(e) => setHumanReply(e.target.value)}
-                    placeholder="Escribí tu respuesta (mantiene al asistente en pausa)…"
-                    className="flex-1 min-h-[44px] text-sm border border-[#DCE3E8] rounded-[9px] px-3.5 py-2"
+                    placeholder={
+                      isSelectedClosed
+                        ? 'Interacción finalizada (solo lectura)…'
+                        : 'Escribí tu respuesta (mantiene al asistente en pausa)…'
+                    }
+                    className="flex-1 min-h-[44px] text-sm border border-[#DCE3E8] rounded-[9px] px-3.5 py-2 disabled:bg-[#F7F8FA]"
                   />
                   <button
                     type="submit"
-                    disabled={busy || !humanReply.trim()}
+                    disabled={isSelectedClosed || busy || !humanReply.trim()}
                     className="inline-flex items-center gap-2 min-h-[44px] px-4 py-2 text-sm font-semibold text-white bg-[#167D83] rounded-[9px] hover:bg-[#116B70] disabled:opacity-40 whitespace-nowrap"
                   >
                     <Send className="w-4 h-4" />
@@ -1452,7 +1542,11 @@ export function OperationsWorkspace({
               <p className="text-sm text-[#5A6877]">
                 Elegí una conversación para ver los datos de contacto y seguimiento.
               </p>
-            ) : (
+            ) : (() => {
+              const contactHistoryConvs = [...(contactConvsMap.get(selectedConv.contactId) ?? [selectedConv])]
+                .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+              const contactLeadCount = scoped.leads.filter((l) => l.contactId === selectedConv.contactId).length;
+              return (
               <div className="space-y-4 text-sm">
                 <div>
                   <div className="font-semibold text-[#25364A]">
@@ -1470,7 +1564,31 @@ export function OperationsWorkspace({
                       Empresa: {selectedContact.company}
                     </div>
                   )}
+                  <div className="text-xs text-[#5A6877] mt-1">
+                    {contactHistoryConvs.length} interacción{contactHistoryConvs.length === 1 ? '' : 'es'} · {contactLeadCount} solicitud{contactLeadCount === 1 ? '' : 'es'}
+                  </div>
                 </div>
+
+                {selectedConvLeads.length > 0 && (
+                  <div className="border-t border-[#EDF0F2] pt-4 space-y-1.5">
+                    <div className="text-xs font-semibold text-[#25364A]">
+                      Solicitud de esta interacción
+                    </div>
+                    {selectedConvLeads.map((l) => (
+                      <div key={l.id} className="text-xs text-[#5A6877] space-y-0.5">
+                        {l.commercialReference && (
+                          <div className="font-mono font-semibold text-[#25364A]">
+                            Ref: {l.commercialReference}
+                          </div>
+                        )}
+                        <div>
+                          {PRIORITY_LABELS[l.categorization.priority] ?? l.categorization.priority} ·{' '}
+                          {l.productName ?? 'Consulta general'}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
 
                 {selectedConvOpps.length > 0 ? (
                   <div className="border-t border-[#EDF0F2] pt-4 space-y-3">
@@ -1524,8 +1642,58 @@ export function OperationsWorkspace({
                     Cuando esta conversación complete un contacto o criterio comercial, aparecerá acá para su seguimiento en Gestión.
                   </div>
                 )}
+
+                {contactHistoryConvs.length > 1 && (
+                  <div className="border-t border-[#EDF0F2] pt-4 space-y-2">
+                    <div className="text-xs font-semibold text-[#25364A] flex items-center gap-1.5">
+                      <History className="w-3.5 h-3.5 text-[#167D83]" />
+                      <span>Interacciones del contacto ({contactHistoryConvs.length})</span>
+                    </div>
+                    <div className="space-y-1.5">
+                      {contactHistoryConvs.map((hc) => {
+                        const hcLead = scoped.leads.find((l) => l.conversationId === hc.id);
+                        const isCurrent = hc.id === selectedConv.id;
+                        const statusText =
+                          hc.status === 'cerrada'
+                            ? 'Finalizada'
+                            : hc.control === 'bot'
+                              ? 'Abierta (asistente)'
+                              : hc.control === 'esperando_humano'
+                                ? 'Abierta (espera humano)'
+                                : 'Abierta (humano activo)';
+                        return (
+                          <button
+                            key={hc.id}
+                            type="button"
+                            onClick={() => {
+                              setSelectedConvId(hc.id);
+                              setMobileShowThread(true);
+                            }}
+                            className={`w-full text-left px-3 py-2 rounded-[8px] border text-xs transition-colors ${
+                              isCurrent
+                                ? 'bg-[#EAF5F2] border-[#167D83] text-[#25364A]'
+                                : 'bg-[#F7F8FA] border-[#E2E7EB] text-[#5A6877] hover:bg-[#EDF1F3]'
+                            }`}
+                          >
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="font-semibold text-[#25364A] truncate">
+                                {hc.productName || 'Conversación'}
+                                {hcLead?.commercialReference ? ` · ${hcLead.commercialReference}` : ''}
+                              </span>
+                              <span className="shrink-0">{statusText}</span>
+                            </div>
+                            <div className="mt-0.5 text-[11px] tabular-nums">
+                              {new Date(hc.createdAt).toLocaleString('es-ES')}
+                            </div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
               </div>
-            )}
+              );
+            })()}
           </aside>
         </div>
 

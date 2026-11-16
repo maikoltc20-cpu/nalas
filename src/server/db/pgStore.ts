@@ -1242,6 +1242,9 @@ export async function saveStoreToPg(client: PoolClient, store: NalasStore): Prom
       pausedForReview: s.pausedForReview,
       pausedReason: s.pausedReason,
       pausedAt: s.pausedAt,
+      completedAt: s.completedAt,
+      closureReason: s.closureReason,
+      closedByUserId: s.closedByUserId,
     };
     await client.query(
       `INSERT INTO nalas_sessions (
@@ -1821,6 +1824,7 @@ export async function loadWasapFlowConversationBundlePg(
     businessId: string;
     connection: ChannelConnection;
     externalUserId: string;
+    includeLatestClosedFallback?: boolean;
   }
 ): Promise<{
   miniStore: NalasStore;
@@ -1961,7 +1965,7 @@ export async function loadWasapFlowConversationBundlePg(
 
   if (channelIdentities[0]) {
     const contactId = channelIdentities[0].contactId;
-    const [contactRes, convRes] = await Promise.all([
+    const [contactRes, initialConvRes] = await Promise.all([
       client.query(`SELECT * FROM nalas_contacts WHERE id = $1 LIMIT 1`, [contactId]),
       client.query(
         `SELECT * FROM nalas_conversations
@@ -1971,6 +1975,16 @@ export async function loadWasapFlowConversationBundlePg(
         [businessId, connection.environment, connection.id, contactId]
       ),
     ]);
+    let convRes = initialConvRes;
+    if (convRes.rows.length === 0 && params.includeLatestClosedFallback) {
+      convRes = await client.query(
+        `SELECT * FROM nalas_conversations
+         WHERE business_id = $1 AND environment = $2 AND connection_id = $3 AND contact_id = $4
+         ORDER BY updated_at DESC
+         LIMIT 1`,
+        [businessId, connection.environment, connection.id, contactId]
+      );
+    }
 
     contacts = contactRes.rows.map((r) => ({
       id: r.id,
@@ -2194,7 +2208,7 @@ export async function loadWasapFlowConversationBundlePg(
       referenceSequences.map((s) => [`${s.businessId}:${s.productKey}:${s.environment}`, s.lastNumber])
     ),
     proAiCallsBefore: counters.proAiCallsTotal,
-    hadOpenConversation: conversations.length > 0,
+    hadOpenConversation: conversations.some((c) => c.status === 'abierta'),
   };
 
   return { miniStore, preExisting };
@@ -2339,6 +2353,9 @@ export async function persistWasapFlowConversationBundlePg(
       pausedForReview: s.pausedForReview,
       pausedReason: s.pausedReason,
       pausedAt: s.pausedAt,
+      completedAt: s.completedAt,
+      closureReason: s.closureReason,
+      closedByUserId: s.closedByUserId,
     };
     queriesExecuted += 1;
     w3.push(

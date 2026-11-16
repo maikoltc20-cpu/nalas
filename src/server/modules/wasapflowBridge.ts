@@ -2512,10 +2512,21 @@ export async function processWasapFlowWebhookEvent(
           targetBusinessId,
           customer.externalUserId,
         ]);
+
+        const existingEchoDedup = await client.query(
+          `SELECT conversation_id FROM nalas_processed_inbound_events WHERE dedup_key = $1 LIMIT 1`,
+          [dedupKey]
+        );
+        if (existingEchoDedup.rows.length > 0) {
+          summary.deduplicated += 1;
+          return;
+        }
+
         const { miniStore, preExisting } = await loadWasapFlowConversationBundlePg(client, {
           businessId: targetBusinessId,
           connection: check.conn,
           externalUserId: customer.externalUserId,
+          includeLatestClosedFallback: true,
         });
         logWasapFlowStage('info', {
           requestId,
@@ -2525,16 +2536,35 @@ export async function processWasapFlowWebhookEvent(
           durationMs: Date.now() - s1,
         });
 
-        const started = startOrGetSimulatorConversation(miniStore, {
-          businessId: targetBusinessId,
-          connectionId: check.conn.id,
-          externalUserId: customer.externalUserId,
-          contactPhone: customer.contactPhone,
-          forceNew: false,
-        });
+        const existingConv = miniStore.conversations[0];
+        if (!existingConv) {
+          const s2 = Date.now();
+          const claimed = await claimInboundEventPg(client, dedupKey, 'wasapflow_echo_no_conv');
+          logWasapFlowStage('info', {
+            requestId,
+            stage: 'db_dedup_claimed',
+            event,
+            claimed,
+            durationMs: Date.now() - s2,
+          });
+          if (!claimed) {
+            summary.deduplicated += 1;
+            return;
+          }
+          await insertAuditEventPg(client, {
+            businessId: targetBusinessId,
+            environment: check.conn.environment,
+            actorUserId: 'integraciones',
+            module: 'integraciones',
+            action: 'eco_iphone_wasapflow_sin_interaccion',
+            detail: `Eco manual (${echoId}) recibido sin interacción previa del contacto; no se abrió una interacción nueva.`,
+          });
+          summary.ignoredOther += 1;
+          return;
+        }
 
         const s2 = Date.now();
-        const claimed = await claimInboundEventPg(client, dedupKey, started.conversation.id);
+        const claimed = await claimInboundEventPg(client, dedupKey, existingConv.id);
         logWasapFlowStage('info', {
           requestId,
           stage: 'db_dedup_claimed',
@@ -2548,14 +2578,17 @@ export async function processWasapFlowWebhookEvent(
           return;
         }
 
-        started.conversation.control = 'humano_activo';
-        started.conversation.updatedAt = new Date().toISOString();
+        const wasOpen = existingConv.status === 'abierta';
+        if (wasOpen) {
+          existingConv.control = 'humano_activo';
+          existingConv.updatedAt = new Date().toISOString();
+        }
 
         const humanMsg: Message = {
           id: `msg_${Date.now()}_iphone_${Math.random().toString(36).slice(2, 6)}`,
           businessId: targetBusinessId,
-          environment: started.conversation.environment,
-          conversationId: started.conversation.id,
+          environment: existingConv.environment,
+          conversationId: existingConv.id,
           sender: 'agente_humano',
           text: echoText,
           deliveryStatus: 'entregado',
@@ -2566,12 +2599,14 @@ export async function processWasapFlowWebhookEvent(
 
         appendAudit(miniStore, {
           businessId: targetBusinessId,
-          environment: started.conversation.environment,
+          environment: existingConv.environment,
           actorUserId: 'integraciones',
           module: 'conversaciones',
-          action: 'eco_iphone_wasapflow',
-          detail: `Respuesta manual detectada desde WhatsApp Business en iPhone (${readStringField(data, 'source') || 'business_app'}). Bot pausado automáticamente (control=humano_activo).`,
-          correlationId: started.conversation.id,
+          action: wasOpen ? 'eco_iphone_wasapflow' : 'eco_iphone_wasapflow_cerrada',
+          detail: wasOpen
+            ? `Respuesta manual detectada desde WhatsApp Business en iPhone (${readStringField(data, 'source') || 'business_app'}). Bot pausado automáticamente (control=humano_activo).`
+            : `Respuesta manual detectada desde WhatsApp Business en iPhone (${readStringField(data, 'source') || 'business_app'}) sobre interacción ya finalizada (${existingConv.id}); se registró sin abrir una interacción nueva.`,
+          correlationId: existingConv.id,
         });
 
         const s3 = Date.now();
@@ -2662,18 +2697,48 @@ export async function processWasapFlowWebhookEvent(
         return { matched: true as const, deduplicated: true as const };
       }
 
-      const started = startOrGetSimulatorConversation(store, {
-        businessId: targetBusinessId,
-        connectionId: check.conn.id,
-        externalUserId: customer.externalUserId,
-        contactPhone: customer.contactPhone,
-        forceNew: false,
-      });
+      const identity = store.channelIdentities.find(
+        (ci) =>
+          ci.businessId === targetBusinessId &&
+          ci.environment === check.conn.environment &&
+          ci.connectionId === check.conn.id &&
+          ci.externalUserId === customer.externalUserId
+      );
+      const matchingConvs = identity
+        ? store.conversations
+            .filter(
+              (c) =>
+                c.businessId === targetBusinessId &&
+                c.environment === check.conn.environment &&
+                c.connectionId === check.conn.id &&
+                c.contactId === identity.contactId
+            )
+            .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+        : [];
+      const targetConv =
+        matchingConvs.find((c) => c.status === 'abierta') ?? matchingConvs[0];
+
+      if (!targetConv) {
+        store.processedInboundEvents.push({
+          dedupKey,
+          conversationId: 'wasapflow_echo_no_conv',
+          processedAt: new Date().toISOString(),
+        });
+        appendAudit(store, {
+          businessId: targetBusinessId,
+          environment: check.conn.environment,
+          actorUserId: 'integraciones',
+          module: 'integraciones',
+          action: 'eco_iphone_wasapflow_sin_interaccion',
+          detail: `Eco manual (${echoId}) recibido sin interacción previa del contacto; no se abrió una interacción nueva.`,
+        });
+        return { matched: false as const };
+      }
 
       return {
         matched: true as const,
         deduplicated: false as const,
-        conversationId: started.conversation.id,
+        conversationId: targetConv.id,
       };
     });
 
@@ -2701,8 +2766,11 @@ export async function processWasapFlowWebhookEvent(
         const conv = store.conversations.find((c) => c.id === lineCheck.conversationId);
         if (!conv) return;
 
-        conv.control = 'humano_activo';
-        conv.updatedAt = new Date().toISOString();
+        const wasOpen = conv.status === 'abierta';
+        if (wasOpen) {
+          conv.control = 'humano_activo';
+          conv.updatedAt = new Date().toISOString();
+        }
 
         const humanMsg: Message = {
           id: `msg_${Date.now()}_iphone_${Math.random().toString(36).slice(2, 6)}`,
@@ -2722,8 +2790,10 @@ export async function processWasapFlowWebhookEvent(
           environment: conv.environment,
           actorUserId: 'integraciones',
           module: 'conversaciones',
-          action: 'eco_iphone_wasapflow',
-          detail: `Respuesta manual detectada desde WhatsApp Business en iPhone (${readStringField(data, 'source') || 'business_app'}). Bot pausado automáticamente (control=humano_activo).`,
+          action: wasOpen ? 'eco_iphone_wasapflow' : 'eco_iphone_wasapflow_cerrada',
+          detail: wasOpen
+            ? `Respuesta manual detectada desde WhatsApp Business en iPhone (${readStringField(data, 'source') || 'business_app'}). Bot pausado automáticamente (control=humano_activo).`
+            : `Respuesta manual detectada desde WhatsApp Business en iPhone (${readStringField(data, 'source') || 'business_app'}) sobre interacción ya finalizada (${conv.id}); se registró sin abrir una interacción nueva.`,
           correlationId: conv.id,
         });
         summary.processedEchoes += 1;
@@ -2849,6 +2919,30 @@ export async function processWasapFlowWebhookEvent(
           targetBusinessId,
           customer.externalUserId,
         ]);
+
+        const dedupKey = `${check.conn.id}:${messageId}`;
+        const existingInboundDedup = await client.query(
+          `SELECT conversation_id FROM nalas_processed_inbound_events WHERE dedup_key = $1 LIMIT 1`,
+          [dedupKey]
+        );
+        if (existingInboundDedup.rows.length > 0) {
+          const priorConvId =
+            typeof existingInboundDedup.rows[0]?.conversation_id === 'string'
+              ? existingInboundDedup.rows[0].conversation_id
+              : undefined;
+          await insertAuditEventPg(client, {
+            businessId: targetBusinessId,
+            environment: check.conn.environment,
+            actorUserId: 'integraciones',
+            module: 'integraciones',
+            action: 'evento_duplicado_omitido',
+            detail: `Evento entrante "${messageId}" deduplicado en conexión ${check.conn.id}.`,
+            correlationId: priorConvId,
+          });
+          summary.deduplicated += 1;
+          return;
+        }
+
         const { miniStore, preExisting } = await loadWasapFlowConversationBundlePg(client, {
           businessId: targetBusinessId,
           connection: check.conn,
@@ -2871,7 +2965,6 @@ export async function processWasapFlowWebhookEvent(
           forceNew: false,
         });
 
-        const dedupKey = `${check.conn.id}:${messageId}`;
         const s2 = Date.now();
         const claimed = await claimInboundEventPg(client, dedupKey, started.conversation.id);
         logWasapFlowStage('info', {
@@ -3073,6 +3166,19 @@ export async function processWasapFlowWebhookEvent(
           detail: `Evento message.received propio/saliente (${messageId}) omitido sin disparar respuesta del bot.`,
         });
         return { matched: false as const, deduplicated: false as const };
+      }
+
+      const dedupKey = `${check.conn.id}:${messageId}`;
+      if (store.processedInboundEvents.some((e) => e.dedupKey === dedupKey)) {
+        appendAudit(store, {
+          businessId: targetBusinessId,
+          environment: check.conn.environment,
+          actorUserId: 'integraciones',
+          module: 'integraciones',
+          action: 'evento_duplicado_omitido',
+          detail: `Evento entrante "${messageId}" deduplicado en conexión ${check.conn.id}.`,
+        });
+        return { matched: false as const, deduplicated: true as const };
       }
 
       const started = startOrGetSimulatorConversation(store, {

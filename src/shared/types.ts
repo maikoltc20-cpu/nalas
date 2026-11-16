@@ -440,6 +440,9 @@ export interface Session {
   pausedForReview?: boolean;
   pausedReason?: string;
   pausedAt?: string;
+  completedAt?: string;
+  closureReason?: 'solicitud_confirmada' | 'cierre_flujo' | 'cancelada' | 'cerrada_humano';
+  closedByUserId?: string;
   createdAt: string;
   updatedAt: string;
 }

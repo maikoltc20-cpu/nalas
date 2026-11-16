@@ -1077,10 +1077,23 @@ export async function processMetaWebhookEvents(payload: MetaWebhookPayload): Pro
               action: 'webhook_meta_canal_no_vinculado',
               detail: `Evento entrante ignorado: phone_number_id="${phoneNumberId || 'ausente'}" (WABA="${entryWabaId || 'sin entry.id'}", display="${displayPhoneNumber || 'sin display'}") no corresponde al número real ni al canal de prueba vinculado de ${targetBusinessId}.`,
             });
-            return { matched: false as const };
+            return { matched: false as const, deduplicated: false as const };
+          }
+          const dedupKey = `${conn.id}:${inbound.id}`;
+          if (store.processedInboundEvents.some((e) => e.dedupKey === dedupKey)) {
+            appendAudit(store, {
+              businessId: targetBusinessId,
+              environment: conn.environment,
+              actorUserId: 'integraciones',
+              module: 'integraciones',
+              action: 'evento_duplicado_omitido',
+              detail: `Evento entrante "${inbound.id}" deduplicado en conexión ${conn.id}.`,
+            });
+            return { matched: false as const, deduplicated: true as const };
           }
           return {
             matched: true as const,
+            deduplicated: false as const,
             connectionId: conn.id,
             environment: conn.environment,
             ...startOrGetSimulatorConversation(store, {
@@ -1095,7 +1108,11 @@ export async function processMetaWebhookEvents(payload: MetaWebhookPayload): Pro
         });
 
         if (!convResolution.matched) {
-          ignoredMessages += 1;
+          if (convResolution.deduplicated) {
+            deduplicatedMessages += 1;
+          } else {
+            ignoredMessages += 1;
+          }
           continue;
         }
 

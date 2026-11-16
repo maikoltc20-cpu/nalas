@@ -158,12 +158,25 @@ export function SimulatorWorkspace({
     const eventId = `evt_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     setSending(true);
     try {
-      const res = await nalasApi.sendInbound(ctx, activeConvId, {
+      let targetConvId = activeConvId;
+      if (activeConv?.status === 'cerrada') {
+        const started = await nalasApi.startSimulator(ctx, {
+          connectionId: activeConv.connectionId,
+          contactId: activeConv.contactId,
+          forceNew: false,
+          useDraft: isDraftSession,
+          useEntryDraft: isDraftSession,
+        });
+        targetConvId = started.conversation.id;
+        setActiveConvId(targetConvId);
+      }
+
+      const res = await nalasApi.sendInbound(ctx, targetConvId, {
         text: cleanText,
         selectedOptionId,
         providerEventId: eventId,
         idempotencyKey:
-          selectedOptionId === 'confirmar_si' ? `confirm_${activeConvId}` : undefined,
+          selectedOptionId === 'confirmar_si' ? `confirm_${targetConvId}` : undefined,
       });
       setMultiSelectedIds([]);
       setInputText('');
@@ -267,6 +280,11 @@ export function SimulatorWorkspace({
                   {pinnedFlow.name} · v{pinnedFlow.versionNumber}
                 </span>
               )}
+              {activeConv?.status === 'cerrada' && (
+                <span className="inline-block rounded-md px-2.5 py-0.5 text-xs font-semibold bg-[#EDF1F3] text-[#25364A]">
+                  Interacción finalizada
+                </span>
+              )}
             </div>
 
             {scoped.conversations.length > 1 && (
@@ -283,9 +301,10 @@ export function SimulatorWorkspace({
                 {scoped.conversations.map((c, i) => {
                   const fv = scoped.flowVersions.find((f) => f.id === c.pinnedFlowVersionId);
                   const tag = fv?.status === 'borrador' ? 'Borrador' : 'Publicada';
+                  const closedTag = c.status === 'cerrada' ? ' · Finalizada' : '';
                   return (
                     <option key={c.id} value={c.id}>
-                      Prueba #{scoped.conversations.length - i} ({tag})
+                      Prueba #{scoped.conversations.length - i} ({tag}{closedTag})
                     </option>
                   );
                 })}
@@ -466,13 +485,15 @@ export function SimulatorWorkspace({
                 disabled={!activeConv || sending}
                 placeholder={
                   activeConv
-                    ? activeConv.control !== 'bot'
-                      ? activeSession?.awaitingHumanContactName
-                        ? 'Escribí tu nombre…'
-                        : activeSession?.awaitingHumanContactPhone
-                          ? 'Escribí tu número con código de país (o seguí conversando acá)…'
-                          : 'Escribí un mensaje para el equipo…'
-                      : 'Escribí una respuesta…'
+                    ? activeConv.status === 'cerrada'
+                      ? 'Interacción finalizada: escribí «Hola» para iniciar una nueva interacción con el mismo contacto…'
+                      : activeConv.control !== 'bot'
+                        ? activeSession?.awaitingHumanContactName
+                          ? 'Escribí tu nombre…'
+                          : activeSession?.awaitingHumanContactPhone
+                            ? 'Escribí tu número con código de país (o seguí conversando acá)…'
+                            : 'Escribí un mensaje para el equipo…'
+                        : 'Escribí una respuesta…'
                     : 'Iniciá una prueba primero'
                 }
                 className="flex-1 min-h-[44px] text-[15px] border border-[#DCE3E8] rounded-[9px] px-4 py-2.5 bg-white disabled:bg-[#F7F8FA]"

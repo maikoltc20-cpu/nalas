@@ -73,6 +73,7 @@ import {
 } from './modules/googleOAuth.ts';
 import { resolveSafeAppBaseUrl } from './modules/urlHelper.ts';
 import {
+  closeConversationInteraction,
   processInboundMessage,
   restartConversationWithPublished,
   runSerializedForConversation,
@@ -2196,6 +2197,7 @@ webApp.post('/api/simulator/start', async (c) => {
     const body = (await c.req.json()) as {
       connectionId?: string;
       externalUserId?: string;
+      contactId?: string;
       contactName?: string;
       contactPhone?: string;
       forceNew?: boolean;
@@ -2206,10 +2208,21 @@ webApp.post('/api/simulator/start', async (c) => {
     };
     const result = await withStoreTransaction(async (store) => {
       resolveActorContext(store, userId, businessId);
+      const matchedIdentity =
+        body.contactId && body.connectionId
+          ? store.channelIdentities.find(
+              (ci) =>
+                ci.businessId === businessId &&
+                ci.connectionId === String(body.connectionId) &&
+                ci.contactId === body.contactId
+            )
+          : undefined;
       const started = startOrGetSimulatorConversation(store, {
         businessId,
         connectionId: String(body.connectionId),
-        externalUserId: String(body.externalUserId || `sim_${Date.now()}`),
+        externalUserId: String(
+          body.externalUserId || matchedIdentity?.externalUserId || `sim_${Date.now()}`
+        ),
         contactName: body.contactName,
         contactPhone: body.contactPhone,
         forceNew: Boolean(body.forceNew),
@@ -2274,6 +2287,11 @@ webApp.post('/api/conversations/:conversationId/handoff/takeover', async (c) => 
         businessId,
         'Conversación'
       );
+      if (found.status === 'cerrada') {
+        const err = new Error('La interacción ya está finalizada.');
+        (err as Error & { statusCode?: number }).statusCode = 400;
+        throw err;
+      }
       found.control = 'humano_activo';
       found.assignedUserId = userId;
       found.updatedAt = new Date().toISOString();
@@ -2317,6 +2335,11 @@ webApp.post('/api/conversations/:conversationId/handoff/reply', async (c) => {
           businessId,
           'Conversación'
         );
+        if (found.status === 'cerrada') {
+          const err = new Error('La interacción ya está finalizada.');
+          (err as Error & { statusCode?: number }).statusCode = 400;
+          throw err;
+        }
         found.control = 'humano_activo';
         found.assignedUserId = userId;
         const now = new Date().toISOString();
@@ -2354,6 +2377,11 @@ webApp.post('/api/conversations/:conversationId/handoff/resume-bot', async (c) =
           businessId,
           'Conversación'
         );
+        if (found.status === 'cerrada') {
+          const err = new Error('La interacción ya está finalizada.');
+          (err as Error & { statusCode?: number }).statusCode = 400;
+          throw err;
+        }
         const biz = store.businesses.find((b) => b.id === businessId)!;
         const assistant = store.assistants.find((a) => a.id === found.assistantId)!;
         const ses = store.sessions.find((s) => s.conversationId === found.id);
@@ -2390,6 +2418,42 @@ webApp.post('/api/conversations/:conversationId/handoff/resume-bot', async (c) =
           correlationId: found.id,
         });
         return found;
+      })
+    );
+    return c.json(conv);
+  } catch (err) {
+    return errorResponse(err);
+  }
+});
+
+webApp.post('/api/conversations/:conversationId/handoff/close', async (c) => {
+  try {
+    const { userId, businessId } = getActorContext(c);
+    const conversationId = c.req.param('conversationId');
+    let reason: string | undefined;
+    try {
+      const body = (await c.req.json()) as { reason?: string };
+      if (typeof body?.reason === 'string' && body.reason.trim()) {
+        reason = body.reason.trim();
+      }
+    } catch {
+      // Optional JSON body
+    }
+    const conv = await runSerializedForConversation(conversationId, () =>
+      withStoreTransaction((store) => {
+        const ctx = resolveActorContext(store, userId, businessId);
+        assertPermission(ctx, 'handleHumanQueue');
+        assertTenantScope(
+          store.conversations.find((cv) => cv.id === conversationId),
+          businessId,
+          'Conversación'
+        );
+        return closeConversationInteraction(store, {
+          businessId,
+          actorUserId: userId,
+          conversationId,
+          reason,
+        });
       })
     );
     return c.json(conv);
@@ -2497,9 +2561,7 @@ webApp.post('/api/opportunities', async (c) => {
           (o) =>
             o.businessId === businessId &&
             o.environment === lead.environment &&
-            (o.leadId === lead.id ||
-              o.conversationId === lead.conversationId ||
-              o.contactId === lead.contactId)
+            (o.leadId === lead.id || o.conversationId === lead.conversationId)
         );
         if (existing) {
           if (!existing.leadId) {
@@ -2551,36 +2613,41 @@ webApp.post('/api/opportunities', async (c) => {
           businessId,
           'Contacto'
         );
-        const linkedConv =
-          (body.conversationId
-            ? store.conversations.find(
-                (cv) =>
-                  cv.id === body.conversationId &&
-                  cv.businessId === businessId &&
-                  cv.environment === contact.environment
-              )
-            : undefined) ??
-          store.conversations.find(
-            (cv) =>
-              cv.businessId === businessId &&
-              cv.environment === contact.environment &&
-              cv.contactId === contact.id
-          );
-        const linkedLead = store.leads.find(
-          (l) =>
-            l.businessId === businessId &&
-            l.environment === contact.environment &&
-            (l.contactId === contact.id ||
-              (linkedConv ? l.conversationId === linkedConv.id : false))
-        );
+        const linkedConv = body.conversationId
+          ? store.conversations.find(
+              (cv) =>
+                cv.id === body.conversationId &&
+                cv.businessId === businessId &&
+                cv.environment === contact.environment
+            )
+          : store.conversations.find(
+              (cv) =>
+                cv.businessId === businessId &&
+                cv.environment === contact.environment &&
+                cv.contactId === contact.id
+            );
+        const linkedLead = linkedConv
+          ? store.leads.find(
+              (l) =>
+                l.businessId === businessId &&
+                l.environment === contact.environment &&
+                l.conversationId === linkedConv.id
+            )
+          : store.leads.find(
+              (l) =>
+                l.businessId === businessId &&
+                l.environment === contact.environment &&
+                l.contactId === contact.id
+            );
 
         const existing = store.opportunities.find(
           (o) =>
             o.businessId === businessId &&
             o.environment === contact.environment &&
-            (o.contactId === contact.id ||
-              (linkedConv ? o.conversationId === linkedConv.id : false) ||
-              (linkedLead ? o.leadId === linkedLead.id : false))
+            (linkedConv
+              ? o.conversationId === linkedConv.id ||
+                (linkedLead ? o.leadId === linkedLead.id : false)
+              : o.contactId === contact.id || (linkedLead ? o.leadId === linkedLead.id : false))
         );
         if (existing) {
           return existing;

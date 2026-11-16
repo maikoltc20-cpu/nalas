@@ -906,6 +906,65 @@ export function createHumanHandoffTask(
   return task;
 }
 
+export function closeConversationInteraction(
+  store: NalasStore,
+  params: {
+    businessId: string;
+    actorUserId: string;
+    conversationId: string;
+    reason?: string;
+  }
+): Conversation {
+  const conv = store.conversations.find(
+    (c) => c.id === params.conversationId && c.businessId === params.businessId
+  );
+  if (!conv) throw new Error('Conversación no encontrada en este negocio.');
+
+  if (conv.status === 'cerrada') {
+    return conv;
+  }
+
+  const now = new Date().toISOString();
+  const session = store.sessions.find((s) => s.conversationId === conv.id);
+
+  conv.status = 'cerrada';
+  conv.updatedAt = now;
+
+  if (session) {
+    session.completedAt = now;
+    session.closureReason = 'cerrada_humano';
+    session.closedByUserId = params.actorUserId;
+    session.awaitingHumanContactName = false;
+    session.awaitingHumanContactPhone = false;
+    session.awaitingHumanTaskId = undefined;
+    session.updatedAt = now;
+  }
+
+  for (const task of store.tasks) {
+    if (
+      task.businessId === params.businessId &&
+      task.conversationId === conv.id &&
+      task.status !== 'resuelta'
+    ) {
+      task.status = 'resuelta';
+      task.assignedUserId = task.assignedUserId ?? params.actorUserId;
+      task.updatedAt = now;
+    }
+  }
+
+  appendAudit(store, {
+    businessId: params.businessId,
+    environment: conv.environment,
+    actorUserId: params.actorUserId,
+    module: 'conversaciones',
+    action: 'cerrar_atencion_humana',
+    detail: `Atención e interacción ${conv.id} finalizadas explícitamente por ${params.actorUserId}${params.reason ? ` (${params.reason})` : ''}. Un nuevo mensaje abrirá una interacción nueva.`,
+    correlationId: conv.id,
+  });
+
+  return conv;
+}
+
 export async function processInboundMessage(
   store: NalasStore,
   params: {
@@ -962,6 +1021,15 @@ export async function processInboundMessage(
       conversationId: conv.id,
       processedAt: new Date().toISOString(),
     });
+  }
+
+  if (conv.status === 'cerrada') {
+    return {
+      deduplicated: false,
+      botReplied: false,
+      aiCalled: false,
+      reason: 'Esta interacción ya fue finalizada. Un nuevo mensaje abrirá una nueva interacción.',
+    };
   }
 
   const now = new Date().toISOString();
@@ -1372,6 +1440,29 @@ export async function processInboundMessage(
         deferRemoteDispatch: params.deferRemoteDispatch,
       });
     }
+  }
+
+  if (
+    basicOut.completedInteraction &&
+    !basicOut.requestHumanHandoff &&
+    !basicOut.configInvalid &&
+    conv.control === 'bot'
+  ) {
+    const finalizedAt = new Date().toISOString();
+    conv.status = 'cerrada';
+    conv.updatedAt = finalizedAt;
+    session.completedAt = finalizedAt;
+    session.closureReason = basicOut.closureReason ?? 'cierre_flujo';
+    session.updatedAt = finalizedAt;
+    appendAudit(store, {
+      businessId: conv.businessId,
+      environment: conv.environment,
+      actorUserId: 'motor_basica',
+      module: 'conversaciones',
+      action: 'interaccion_finalizada',
+      detail: `Interacción ${conv.id} finalizada automáticamente (${session.closureReason}${basicOut.confirmedLead?.commercialReference ? `, ref=${basicOut.confirmedLead.commercialReference}` : ''}).`,
+      correlationId: conv.id,
+    });
   }
 
   return {

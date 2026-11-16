@@ -593,7 +593,8 @@ export const nalasApi = {
     ctx: ApiContext,
     payload: {
       connectionId: string;
-      externalUserId: string;
+      externalUserId?: string;
+      contactId?: string;
       contactName?: string;
       contactPhone?: string;
       forceNew?: boolean;
@@ -656,6 +657,12 @@ export const nalasApi = {
     return apiFetch(`/api/conversations/${conversationId}/handoff/resume-bot`, ctx, {
       method: 'POST',
       body: JSON.stringify({}),
+    });
+  },
+  closeHumanAttention(ctx: ApiContext, conversationId: string, reason?: string) {
+    return apiFetch<Conversation>(`/api/conversations/${conversationId}/handoff/close`, ctx, {
+      method: 'POST',
+      body: JSON.stringify(reason ? { reason } : {}),
     });
   },
   restartConversationWithPublished(ctx: ApiContext, conversationId: string) {

@@ -370,13 +370,18 @@ class FakePgClient {
         'SELECT * FROM nalas_conversations WHERE business_id = $1 AND environment = $2 AND connection_id = $3 AND contact_id = $4'
       )
     ) {
-      const rows = this.db.conversations.filter(
-        (cv) =>
-          cv.business_id === params[0] &&
-          cv.environment === params[1] &&
-          cv.connection_id === params[2] &&
-          cv.contact_id === params[3]
-      );
+      const requireOpen = sql.includes("status = 'abierta'");
+      const rows = this.db.conversations
+        .filter(
+          (cv) =>
+            cv.business_id === params[0] &&
+            cv.environment === params[1] &&
+            cv.connection_id === params[2] &&
+            cv.contact_id === params[3] &&
+            (!requireOpen || cv.status === 'abierta')
+        )
+        .sort((a, b) => String(b.updated_at).localeCompare(String(a.updated_at)))
+        .slice(0, 1);
       return { rows: rows as T[], rowCount: rows.length };
     }
     if (sql.startsWith('SELECT * FROM nalas_sessions WHERE conversation_id = $1')) {
@@ -397,6 +402,15 @@ class FakePgClient {
     }
     if (sql.startsWith("SELECT basica_ai_calls_total, pro_ai_calls_total FROM nalas_platform_counters")) {
       return { rows: [{ basica_ai_calls_total: 0, pro_ai_calls_total: 0 }] as T[], rowCount: 1 };
+    }
+
+    if (sql.startsWith('SELECT conversation_id FROM nalas_processed_inbound_events WHERE dedup_key = $1')) {
+      const dedupKey = String(params[0]);
+      const rows = this.db.processedInboundEvents
+        .filter((e) => e.dedup_key === dedupKey)
+        .map((e) => ({ conversation_id: e.conversation_id }))
+        .slice(0, 1);
+      return { rows: rows as T[], rowCount: rows.length };
     }
 
     // Inbound event dedup claim
