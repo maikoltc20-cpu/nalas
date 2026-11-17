@@ -105,6 +105,18 @@ export interface HumanHandoffConfig {
   finalConfirmationMessage: string;
 }
 
+export interface SummaryFieldConfig {
+  stepId: string;
+  label: string;
+  enabled: boolean;
+  order: number;
+}
+
+export interface SummaryConfig {
+  introPrompt?: string;
+  fields: SummaryFieldConfig[];
+}
+
 export interface FlowVersion {
   id: string;
   businessId: string;
@@ -114,11 +126,13 @@ export interface FlowVersion {
   status: 'borrador' | 'publicada' | 'retirada';
   steps: FlowStep[];
   outOfScriptRules: OutOfScriptRule[];
+  summaryConfig?: SummaryConfig;
   summaryTemplate?: string;
   closureTemplate?: string;
   referenceTemplate?: string;
   alreadyRegisteredTemplate?: string;
   cancelMessage?: string;
+  showReferenceInClosure?: boolean;
   handoffMessage?: string;
   handoffNoContactMessage?: string;
   outOfScriptPrompt?: string;
@@ -675,6 +689,12 @@ export interface ProductionConversationSummary {
     steps: FlowStep[];
     outOfScriptRules: OutOfScriptRule[];
     humanHandoffConfig?: HumanHandoffConfig;
+    summaryConfig?: SummaryConfig;
+    summaryTemplate?: string;
+    closureTemplate?: string;
+    referenceTemplate?: string;
+    alreadyRegisteredTemplate?: string;
+    showReferenceInClosure?: boolean;
     handoffMessage?: string;
     cancelMessage?: string;
     outOfScriptPrompt?: string;

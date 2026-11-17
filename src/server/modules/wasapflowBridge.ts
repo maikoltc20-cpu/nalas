@@ -7,6 +7,7 @@ import type {
   StructuredOption,
 } from '../../shared/types.ts';
 import {
+  allocateCommercialReferencePg,
   claimInboundEventPg,
   claimWasapFlowOutboxTargetsPg,
   findOwnBotMessageByProviderIdPg,
@@ -30,6 +31,7 @@ import {
 } from '../db/pgStore.ts';
 import { getEnv, getRequestId, isWorkerRuntime, scheduleBackgroundTask } from '../runtimeContext.ts';
 import { getSessionSigningSecret } from './auth.ts';
+import { resolveCommercialReferenceDescriptor } from './basicEngine.ts';
 import { appendAudit } from './consumptionAndAudit.ts';
 import {
   processInboundMessage,
@@ -3025,6 +3027,62 @@ export async function processWasapFlowWebhookEvent(
         );
         const fallbackList: Message[] =
           newBotMsgs.length > 0 ? newBotMsgs : out.outgoingMessage ? [out.outgoingMessage] : [];
+
+        // Atomic PG sequence allocation per (businessId, productKey, environment) so concurrent customers never collide
+        const newlyCreatedLeads = miniStore.leads.filter(
+          (l) => !preExisting.leadIds.has(l.id) && !l.id.startsWith('__ref_stub_')
+        );
+        if (newlyCreatedLeads.length > 0) {
+          const conv = miniStore.conversations.find((c) => c.id === started.conversation.id);
+          const sess = miniStore.sessions.find((s) => s.conversationId === started.conversation.id);
+          const biz = miniStore.businesses.find((b) => b.id === targetBusinessId);
+          const pinnedFlow = miniStore.flowVersions.find(
+            (f) => f.id === (sess?.pinnedFlowVersionId ?? conv?.pinnedFlowVersionId)
+          );
+          for (const newLead of newlyCreatedLeads) {
+            const provisionalRef = newLead.commercialReference;
+            const { productKey, prefix } = resolveCommercialReferenceDescriptor(
+              biz,
+              sess ?? { businessId: targetBusinessId, productId: newLead.productId },
+              pinnedFlow
+            );
+            const pgRef = await allocateCommercialReferencePg(client, {
+              businessId: targetBusinessId,
+              productKey,
+              environment: newLead.environment,
+              prefix,
+            });
+            const matchNum = pgRef.match(/_(\d+)$/);
+            const pgNum = matchNum ? Number(matchNum[1]) : 1;
+            const seqEntry = (miniStore.referenceSequences ?? []).find(
+              (s) =>
+                s.businessId === targetBusinessId &&
+                s.productKey === productKey &&
+                s.environment === newLead.environment
+            );
+            if (seqEntry) {
+              seqEntry.prefix = prefix;
+              seqEntry.lastNumber = Math.max(seqEntry.lastNumber, pgNum);
+            }
+            if (provisionalRef && pgRef !== provisionalRef) {
+              newLead.commercialReference = pgRef;
+              for (const msg of fallbackList) {
+                if (msg.text.includes(provisionalRef)) {
+                  msg.text = msg.text.split(provisionalRef).join(pgRef);
+                }
+                const ob = miniStore.outboxEvents.find((o) => o.messageId === msg.id);
+                if (ob && ob.payloadText.includes(provisionalRef)) {
+                  ob.payloadText = ob.payloadText.split(provisionalRef).join(pgRef);
+                }
+              }
+              for (const au of miniStore.auditEvents) {
+                if (!preExisting.auditIds.has(au.id) && au.detail.includes(provisionalRef)) {
+                  au.detail = au.detail.split(provisionalRef).join(pgRef);
+                }
+              }
+            }
+          }
+        }
 
         const eligibleDueIso = new Date(Date.now() - 5000).toISOString();
         const targets: WasapFlowOutboxTarget[] = [];

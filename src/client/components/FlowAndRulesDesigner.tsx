@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   AlertTriangle,
   ArrowDown,
@@ -27,7 +27,16 @@ import type {
   ProductionSummary,
   RuleOperator,
   StepType,
+  SummaryConfig,
 } from '../../shared/types';
+import {
+  isAnswerableSummaryStep,
+  listAvailableFlowVariables,
+  PRESET_TARGET_FIELDS,
+  previewSummaryInEditor,
+  resolveSummaryConfigForEditor,
+  validateFlowTemplates,
+} from '../../shared/flowTemplates';
 import { resolveHumanHandoffConfig } from '../../shared/humanHandoff';
 import {
   type ApiContext,
@@ -415,6 +424,33 @@ export function FlowAndRulesDesigner({
   const [humanHandoffConfig, setHumanHandoffConfig] = useState<HumanHandoffConfig>(() =>
     resolveHumanHandoffConfig(draftFlow?.humanHandoffConfig)
   );
+  const [summaryConfig, setSummaryConfig] = useState<SummaryConfig>(() =>
+    resolveSummaryConfigForEditor(draftFlow?.steps ?? [], draftFlow?.summaryConfig)
+  );
+  const [summaryConfigCustomized, setSummaryConfigCustomized] = useState<boolean>(() =>
+    Boolean(draftFlow?.summaryConfig)
+  );
+  const [closureTemplate, setClosureTemplate] = useState<string>(
+    () => draftFlow?.closureTemplate ?? ''
+  );
+  const [referenceTemplate, setReferenceTemplate] = useState<string>(
+    () => draftFlow?.referenceTemplate ?? ''
+  );
+  const [alreadyRegisteredTemplate, setAlreadyRegisteredTemplate] = useState<string>(
+    () => draftFlow?.alreadyRegisteredTemplate ?? ''
+  );
+  const [cancelMessage, setCancelMessage] = useState<string>(
+    () => draftFlow?.cancelMessage ?? ''
+  );
+  const [showReferenceInClosure, setShowReferenceInClosure] = useState<boolean>(
+    () => draftFlow?.showReferenceInClosure ?? true
+  );
+  const [customTargetFieldMode, setCustomTargetFieldMode] = useState<Record<string, boolean>>({});
+  const stepPromptRef = useRef<HTMLTextAreaElement | null>(null);
+  const summaryIntroRef = useRef<HTMLTextAreaElement | null>(null);
+  const closureTplRef = useRef<HTMLTextAreaElement | null>(null);
+  const referenceTplRef = useRef<HTMLInputElement | null>(null);
+  const alreadyRegTplRef = useRef<HTMLTextAreaElement | null>(null);
   const [draftDirty, setDraftDirty] = useState(false);
   const [selectedStepId, setSelectedStepId] = useState<string>(steps[0]?.id ?? '');
   const [validationMessages, setValidationMessages] = useState<ClientValidationIssue[]>([]);
@@ -495,7 +531,7 @@ export function FlowAndRulesDesigner({
   }, [business.id]);
 
   const draftSignature = draftFlow
-    ? `${effectiveFlowKey}:${draftFlow.id}:${draftFlow.status}:${draftFlow.name}:${draftFlow.versionNumber}:${JSON.stringify(draftFlow.steps)}:${JSON.stringify(draftFlow.outOfScriptRules)}:${JSON.stringify(draftFlow.humanHandoffConfig ?? null)}`
+    ? `${effectiveFlowKey}:${draftFlow.id}:${draftFlow.status}:${draftFlow.name}:${draftFlow.versionNumber}:${JSON.stringify(draftFlow.steps)}:${JSON.stringify(draftFlow.outOfScriptRules)}:${JSON.stringify(draftFlow.humanHandoffConfig ?? null)}:${JSON.stringify(draftFlow.summaryConfig ?? null)}:${draftFlow.closureTemplate ?? ''}:${draftFlow.referenceTemplate ?? ''}:${draftFlow.alreadyRegisteredTemplate ?? ''}:${draftFlow.cancelMessage ?? ''}:${draftFlow.showReferenceInClosure ?? true}`
     : `${effectiveFlowKey}:empty`;
 
   const entrySignature = JSON.stringify({
@@ -514,6 +550,14 @@ export function FlowAndRulesDesigner({
       setSteps(structuredClone(draftFlow.steps));
       setOosRules(structuredClone(draftFlow.outOfScriptRules));
       setHumanHandoffConfig(resolveHumanHandoffConfig(draftFlow.humanHandoffConfig));
+      setSummaryConfig(resolveSummaryConfigForEditor(draftFlow.steps, draftFlow.summaryConfig));
+      setSummaryConfigCustomized(Boolean(draftFlow.summaryConfig));
+      setClosureTemplate(draftFlow.closureTemplate ?? '');
+      setReferenceTemplate(draftFlow.referenceTemplate ?? '');
+      setAlreadyRegisteredTemplate(draftFlow.alreadyRegisteredTemplate ?? '');
+      setCancelMessage(draftFlow.cancelMessage ?? '');
+      setShowReferenceInClosure(draftFlow.showReferenceInClosure ?? true);
+      setCustomTargetFieldMode({});
       if (!draftFlow.steps.some((s) => s.id === selectedStepId)) {
         setSelectedStepId(draftFlow.steps[0]?.id ?? '');
       }
@@ -654,6 +698,67 @@ export function FlowAndRulesDesigner({
     }
   }
 
+  function buildFlowDraftPayload() {
+    const resolvedSumCfg = summaryConfigCustomized
+      ? resolveSummaryConfigForEditor(steps, summaryConfig)
+      : undefined;
+    const textOrNull = (val: string, existing?: string): string | null | undefined => {
+      if (val.trim()) return val;
+      return existing ? null : undefined;
+    };
+    return {
+      steps,
+      outOfScriptRules: oosRules,
+      humanHandoffConfig,
+      name: flowName.trim() || draftFlow?.name,
+      flowKey: effectiveFlowKey,
+      summaryConfig: resolvedSumCfg,
+      closureTemplate: textOrNull(closureTemplate, draftFlow?.closureTemplate),
+      referenceTemplate: textOrNull(referenceTemplate, draftFlow?.referenceTemplate),
+      alreadyRegisteredTemplate: textOrNull(
+        alreadyRegisteredTemplate,
+        draftFlow?.alreadyRegisteredTemplate
+      ),
+      cancelMessage: textOrNull(cancelMessage, draftFlow?.cancelMessage),
+      showReferenceInClosure:
+        draftFlow?.showReferenceInClosure !== undefined || !showReferenceInClosure
+          ? showReferenceInClosure
+          : undefined,
+    };
+  }
+
+  function mutateSummaryConfig(updater: (prev: SummaryConfig) => SummaryConfig) {
+    setDraftDirty(true);
+    setSummaryConfigCustomized(true);
+    setSummaryConfig((prev) => updater(resolveSummaryConfigForEditor(steps, prev)));
+  }
+
+  function insertVariableIntoField(
+    varKey: string,
+    currentVal: string,
+    setter: (next: string) => void,
+    el: HTMLTextAreaElement | HTMLInputElement | null
+  ) {
+    const token = `{{${varKey}}}`;
+    if (el && typeof el.selectionStart === 'number' && typeof el.selectionEnd === 'number') {
+      const start = el.selectionStart;
+      const end = el.selectionEnd;
+      const next = currentVal.slice(0, start) + token + currentVal.slice(end);
+      setter(next);
+      requestAnimationFrame(() => {
+        el.focus();
+        const pos = start + token.length;
+        el.setSelectionRange(pos, pos);
+      });
+      return;
+    }
+    const separator =
+      currentVal.length > 0 && !/\s$/.test(currentVal) && !currentVal.endsWith('(')
+        ? ' '
+        : '';
+    setter(`${currentVal}${separator}${token}`);
+  }
+
   function applySelectedConversation(nextKey: string) {
     setPendingFlowKey(null);
     setPendingCreateConvName(null);
@@ -662,6 +767,7 @@ export function FlowAndRulesDesigner({
     setValidationMessages([]);
     setPublishModalError(null);
     setPublishModalIssues([]);
+    setCustomTargetFieldMode({});
     const grp = flowGroups.find((g) => g.flowKey === nextKey);
     const fv = grp?.draft ?? grp?.latestPublished;
     if (fv) {
@@ -669,12 +775,26 @@ export function FlowAndRulesDesigner({
       setSteps(structuredClone(fv.steps));
       setOosRules(structuredClone(fv.outOfScriptRules));
       setHumanHandoffConfig(resolveHumanHandoffConfig(fv.humanHandoffConfig));
+      setSummaryConfig(resolveSummaryConfigForEditor(fv.steps, fv.summaryConfig));
+      setSummaryConfigCustomized(Boolean(fv.summaryConfig));
+      setClosureTemplate(fv.closureTemplate ?? '');
+      setReferenceTemplate(fv.referenceTemplate ?? '');
+      setAlreadyRegisteredTemplate(fv.alreadyRegisteredTemplate ?? '');
+      setCancelMessage(fv.cancelMessage ?? '');
+      setShowReferenceInClosure(fv.showReferenceInClosure ?? true);
       setSelectedStepId(fv.steps[0]?.id ?? '');
     } else {
       setFlowName('');
       setSteps([]);
       setOosRules([]);
       setHumanHandoffConfig(resolveHumanHandoffConfig(undefined));
+      setSummaryConfig(resolveSummaryConfigForEditor([], undefined));
+      setSummaryConfigCustomized(false);
+      setClosureTemplate('');
+      setReferenceTemplate('');
+      setAlreadyRegisteredTemplate('');
+      setCancelMessage('');
+      setShowReferenceInClosure(true);
       setSelectedStepId('');
     }
   }
@@ -703,11 +823,19 @@ export function FlowAndRulesDesigner({
       setPendingCreateConvName(null);
       setDraftDirty(false);
       setValidationMessages([]);
+      setCustomTargetFieldMode({});
       setSelectedFlowKey(createdKey);
       setFlowName(created.name);
       setSteps(structuredClone(created.steps));
       setOosRules(structuredClone(created.outOfScriptRules));
       setHumanHandoffConfig(resolveHumanHandoffConfig(created.humanHandoffConfig));
+      setSummaryConfig(resolveSummaryConfigForEditor(created.steps, created.summaryConfig));
+      setSummaryConfigCustomized(Boolean(created.summaryConfig));
+      setClosureTemplate(created.closureTemplate ?? '');
+      setReferenceTemplate(created.referenceTemplate ?? '');
+      setAlreadyRegisteredTemplate(created.alreadyRegisteredTemplate ?? '');
+      setCancelMessage(created.cancelMessage ?? '');
+      setShowReferenceInClosure(created.showReferenceInClosure ?? true);
       setSelectedStepId(created.steps[0]?.id ?? '');
       await onRefresh();
       onNotice(
@@ -737,13 +865,7 @@ export function FlowAndRulesDesigner({
   async function handleSaveAndProceedSwitch() {
     setBusy(true);
     try {
-      const res = await nalasApi.saveFlowDraft(ctx, {
-        steps,
-        outOfScriptRules: oosRules,
-        humanHandoffConfig,
-        name: flowName.trim() || draftFlow?.name,
-        flowKey: effectiveFlowKey,
-      });
+      const res = await nalasApi.saveFlowDraft(ctx, buildFlowDraftPayload());
       setValidationMessages(res.issues);
       setDraftDirty(false);
       await onRefresh();
@@ -917,13 +1039,7 @@ export function FlowAndRulesDesigner({
       setRulesValidationError(null);
       try {
         if (draftDirty) {
-          const flowRes = await nalasApi.saveFlowDraft(ctx, {
-            steps,
-            outOfScriptRules: oosRules,
-            humanHandoffConfig,
-            name: flowName.trim() || draftFlow?.name,
-            flowKey: effectiveFlowKey,
-          });
+          const flowRes = await nalasApi.saveFlowDraft(ctx, buildFlowDraftPayload());
           setDraftDirty(false);
           setValidationMessages(flowRes.issues);
         }
@@ -951,13 +1067,7 @@ export function FlowAndRulesDesigner({
 
     setBusy(true);
     try {
-      const res = await nalasApi.saveFlowDraft(ctx, {
-        steps,
-        outOfScriptRules: oosRules,
-        humanHandoffConfig,
-        name: flowName.trim() || draftFlow?.name,
-        flowKey: effectiveFlowKey,
-      });
+      const res = await nalasApi.saveFlowDraft(ctx, buildFlowDraftPayload());
       setDraftDirty(false);
       setValidationMessages(res.issues);
       await onRefresh();
@@ -984,13 +1094,7 @@ export function FlowAndRulesDesigner({
     setBusy(true);
     try {
       if (draftDirty) {
-        const res = await nalasApi.saveFlowDraft(ctx, {
-          steps,
-          outOfScriptRules: oosRules,
-          humanHandoffConfig,
-          name: flowName.trim() || draftFlow?.name,
-          flowKey: effectiveFlowKey,
-        });
+        const res = await nalasApi.saveFlowDraft(ctx, buildFlowDraftPayload());
         setValidationMessages(res.issues);
         if (res.issues.some((i) => i.severity === 'error')) {
           onError('Revisá las preguntas marcadas antes de probar el borrador.');
@@ -1018,13 +1122,7 @@ export function FlowAndRulesDesigner({
     setPublishModalIssues([]);
     try {
       if (draftDirty || !activeGroup?.draft) {
-        const draftRes = await nalasApi.saveFlowDraft(ctx, {
-          steps,
-          outOfScriptRules: oosRules,
-          humanHandoffConfig,
-          name: flowName.trim() || draftFlow?.name,
-          flowKey: effectiveFlowKey,
-        });
+        const draftRes = await nalasApi.saveFlowDraft(ctx, buildFlowDraftPayload());
         setDraftDirty(false);
         if (draftRes.issues.some((i) => i.severity === 'error')) {
           setValidationMessages(draftRes.issues);
@@ -1197,12 +1295,42 @@ export function FlowAndRulesDesigner({
         JSON.stringify(draftFlow.outOfScriptRules) !==
           JSON.stringify(publishedGroupFlow.outOfScriptRules) ||
         JSON.stringify(draftFlow.humanHandoffConfig ?? null) !==
-          JSON.stringify(publishedGroupFlow.humanHandoffConfig ?? null))
+          JSON.stringify(publishedGroupFlow.humanHandoffConfig ?? null) ||
+        JSON.stringify(draftFlow.summaryConfig ?? null) !==
+          JSON.stringify(publishedGroupFlow.summaryConfig ?? null) ||
+        (draftFlow.closureTemplate ?? '') !== (publishedGroupFlow.closureTemplate ?? '') ||
+        (draftFlow.referenceTemplate ?? '') !== (publishedGroupFlow.referenceTemplate ?? '') ||
+        (draftFlow.alreadyRegisteredTemplate ?? '') !==
+          (publishedGroupFlow.alreadyRegisteredTemplate ?? '') ||
+        (draftFlow.cancelMessage ?? '') !== (publishedGroupFlow.cancelMessage ?? '') ||
+        (draftFlow.showReferenceInClosure ?? true) !==
+          (publishedGroupFlow.showReferenceInClosure ?? true))
   );
   const hasFlowDraft =
     draftDirty ||
     !publishedGroupFlow ||
     draftDiffersFromPublishedFlow;
+
+  const displayedSummaryConfig = resolveSummaryConfigForEditor(steps, summaryConfig);
+  const availableVariables = listAvailableFlowVariables(steps, {
+    includeBuiltIns: true,
+    flowKey: effectiveFlowKey,
+  });
+  const stepPromptVariables = availableVariables.filter(
+    (v) => v.source === 'step' || (selectedStep?.type === 'cierre' && v.key === 'referencia')
+  );
+  const liveTemplateIssues = validateFlowTemplates({
+    steps,
+    summaryConfig: summaryConfigCustomized ? displayedSummaryConfig : undefined,
+    summaryTemplate: summaryConfigCustomized ? undefined : draftFlow?.summaryTemplate,
+    closureTemplate: closureTemplate.trim() ? closureTemplate : undefined,
+    referenceTemplate: referenceTemplate.trim() ? referenceTemplate : undefined,
+    alreadyRegisteredTemplate: alreadyRegisteredTemplate.trim()
+      ? alreadyRegisteredTemplate
+      : undefined,
+    cancelMessage: cancelMessage.trim() ? cancelMessage : undefined,
+    showReferenceInClosure,
+  });
 
   const hasUnpublishedRulesetDraft = Boolean(
     draftRuleset &&
@@ -2187,9 +2315,13 @@ export function FlowAndRulesDesigner({
                 {steps.map((step, index) => {
                   const isSelected = step.id === selectedStepId;
                   const readableTitle = getStepTitle(step, index);
-                  const stepHasBlocker = validateClientFlowSteps(steps).some(
-                    (issue) => issue.severity === 'error' && issue.stepId === step.id
-                  );
+                  const stepHasBlocker =
+                    validateClientFlowSteps(steps).some(
+                      (issue) => issue.severity === 'error' && issue.stepId === step.id
+                    ) ||
+                    liveTemplateIssues.some(
+                      (issue) => issue.severity === 'error' && issue.stepId === step.id
+                    );
                   return (
                     <div
                       key={step.id}
@@ -2326,12 +2458,136 @@ export function FlowAndRulesDesigner({
                       Lo que preguntará tu asistente
                     </label>
                     <textarea
+                      ref={stepPromptRef}
                       rows={3}
                       value={selectedStep.prompt}
                       onChange={(e) => updateStep(selectedStep.id, { prompt: e.target.value })}
                       className="w-full text-[15px] border border-[#DCE3E8] rounded-[9px] px-3.5 py-2.5 leading-relaxed"
                     />
+                    {stepPromptVariables.filter((v) => v.stepId !== selectedStep.id).length > 0 && (
+                      <div className="mt-2 space-y-1.5">
+                        <div className="text-[11px] font-medium text-[#5A6877]">
+                          Insertar respuesta guardada en este mensaje:
+                        </div>
+                        <div className="flex flex-wrap gap-1.5">
+                          {stepPromptVariables
+                            .filter((v) => v.stepId !== selectedStep.id)
+                            .map((v) => (
+                              <button
+                                key={v.key}
+                                type="button"
+                                onClick={() =>
+                                  insertVariableIntoField(
+                                    v.key,
+                                    selectedStep.prompt,
+                                    (nextPrompt) =>
+                                      updateStep(selectedStep.id, { prompt: nextPrompt }),
+                                    stepPromptRef.current
+                                  )
+                                }
+                                className="px-2.5 py-1 text-[11px] font-medium text-[#116B70] bg-[#EAF5F2] border border-[#D4EAE4] rounded-[7px] hover:bg-[#DCEFE9]"
+                              >
+                                + {v.label} ({`{{${v.key}}}`})
+                              </button>
+                            ))}
+                        </div>
+                      </div>
+                    )}
+                    {liveTemplateIssues
+                      .filter((i) => i.stepId === selectedStep.id)
+                      .map((issue, iIdx) => (
+                        <div
+                          key={`${issue.code}_${iIdx}`}
+                          className={`mt-2 p-2.5 rounded-[8px] text-xs ${
+                            issue.severity === 'error'
+                              ? 'bg-red-50 border border-red-200 text-red-800'
+                              : 'bg-[#FFF0E3] border border-[#F2D7BF] text-[#8C542C]'
+                          }`}
+                        >
+                          {issue.message}
+                        </div>
+                      ))}
                   </div>
+
+                  {isAnswerableSummaryStep(selectedStep) && (() => {
+                    const currentTarget = selectedStep.targetField ?? '';
+                    const isPreset = PRESET_TARGET_FIELDS.some((p) => p.key === currentTarget);
+                    const isCustomMode = Boolean(
+                      customTargetFieldMode[selectedStep.id] || (currentTarget && !isPreset)
+                    );
+                    const activePreset = PRESET_TARGET_FIELDS.find((p) => p.key === currentTarget);
+                    const effectiveVarKey = currentTarget.trim() || selectedStep.id;
+                    return (
+                      <div className="p-3.5 bg-[#F7F8FA] border border-[#E2E7EB] rounded-[10px] space-y-2.5">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div>
+                            <label className="block text-[13px] font-semibold text-[#25364A]">
+                              Dato que guarda esta pregunta
+                            </label>
+                            <p className="text-xs text-[#5A6877]">
+                              Definí dónde se almacena la respuesta (contacto, solicitud y textos con variables).
+                            </p>
+                          </div>
+                          <span className="text-[11px] font-medium text-[#116B70] bg-[#EAF5F2] border border-[#D4EAE4] rounded-[6px] px-2 py-1">
+                            Variable: {`{{${effectiveVarKey}}}`}
+                          </span>
+                        </div>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                          <select
+                            aria-label="Dato que guarda esta pregunta"
+                            value={isCustomMode ? '__custom__' : currentTarget}
+                            onChange={(e) => {
+                              const val = e.target.value;
+                              if (val === '__custom__') {
+                                setCustomTargetFieldMode((prev) => ({
+                                  ...prev,
+                                  [selectedStep.id]: true,
+                                }));
+                              } else {
+                                setCustomTargetFieldMode((prev) => ({
+                                  ...prev,
+                                  [selectedStep.id]: false,
+                                }));
+                                updateStep(selectedStep.id, { targetField: val });
+                              }
+                            }}
+                            className="w-full min-h-[40px] text-sm border border-[#DCE3E8] rounded-[8px] px-3 py-1.5 bg-white"
+                          >
+                            <option value="">Elegir campo...</option>
+                            {PRESET_TARGET_FIELDS.map((preset) => (
+                              <option key={preset.key} value={preset.key}>
+                                {preset.label} ({preset.key})
+                              </option>
+                            ))}
+                            <option value="__custom__">Otro campo personalizado...</option>
+                          </select>
+
+                          {isCustomMode ? (
+                            <input
+                              type="text"
+                              aria-label="Nombre del campo personalizado"
+                              value={currentTarget}
+                              onChange={(e) =>
+                                updateStep(selectedStep.id, {
+                                  targetField: e.target.value
+                                    .toLowerCase()
+                                    .replace(/[^a-z0-9_]/g, '_'),
+                                })
+                              }
+                              placeholder="ej: rubro, cantidad_empleados"
+                              className="w-full min-h-[40px] text-sm border border-[#DCE3E8] rounded-[8px] px-3 py-1.5 bg-white"
+                            />
+                          ) : (
+                            <div className="flex items-center text-xs text-[#5A6877] px-1">
+                              {activePreset
+                                ? activePreset.description
+                                : 'Asignar «nombre», «empresa», «correo», «necesidad» o «interes» conecta la respuesta con Contacto y Solicitud.'}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })()}
 
                   {(selectedStep.type === 'seleccion_unica' ||
                     selectedStep.type === 'seleccion_multiple' ||
@@ -2623,6 +2879,483 @@ export function FlowAndRulesDesigner({
                   Elegí una pregunta de la lista para editarla.
                 </div>
               )}
+
+              {/* Configurable Summary, Confirmation, Closure & Request Reference */}
+              <section className="bg-white border border-[#E2E7EB] rounded-[13px] p-6 space-y-5">
+                <div className="flex flex-wrap items-start justify-between gap-3 border-b border-[#EDF0F2] pb-4">
+                  <div>
+                    <h3 className="text-base font-semibold text-[#25364A]">
+                      Resumen, confirmación, cierre y referencia
+                    </h3>
+                    <p className="text-xs text-[#5A6877] mt-0.5">
+                      Elegí qué respuestas incluir en el resumen antes de confirmar y cómo mostrar la referencia única al finalizar.
+                    </p>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    {!steps.some((s) => s.type === 'resumen') && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const newId = `step_resumen_${Date.now().toString(36)}`;
+                          const confirmIdx = steps.findIndex((s) => s.type === 'confirmacion');
+                          const cierreIdx = steps.findIndex((s) => s.type === 'cierre');
+                          const insertAt =
+                            confirmIdx >= 0
+                              ? confirmIdx
+                              : cierreIdx >= 0
+                                ? cierreIdx
+                                : steps.length;
+                          const copy = structuredClone(steps);
+                          const nextTarget = copy[insertAt]?.id ?? null;
+                          copy.splice(insertAt, 0, {
+                            id: newId,
+                            title: 'Resumen',
+                            type: 'resumen',
+                            prompt: 'Resumen previo a confirmar:',
+                            targetField: 'resumen',
+                            required: false,
+                            nextStepId: nextTarget,
+                          });
+                          if (insertAt > 0 && copy[insertAt - 1]) {
+                            copy[insertAt - 1].nextStepId = newId;
+                          }
+                          setDraftDirty(true);
+                          setSummaryConfigCustomized(true);
+                          setSteps(copy);
+                          setSelectedStepId(newId);
+                        }}
+                        className="px-3 py-1.5 text-xs font-medium text-[#116B70] bg-[#EAF5F2] border border-[#D4EAE4] rounded-[8px] hover:bg-[#DCEFE9]"
+                      >
+                        + Agregar paso de Resumen
+                      </button>
+                    )}
+                    {!steps.some((s) => s.type === 'confirmacion') && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const newId = `step_confirm_${Date.now().toString(36)}`;
+                          const cierreIdx = steps.findIndex((s) => s.type === 'cierre');
+                          const insertAt = cierreIdx >= 0 ? cierreIdx : steps.length;
+                          const copy = structuredClone(steps);
+                          const nextTarget = copy[insertAt]?.id ?? null;
+                          copy.splice(insertAt, 0, {
+                            id: newId,
+                            title: 'Confirmación',
+                            type: 'confirmacion',
+                            prompt: '¿Confirmás que registremos tu solicitud con estos datos?',
+                            targetField: 'confirmacion',
+                            required: true,
+                            options: [
+                              { id: 'confirmar_si', label: 'Confirmar solicitud' },
+                              { id: 'confirmar_corregir', label: 'Corregir un dato' },
+                              { id: 'confirmar_no', label: 'Ahora no' },
+                            ],
+                            nextStepId: nextTarget,
+                          });
+                          if (insertAt > 0 && copy[insertAt - 1]) {
+                            copy[insertAt - 1].nextStepId = newId;
+                          }
+                          setDraftDirty(true);
+                          setSteps(copy);
+                          setSelectedStepId(newId);
+                        }}
+                        className="px-3 py-1.5 text-xs font-medium text-[#116B70] bg-[#EAF5F2] border border-[#D4EAE4] rounded-[8px] hover:bg-[#DCEFE9]"
+                      >
+                        + Agregar paso de Confirmación
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {!summaryConfigCustomized && draftFlow?.summaryTemplate && (
+                  <div className="p-3.5 bg-[#F7F8FA] border border-[#E2E7EB] rounded-[10px] flex flex-wrap items-center justify-between gap-3 text-xs">
+                    <div className="text-[#5A6877]">
+                      Esta conversación conserva su plantilla de resumen clásica. Podés mantenerla intacta o activar el selector visual de campos para editar etiquetas y orden.
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setDraftDirty(true);
+                        setSummaryConfigCustomized(true);
+                        setSummaryConfig(resolveSummaryConfigForEditor(steps, summaryConfig));
+                      }}
+                      className="px-3 py-1.5 font-semibold text-[#116B70] bg-white border border-[#D4EAE4] rounded-[8px] hover:bg-[#EAF5F2]"
+                    >
+                      Personalizar campos del resumen
+                    </button>
+                  </div>
+                )}
+
+                {(summaryConfigCustomized || !draftFlow?.summaryTemplate) && (
+                  <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
+                    <div className="lg:col-span-7 space-y-4">
+                      <div>
+                        <label className="block text-[13px] font-semibold text-[#25364A] mb-1">
+                          Introducción del resumen
+                        </label>
+                        <textarea
+                          ref={summaryIntroRef}
+                          rows={2}
+                          value={displayedSummaryConfig.introPrompt ?? ''}
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            mutateSummaryConfig((prev) => ({ ...prev, introPrompt: val }));
+                          }}
+                          placeholder="ej: Gracias, {{nombre}}. Revisá tus respuestas antes de confirmar:"
+                          className="w-full text-sm border border-[#DCE3E8] rounded-[9px] px-3.5 py-2 bg-white"
+                        />
+                        {availableVariables.filter((v) => v.source === 'step').length > 0 && (
+                          <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                            <span className="text-[11px] text-[#5A6877]">Insertar:</span>
+                            {availableVariables
+                              .filter((v) => v.source === 'step')
+                              .map((v) => (
+                                <button
+                                  key={`sum_intro_${v.key}`}
+                                  type="button"
+                                  onClick={() =>
+                                    insertVariableIntoField(
+                                      v.key,
+                                      displayedSummaryConfig.introPrompt ?? '',
+                                      (nextVal) =>
+                                        mutateSummaryConfig((prev) => ({
+                                          ...prev,
+                                          introPrompt: nextVal,
+                                        })),
+                                      summaryIntroRef.current
+                                    )
+                                  }
+                                  className="px-2 py-0.5 text-[11px] font-medium text-[#116B70] bg-[#EAF5F2] border border-[#D4EAE4] rounded-[6px] hover:bg-[#DCEFE9]"
+                                >
+                                  + {v.label} ({`{{${v.key}}}`})
+                                </button>
+                              ))}
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="space-y-2">
+                        <div className="text-[13px] font-semibold text-[#25364A]">
+                          Respuestas incluidas y orden en el resumen
+                        </div>
+                        <p className="text-xs text-[#5A6877]">
+                          Las preguntas opcionales que el cliente omita se ocultan automáticamente. Las selecciones múltiples muestran todas sus etiquetas completas.
+                        </p>
+                        {displayedSummaryConfig.fields.length === 0 ? (
+                          <p className="text-xs text-[#5A6877]">
+                            Todavía no hay preguntas con captura de respuesta en esta conversación.
+                          </p>
+                        ) : (
+                          <div className="space-y-2">
+                            {displayedSummaryConfig.fields.map((field, fIdx) => {
+                              const sourceStep = steps.find((s) => s.id === field.stepId);
+                              return (
+                                <div
+                                  key={field.stepId}
+                                  className="flex flex-wrap items-center gap-2 p-2.5 border border-[#E2E7EB] rounded-[9px] bg-[#F7F8FA]/60"
+                                >
+                                  <input
+                                    type="checkbox"
+                                    aria-label={`Incluir ${field.label} en el resumen`}
+                                    checked={field.enabled}
+                                    onChange={(e) => {
+                                      const checked = e.target.checked;
+                                      mutateSummaryConfig((prev) => ({
+                                        ...prev,
+                                        fields: prev.fields.map((f) =>
+                                          f.stepId === field.stepId ? { ...f, enabled: checked } : f
+                                        ),
+                                      }));
+                                    }}
+                                    className="w-4 h-4 accent-[#167D83]"
+                                  />
+                                  <input
+                                    type="text"
+                                    aria-label={`Etiqueta en resumen para ${field.stepId}`}
+                                    value={field.label}
+                                    onChange={(e) => {
+                                      const nextLabel = e.target.value;
+                                      mutateSummaryConfig((prev) => ({
+                                        ...prev,
+                                        fields: prev.fields.map((f) =>
+                                          f.stepId === field.stepId
+                                            ? { ...f, label: nextLabel }
+                                            : f
+                                        ),
+                                      }));
+                                    }}
+                                    className="flex-1 min-w-[160px] min-h-[36px] text-sm border border-[#DCE3E8] rounded-[8px] px-2.5 py-1 bg-white"
+                                  />
+                                  {sourceStep?.targetField && (
+                                    <span className="text-[11px] text-[#5A6877]">
+                                      {`{{${sourceStep.targetField}}}`}
+                                    </span>
+                                  )}
+                                  <div className="flex items-center gap-1">
+                                    <button
+                                      type="button"
+                                      aria-label="Subir campo en resumen"
+                                      disabled={fIdx === 0}
+                                      onClick={() =>
+                                        mutateSummaryConfig((prev) => {
+                                          const arr = [...prev.fields];
+                                          if (fIdx <= 0) return prev;
+                                          const [moved] = arr.splice(fIdx, 1);
+                                          arr.splice(fIdx - 1, 0, moved);
+                                          return {
+                                            ...prev,
+                                            fields: arr.map((item, idx) => ({ ...item, order: idx })),
+                                          };
+                                        })
+                                      }
+                                      className="p-1.5 text-[#5A6877] hover:text-[#25364A] bg-white border border-[#E2E7EB] rounded disabled:opacity-40"
+                                    >
+                                      <ArrowUp className="w-3.5 h-3.5" />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      aria-label="Bajar campo en resumen"
+                                      disabled={fIdx === displayedSummaryConfig.fields.length - 1}
+                                      onClick={() =>
+                                        mutateSummaryConfig((prev) => {
+                                          const arr = [...prev.fields];
+                                          if (fIdx >= arr.length - 1) return prev;
+                                          const [moved] = arr.splice(fIdx, 1);
+                                          arr.splice(fIdx + 1, 0, moved);
+                                          return {
+                                            ...prev,
+                                            fields: arr.map((item, idx) => ({ ...item, order: idx })),
+                                          };
+                                        })
+                                      }
+                                      className="p-1.5 text-[#5A6877] hover:text-[#25364A] bg-white border border-[#E2E7EB] rounded disabled:opacity-40"
+                                    >
+                                      <ArrowDown className="w-3.5 h-3.5" />
+                                    </button>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+
+                      {(() => {
+                        const confirmStep = steps.find((s) => s.type === 'confirmacion');
+                        if (!confirmStep) return null;
+                        return (
+                          <div>
+                            <label className="block text-[13px] font-semibold text-[#25364A] mb-1">
+                              Pregunta de confirmación (paso «{getStepTitle(confirmStep)}»)
+                            </label>
+                            <input
+                              type="text"
+                              value={confirmStep.prompt}
+                              onChange={(e) =>
+                                updateStep(confirmStep.id, { prompt: e.target.value })
+                              }
+                              className="w-full min-h-[40px] text-sm border border-[#DCE3E8] rounded-[8px] px-3 py-1.5 bg-white"
+                            />
+                          </div>
+                        );
+                      })()}
+                    </div>
+
+                    <div className="lg:col-span-5 p-4 bg-[#F7F8FA] border border-[#E2E7EB] rounded-[11px] space-y-2.5">
+                      <div className="text-xs font-semibold text-[#25364A]">
+                        Vista previa del resumen con datos de ejemplo
+                      </div>
+                      <div className="p-3 bg-white border border-[#DCE3E8] rounded-[9px] text-xs text-[#25364A] whitespace-pre-wrap leading-relaxed">
+                        {previewSummaryInEditor({
+                          steps,
+                          summaryConfig: displayedSummaryConfig,
+                          flowKey: effectiveFlowKey,
+                        })}
+                      </div>
+                      {(() => {
+                        const confirmStep = steps.find((s) => s.type === 'confirmacion');
+                        if (!confirmStep) return null;
+                        return (
+                          <div className="p-2.5 bg-white border border-[#DCE3E8] rounded-[9px] text-xs space-y-1.5">
+                            <div className="text-[#25364A]">{confirmStep.prompt}</div>
+                            {confirmStep.options && confirmStep.options.length > 0 && (
+                              <div className="flex flex-wrap gap-1.5">
+                                {confirmStep.options.map((opt) => (
+                                  <span
+                                    key={opt.id}
+                                    className="px-2 py-0.5 text-[11px] bg-[#EAF5F2] text-[#116B70] border border-[#D4EAE4] rounded"
+                                  >
+                                    {opt.label}
+                                  </span>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })()}
+                    </div>
+                  </div>
+                )}
+
+                <div className="border-t border-[#EDF0F2] pt-4 space-y-4">
+                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-[13px] font-semibold text-[#25364A] mb-1">
+                        Mensaje de cierre al confirmar
+                      </label>
+                      <textarea
+                        ref={closureTplRef}
+                        rows={2}
+                        value={closureTemplate}
+                        onChange={(e) => {
+                          setDraftDirty(true);
+                          setClosureTemplate(e.target.value);
+                        }}
+                        placeholder="ej: ¡Gracias, {{nombre}}! Tu solicitud quedó registrada y nuestro equipo te contactará pronto."
+                        className="w-full text-sm border border-[#DCE3E8] rounded-[9px] px-3.5 py-2 bg-white"
+                      />
+                      <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                        <span className="text-[11px] text-[#5A6877]">Insertar:</span>
+                        {availableVariables.map((v) => (
+                          <button
+                            key={`closure_var_${v.key}`}
+                            type="button"
+                            onClick={() => {
+                              setDraftDirty(true);
+                              insertVariableIntoField(
+                                v.key,
+                                closureTemplate,
+                                setClosureTemplate,
+                                closureTplRef.current
+                              );
+                            }}
+                            className="px-2 py-0.5 text-[11px] font-medium text-[#116B70] bg-[#EAF5F2] border border-[#D4EAE4] rounded-[6px] hover:bg-[#DCEFE9]"
+                          >
+                            + {v.label} ({`{{${v.key}}}`})
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div className="space-y-3 p-3.5 bg-[#F7F8FA] border border-[#E2E7EB] rounded-[10px]">
+                      <label className="inline-flex items-center gap-2.5 text-sm font-semibold text-[#25364A] cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={showReferenceInClosure}
+                          onChange={(e) => {
+                            setDraftDirty(true);
+                            setShowReferenceInClosure(e.target.checked);
+                          }}
+                          className="w-4 h-4 accent-[#167D83]"
+                        />
+                        <span>Mostrar referencia en el cierre</span>
+                      </label>
+                      <p className="text-xs text-[#5A6877]">
+                        El formato consecutivo (ej. <code>{`${effectiveFlowKey === 'default' ? 'nexo' : effectiveFlowKey}_1`}</code>) lo controla la plataforma de forma única al registrar la solicitud. Si desmarcás esta opción, el registro interno y su referencia se siguen guardando sin mostrarse al cliente.
+                      </p>
+                      <div>
+                        <label className="block text-xs font-semibold text-[#25364A] mb-1">
+                          Texto que acompaña la referencia
+                        </label>
+                        <input
+                          ref={referenceTplRef}
+                          type="text"
+                          disabled={!showReferenceInClosure}
+                          value={referenceTemplate}
+                          onChange={(e) => {
+                            setDraftDirty(true);
+                            setReferenceTemplate(e.target.value);
+                          }}
+                          placeholder="Referencia de tu solicitud: {{referencia}}"
+                          className="w-full min-h-[38px] text-sm border border-[#DCE3E8] rounded-[8px] px-3 py-1.5 bg-white disabled:bg-[#EDF0F2] disabled:text-[#5A6877]"
+                        />
+                        {showReferenceInClosure && (
+                          <div className="mt-1 flex flex-wrap gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setDraftDirty(true);
+                                insertVariableIntoField(
+                                  'referencia',
+                                  referenceTemplate,
+                                  setReferenceTemplate,
+                                  referenceTplRef.current
+                                );
+                              }}
+                              className="px-2 py-0.5 text-[11px] font-medium text-[#116B70] bg-white border border-[#D4EAE4] rounded-[6px] hover:bg-[#EAF5F2]"
+                            >
+                              + Referencia ({'{{referencia}}'})
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-xs font-semibold text-[#25364A] mb-1">
+                        Mensaje si el cliente elige «Ahora no» (no registra solicitud)
+                      </label>
+                      <input
+                        type="text"
+                        value={cancelMessage}
+                        onChange={(e) => {
+                          setDraftDirty(true);
+                          setCancelMessage(e.target.value);
+                        }}
+                        placeholder="Entendido. Cancelamos el registro; podés escribirnos cuando gustes."
+                        className="w-full min-h-[40px] text-sm border border-[#DCE3E8] rounded-[8px] px-3 py-1.5 bg-white"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-semibold text-[#25364A] mb-1">
+                        Mensaje si intenta confirmar de nuevo una solicitud ya registrada
+                      </label>
+                      <textarea
+                        ref={alreadyRegTplRef}
+                        rows={1}
+                        value={alreadyRegisteredTemplate}
+                        onChange={(e) => {
+                          setDraftDirty(true);
+                          setAlreadyRegisteredTemplate(e.target.value);
+                        }}
+                        placeholder="Tu solicitud ya había quedado registrada."
+                        className="w-full min-h-[40px] text-sm border border-[#DCE3E8] rounded-[8px] px-3 py-1.5 bg-white"
+                      />
+                    </div>
+                  </div>
+
+                  {liveTemplateIssues.length > 0 && (
+                    <div className="space-y-1.5">
+                      {liveTemplateIssues.map((issue, idx) => (
+                        <div
+                          key={`tpl_issue_${issue.code}_${idx}`}
+                          className={`p-2.5 rounded-[8px] text-xs flex flex-wrap items-center justify-between gap-2 ${
+                            issue.severity === 'error'
+                              ? 'bg-red-50 border border-red-200 text-red-800'
+                              : 'bg-[#FFF0E3] border border-[#F2D7BF] text-[#8C542C]'
+                          }`}
+                        >
+                          <span>
+                            • {issue.message}
+                            {issue.suggestion ? ` ${issue.suggestion}` : ''}
+                          </span>
+                          {issue.stepId && steps.some((s) => s.id === issue.stepId) && (
+                            <button
+                              type="button"
+                              onClick={() => setSelectedStepId(issue.stepId!)}
+                              className="font-semibold text-[#116B70] underline shrink-0"
+                            >
+                              Ir a la pregunta
+                            </button>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </section>
 
               {/* Out-of-script explicit rules */}
               <section className="bg-white border border-[#E2E7EB] rounded-[13px] p-6 space-y-3">
@@ -3520,6 +4253,56 @@ export function FlowAndRulesDesigner({
                         ))}
                       </div>
 
+                      {(conv.latestPublished.summaryConfig ||
+                        conv.latestPublished.summaryTemplate ||
+                        conv.latestPublished.closureTemplate ||
+                        conv.latestPublished.referenceTemplate ||
+                        conv.latestPublished.showReferenceInClosure === false) && (
+                        <div className="text-xs bg-[#F7F8FA] border border-[#E2E7EB] rounded-[8px] p-3 space-y-1.5">
+                          <div className="font-semibold text-[#25364A]">
+                            Resumen y cierre publicados
+                          </div>
+                          {conv.latestPublished.summaryConfig && (
+                            <div className="space-y-0.5 text-[#5A6877]">
+                              {conv.latestPublished.summaryConfig.introPrompt && (
+                                <div>
+                                  <span className="font-medium text-[#25364A]">Introducción:</span>{' '}
+                                  {conv.latestPublished.summaryConfig.introPrompt}
+                                </div>
+                              )}
+                              <div>
+                                <span className="font-medium text-[#25364A]">Campos incluidos:</span>{' '}
+                                {conv.latestPublished.summaryConfig.fields
+                                  .filter((f) => f.enabled)
+                                  .sort((a, b) => a.order - b.order)
+                                  .map((f) => f.label)
+                                  .join(' · ') || 'Ninguno'}
+                              </div>
+                            </div>
+                          )}
+                          {!conv.latestPublished.summaryConfig &&
+                            conv.latestPublished.summaryTemplate && (
+                              <div className="text-[#5A6877] whitespace-pre-wrap">
+                                <span className="font-medium text-[#25364A]">Plantilla de resumen:</span>{' '}
+                                {conv.latestPublished.summaryTemplate}
+                              </div>
+                            )}
+                          {conv.latestPublished.closureTemplate && (
+                            <div className="text-[#5A6877] whitespace-pre-wrap">
+                              <span className="font-medium text-[#25364A]">Mensaje de cierre:</span>{' '}
+                              {conv.latestPublished.closureTemplate}
+                            </div>
+                          )}
+                          <div className="text-[#5A6877]">
+                            <span className="font-medium text-[#25364A]">Referencia en el cierre:</span>{' '}
+                            {conv.latestPublished.showReferenceInClosure === false
+                              ? 'Oculta para el cliente (se registra internamente)'
+                              : conv.latestPublished.referenceTemplate ||
+                                'Visible (Referencia de tu solicitud: {{referencia}})'}
+                          </div>
+                        </div>
+                      )}
+
                       {conv.latestPublished.outOfScriptRules.length > 0 && (
                         <div className="text-xs space-y-1">
                           <div className="font-semibold text-[#25364A]">Respuestas rápidas publicadas</div>
@@ -3719,9 +4502,10 @@ export function FlowAndRulesDesigner({
         const linkedMenuOptions = (business.products ?? []).filter(
           (p) => p.active && p.targetType !== 'handoff' && resolveProductFlowKey(p) === effectiveFlowKey
         );
-        const clientStepErrors = validateClientFlowSteps(steps).filter(
-          (i) => i.severity === 'error'
-        );
+        const clientStepErrors = [
+          ...validateClientFlowSteps(steps).filter((i) => i.severity === 'error'),
+          ...liveTemplateIssues.filter((i) => i.severity === 'error'),
+        ];
         const displayedIssues =
           publishModalIssues.filter((i) => i.severity === 'error').length > 0
             ? publishModalIssues.filter((i) => i.severity === 'error')

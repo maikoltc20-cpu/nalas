@@ -1,3 +1,8 @@
+import {
+  formatAnswerDisplayValue,
+  isSkippedOptionalAnswer,
+  renderSummaryFromConfig,
+} from '../../shared/flowTemplates.ts';
 import { hasValidContactName, normalizeInternationalPhone } from '../../shared/humanHandoff.ts';
 import type {
   AnswerRecord,
@@ -137,9 +142,10 @@ export function evaluateRuleset(
 function getFieldMap(session: Session, extra?: Record<string, string>): Record<string, string> {
   const map: Record<string, string> = {};
   for (const ans of Object.values(session.answers)) {
-    map[ans.stepId] = ans.displayValue;
+    const val = isSkippedOptionalAnswer(ans) ? '' : formatAnswerDisplayValue(ans);
+    map[ans.stepId] = val;
     if (ans.targetField) {
-      map[ans.targetField] = ans.displayValue;
+      map[ans.targetField] = val;
     }
   }
   const canal = (map.canal_contacto ?? '').toLowerCase();
@@ -151,7 +157,7 @@ function getFieldMap(session: Session, extra?: Record<string, string>): Record<s
     map.canal_contacto_texto = 'correo electrónico';
   } else {
     map.etiqueta_dato_contacto = 'Dato de contacto';
-    map.canal_contacto_texto = map.canal_contacto ?? 'el medio elegido';
+    map.canal_contacto_texto = map.canal_contacto || 'el medio elegido';
   }
   if (extra) {
     Object.assign(map, extra);
@@ -177,19 +183,27 @@ function buildSummaryText(
   flow: FlowVersion,
   session: Session
 ): string {
+  if (flow.summaryConfig) {
+    return renderSummaryFromConfig({
+      summaryConfig: flow.summaryConfig,
+      steps: flow.steps,
+      answers: session.answers,
+      interpolate: (tpl) => interpolateTemplate(tpl, session),
+    });
+  }
   if (flow.summaryTemplate) {
     const rendered = interpolateTemplate(flow.summaryTemplate, session);
     const extraLines: string[] = [];
     for (const step of flow.steps) {
       const ans = session.answers[step.id];
-      if (!ans) continue;
+      if (!ans || isSkippedOptionalAnswer(ans)) continue;
       const keyById = `{{${step.id}}}`;
       const keyByField = step.targetField ? `{{${step.targetField}}}` : '';
       const alreadyIncluded =
         flow.summaryTemplate.includes(keyById) ||
         (keyByField ? flow.summaryTemplate.includes(keyByField) : false);
       if (!alreadyIncluded) {
-        extraLines.push(`• ${step.title ?? step.prompt}: ${ans.displayValue}`);
+        extraLines.push(`• ${step.title ?? step.prompt}: ${formatAnswerDisplayValue(ans)}`);
       }
     }
     return extraLines.length > 0 ? `${rendered}\n${extraLines.join('\n')}` : rendered;
@@ -197,8 +211,8 @@ function buildSummaryText(
   const lines: string[] = [];
   for (const step of flow.steps) {
     const ans = session.answers[step.id];
-    if (ans) {
-      lines.push(`• ${step.title ?? step.prompt}: ${ans.displayValue}`);
+    if (ans && !isSkippedOptionalAnswer(ans)) {
+      lines.push(`• ${step.title ?? step.prompt}: ${formatAnswerDisplayValue(ans)}`);
     }
   }
   if (lines.length === 0) {
@@ -244,24 +258,53 @@ function normalizeProductPrefix(raw: string): string {
   return cleaned || 'sol';
 }
 
-function allocateCommercialReference(
-  store: NalasStore,
+export function resolveCommercialReferenceDescriptor(
   business: Business | undefined,
-  session: Session
-): string {
-  if (!store.referenceSequences) {
-    store.referenceSequences = [];
-  }
-  const productKey = session.productId || 'default';
-  const matchedProduct = session.productId
-    ? business?.products?.find((p) => p.id === session.productId)
-    : undefined;
+  session: Pick<Session, 'productId' | 'businessId'>,
+  flow?: Pick<FlowVersion, 'businessId' | 'flowKey'>
+): { productKey: string; prefix: string } {
+  const flowKey = flow ? getFlowKey(flow) : undefined;
+  const directFlowKey =
+    session.productId && session.productId.startsWith('direct_')
+      ? session.productId.slice('direct_'.length).trim() || undefined
+      : undefined;
+  const lookupFlowKey = directFlowKey ?? flowKey;
+  const matchedProduct =
+    (session.productId
+      ? business?.products?.find((p) => p.id === session.productId)
+      : undefined) ??
+    (lookupFlowKey
+      ? business?.products?.find((p) => p.flowKey === lookupFlowKey)
+      : undefined);
+
+  const productKey =
+    matchedProduct?.flowKey?.trim() ||
+    (lookupFlowKey && lookupFlowKey !== 'default' ? lookupFlowKey : undefined) ||
+    matchedProduct?.id ||
+    session.productId ||
+    'default';
+
   const prefix = normalizeProductPrefix(
     matchedProduct?.referencePrefix ??
+      (lookupFlowKey && lookupFlowKey !== 'default' ? lookupFlowKey : undefined) ??
       business?.defaultReferencePrefix ??
       business?.slug ??
       'sol'
   );
+
+  return { productKey, prefix };
+}
+
+function allocateCommercialReference(
+  store: NalasStore,
+  business: Business | undefined,
+  session: Session,
+  flow?: FlowVersion
+): string {
+  if (!store.referenceSequences) {
+    store.referenceSequences = [];
+  }
+  const { productKey, prefix } = resolveCommercialReferenceDescriptor(business, session, flow);
 
   let seq: ReferenceSequence | undefined = store.referenceSequences.find(
     (s) =>
@@ -572,6 +615,12 @@ function validateAndParseStepAnswer(
     }
   }
 
+  const findOtroOption = (opts: NonNullable<FlowStep['options']>) =>
+    opts.find((o) => {
+      const lbl = foldAccentsLower(o.label);
+      return lbl === 'otro' || lbl.startsWith('otro:') || lbl.startsWith('otro ') || o.id.toLowerCase().includes('otro');
+    });
+
   if (step.type === 'seleccion_unica') {
     const opts = step.options ?? [];
     const byId = selectedOptionId ? opts.find((o) => o.id === selectedOptionId) : undefined;
@@ -582,13 +631,23 @@ function validateAndParseStepAnswer(
         o.label.replace(/\.$/, '').toLowerCase() === trimmed.replace(/\.$/, '').toLowerCase() ||
         o.id.toLowerCase() === trimmed.toLowerCase()
     );
-    const matched = byId ?? byNum ?? byLabel;
+    let matched = byId ?? byNum ?? byLabel;
+    let customLabel: string | undefined;
+    if (!matched) {
+      const otroMatch = trimmed.match(/^otro(?:\s*[:\-–]\s*(.+))$/i);
+      const otroOpt = otroMatch ? findOtroOption(opts) : undefined;
+      if (otroMatch && otroOpt && otroMatch[1]?.trim()) {
+        matched = otroOpt;
+        customLabel = `Otro: ${otroMatch[1].trim()}`;
+      }
+    }
     if (!matched) {
       return {
         ok: false,
         errorText: `Entrada no válida. Elige una de las opciones disponibles (${opts.map((o, idx) => `${idx + 1}. ${o.label}`).join(' / ')}).`,
       };
     }
+    const finalLabel = customLabel ?? matched.label;
     return {
       ok: true,
       chosenNextStepId: matched.nextStepId ?? step.nextStepId,
@@ -597,9 +656,9 @@ function validateAndParseStepAnswer(
         stepPrompt: step.title ?? step.prompt,
         targetField: step.targetField,
         rawValue: matched.id,
-        displayValue: matched.storedValue ?? matched.label,
+        displayValue: customLabel ?? matched.storedValue ?? matched.label,
         optionIds: [matched.id],
-        optionLabels: [matched.label],
+        optionLabels: [finalLabel],
         answeredAt: now,
       },
     };
@@ -612,9 +671,13 @@ function validateAndParseStepAnswer(
       .map((t) => t.replace(/\.$/, '').trim())
       .filter(Boolean);
     const seenIds = new Set<string>();
-    const matchedOpts: NonNullable<FlowStep['options']> = [];
+    const matchedEntries: Array<{
+      opt: NonNullable<FlowStep['options']>[number];
+      label: string;
+    }> = [];
     for (const tok of tokens) {
       let found: NonNullable<FlowStep['options']>[number] | undefined;
+      let labelOverride: string | undefined;
       if (selectedOptionId && tok === trimmed.replace(/\.$/, '').trim()) {
         found = opts.find((o) => o.id === selectedOptionId);
       }
@@ -629,18 +692,26 @@ function validateAndParseStepAnswer(
             o.label.replace(/\.$/, '').toLowerCase() === tok.toLowerCase()
         );
       }
+      if (!found) {
+        const otroMatch = tok.match(/^otro(?:\s*[:\-–]\s*(.+))$/i);
+        const otroOpt = otroMatch ? findOtroOption(opts) : undefined;
+        if (otroMatch && otroOpt && otroMatch[1]?.trim()) {
+          found = otroOpt;
+          labelOverride = `Otro: ${otroMatch[1].trim()}`;
+        }
+      }
       if (found && !seenIds.has(found.id)) {
         seenIds.add(found.id);
-        matchedOpts.push(found);
+        matchedEntries.push({ opt: found, label: labelOverride ?? found.label });
       }
     }
 
-    if (matchedOpts.length === 0 && selectedOptionId) {
+    if (matchedEntries.length === 0 && selectedOptionId) {
       const direct = opts.find((o) => o.id === selectedOptionId);
-      if (direct) matchedOpts.push(direct);
+      if (direct) matchedEntries.push({ opt: direct, label: direct.label });
     }
 
-    if (matchedOpts.length === 0) {
+    if (matchedEntries.length === 0) {
       return {
         ok: false,
         errorText: 'Selecciona al menos una opción válida (ej: "1, 2" o el nombre de las opciones).',
@@ -653,10 +724,10 @@ function validateAndParseStepAnswer(
         stepId: step.id,
         stepPrompt: step.title ?? step.prompt,
         targetField: step.targetField,
-        rawValue: matchedOpts.map((m) => m.id),
-        displayValue: matchedOpts.map((m) => m.label.replace(/\.$/, '')).join(', '),
-        optionIds: matchedOpts.map((m) => m.id),
-        optionLabels: matchedOpts.map((m) => m.label),
+        rawValue: matchedEntries.map((m) => m.opt.id),
+        displayValue: matchedEntries.map((m) => m.label.replace(/\.$/, '')).join(', '),
+        optionIds: matchedEntries.map((m) => m.opt.id),
+        optionLabels: matchedEntries.map((m) => m.label),
         answeredAt: now,
       },
     };
@@ -1578,21 +1649,79 @@ export function runBasicEngine(params: {
       };
     }
 
-    const isConfirm =
-      selectedOptionId === 'confirmar_si' ||
-      normalized === 'confirmar' ||
-      normalized === 'registrar solicitud' ||
-      normalized === 'registrar solicitud.' ||
-      normalized === 'intentar nuevamente' ||
-      normalized === 'si' ||
-      normalized === 'sí';
+    const selectedOpt = selectedOptionId
+      ? currentStep.options?.find((o) => o.id === selectedOptionId)
+      : undefined;
+    const foldedInput = foldAccentsLower(inputText);
+    const foldedSelectedLabel = selectedOpt ? foldAccentsLower(selectedOpt.label) : '';
+
+    const declineLabels = new Set([
+      'ahora no',
+      'no',
+      'no gracias',
+      'mas tarde',
+      'despues',
+      'en otro momento',
+      'cancelar',
+    ]);
+    const isDecline =
+      selectedOptionId === 'confirmar_no' ||
+      selectedOptionId === 'cmd_cancelar' ||
+      declineLabels.has(foldedInput) ||
+      (foldedSelectedLabel ? declineLabels.has(foldedSelectedLabel) : false);
 
     const isCorrect =
       selectedOptionId === 'corregir' ||
       normalized === 'corregir' ||
       normalized === 'corregir un dato' ||
       normalized === 'corregir un dato.' ||
-      normalized === 'corregir respuestas';
+      normalized === 'corregir respuestas' ||
+      foldedInput.startsWith('corregir') ||
+      foldedSelectedLabel.startsWith('corregir');
+
+    const isAffirmativeLabel = (lbl: string): boolean => {
+      const f = foldAccentsLower(lbl);
+      return (
+        f === 'si' ||
+        f === 'confirmar' ||
+        f === 'si, confirmar' ||
+        f === 'confirmar solicitud' ||
+        f === 'confirmar consulta' ||
+        f === 'registrar solicitud' ||
+        f === 'intentar nuevamente' ||
+        f.startsWith('confirmar ') ||
+        f.startsWith('si,') ||
+        f.startsWith('registrar ') ||
+        f.startsWith('enviar ')
+      );
+    };
+
+    const isConfirm =
+      !isDecline &&
+      !isCorrect &&
+      (selectedOptionId === 'confirmar_si' ||
+        (Boolean(selectedOpt) && isAffirmativeLabel(selectedOpt!.label)) ||
+        normalized === 'confirmar' ||
+        normalized === 'registrar solicitud' ||
+        normalized === 'registrar solicitud.' ||
+        normalized === 'intentar nuevamente' ||
+        normalized === 'si' ||
+        normalized === 'sí' ||
+        isAffirmativeLabel(inputText));
+
+    if (isDecline) {
+      session.captureStatus = 'cancelada';
+      session.currentStepId = null;
+      session.updatedAt = new Date().toISOString();
+      return {
+        replyText:
+          flow.cancelMessage ??
+          'No registramos tu solicitud por ahora. Si más adelante querés retomarla, escribinos en cualquier momento.',
+        cancelled: true,
+        completedInteraction: true,
+        closureReason: 'cancelada',
+      };
+    }
 
     if (isCorrect) {
       if (currentStep.correctionFields && currentStep.correctionFields.length > 0) {
@@ -1642,13 +1771,15 @@ export function runBasicEngine(params: {
     );
     if (existingLead) {
       const ref = existingLead.commercialReference ?? existingLead.id;
+      const showRefInClosure = flow.showReferenceInClosure !== false;
+      const alreadyTemplate = showRefInClosure
+        ? flow.alreadyRegisteredTemplate ??
+          'Tu solicitud ya quedó registrada. Tu referencia es {{referencia}}. ¡Gracias por escribirnos!'
+        : 'Tu solicitud ya quedó registrada. ¡Gracias por escribirnos!';
       return {
-        replyText: interpolateTemplate(
-          flow.alreadyRegisteredTemplate ??
-            'Tu solicitud ya quedó registrada. Tu referencia es {{referencia}}. ¡Gracias por escribirnos!',
-          session,
-          { referencia: ref }
-        ),
+        replyText: interpolateTemplate(alreadyTemplate, session, {
+          referencia: showRefInClosure ? ref : '',
+        }),
         confirmedLead: existingLead,
         categorization: existingLead.categorization,
         completedInteraction: true,
@@ -1659,7 +1790,7 @@ export function runBasicEngine(params: {
     try {
       const categorization = evaluateRuleset(ruleset, session.answers);
       const now = new Date().toISOString();
-      const commercialReference = allocateCommercialReference(store, business, session);
+      const commercialReference = allocateCommercialReference(store, business, session, flow);
       session.captureStatus = 'confirmada';
       session.confirmedIdempotencyKey = effectiveIdemKey;
 
@@ -1699,20 +1830,29 @@ export function runBasicEngine(params: {
       session.currentStepId = cierreStep?.id ?? null;
       session.updatedAt = now;
 
-      const closureMsg = flow.closureTemplate
-        ? interpolateTemplate(flow.closureTemplate, session, { referencia: commercialReference })
-        : cierreStep
-          ? interpolateTemplate(cierreStep.prompt, session, { referencia: commercialReference })
-          : 'Solicitud confirmada correctamente.';
+      const showRefInClosure = flow.showReferenceInClosure !== false;
+      const rawClosureTemplate =
+        flow.closureTemplate || cierreStep?.prompt || 'Solicitud confirmada correctamente.';
+      const closureMsg = interpolateTemplate(rawClosureTemplate, session, {
+        referencia: showRefInClosure ? commercialReference : '',
+      });
 
       const finalMsg =
         !flow.hideInternalCategorizationInClosure && !flow.closureTemplate
           ? `${closureMsg}\n\nCategorización asignada: ${categorization.priority.toUpperCase()} (${categorization.reason})`
           : closureMsg;
 
-      const separateMessages = flow.referenceTemplate
-        ? [interpolateTemplate(flow.referenceTemplate, session, { referencia: commercialReference })]
-        : undefined;
+      const closureAlreadyContainsRef = rawClosureTemplate.includes('{{referencia}}');
+      const effectiveRefTemplate =
+        flow.referenceTemplate?.trim() ||
+        (showRefInClosure && !closureAlreadyContainsRef
+          ? 'Referencia de tu solicitud: {{referencia}}'
+          : '');
+
+      const separateMessages =
+        showRefInClosure && effectiveRefTemplate
+          ? [interpolateTemplate(effectiveRefTemplate, session, { referencia: commercialReference })]
+          : undefined;
 
       return {
         replyText: finalMsg,

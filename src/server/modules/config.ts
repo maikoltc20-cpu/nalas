@@ -1,4 +1,9 @@
 import {
+  buildAllKnownVariableKeys,
+  extractTemplateVariables,
+  validateFlowTemplates,
+} from '../../shared/flowTemplates.ts';
+import {
   hasValidContactName,
   isValidEmailAddress,
   normalizeInternationalPhone,
@@ -20,6 +25,7 @@ import type {
   ProductionSummary,
   ProPolicyVersion,
   RulesetVersion,
+  SummaryConfig,
   Task,
 } from '../../shared/types.ts';
 import { appendAudit } from './consumptionAndAudit.ts';
@@ -299,6 +305,10 @@ export function validateFlowAndDependencies(
         }
       }
     }
+  }
+
+  for (const tplIssue of validateFlowTemplates(flow)) {
+    issues.push(tplIssue);
   }
 
   return issues;
@@ -637,6 +647,21 @@ export function createFlowConversation(
     status: 'borrador',
     steps: starterSteps,
     outOfScriptRules: [],
+    summaryConfig: {
+      introPrompt: 'Revisá tus respuestas antes de confirmar:',
+      fields: [
+        {
+          stepId: `${baseStepPrefix}_1`,
+          label: 'Consulta inicial',
+          enabled: true,
+          order: 0,
+        },
+      ],
+    },
+    referenceTemplate: 'Referencia de tu solicitud: {{referencia}}',
+    alreadyRegisteredTemplate:
+      'Tu solicitud ya quedó registrada. Tu referencia es {{referencia}}. ¡Gracias por escribirnos!',
+    showReferenceInClosure: true,
     humanHandoffConfig: resolveHumanHandoffConfig(undefined),
     handoffMessage:
       'Dejamos registrada tu solicitud de atención con nuestro equipo. El asistente automático quedará en pausa en esta conversación.',
@@ -669,6 +694,27 @@ function stripHiddenStepPrompts(steps: FlowStep[]): FlowStep[] {
   });
 }
 
+export interface FlowDraftTemplateOverrides {
+  summaryConfig?: SummaryConfig | null;
+  summaryTemplate?: string | null;
+  closureTemplate?: string | null;
+  referenceTemplate?: string | null;
+  alreadyRegisteredTemplate?: string | null;
+  cancelMessage?: string | null;
+  showReferenceInClosure?: boolean | null;
+  hideInternalCategorizationInClosure?: boolean | null;
+}
+
+function resolveOptionalTextOverride(
+  incoming: string | null | undefined,
+  existing: string | undefined
+): string | undefined {
+  if (incoming === undefined) return existing;
+  if (incoming === null) return undefined;
+  const trimmed = incoming.trim();
+  return trimmed.length > 0 ? incoming : undefined;
+}
+
 export function saveFlowDraft(
   store: NalasStore,
   businessId: string,
@@ -677,7 +723,8 @@ export function saveFlowDraft(
   outOfScriptRules: OutOfScriptRule[],
   name?: string,
   humanHandoffConfig?: Partial<HumanHandoffConfig> | null,
-  flowKey?: string
+  flowKey?: string,
+  templateOverrides?: FlowDraftTemplateOverrides
 ): FlowVersion {
   const biz = store.businesses.find((b) => b.id === businessId);
   const activeFlow = biz
@@ -713,6 +760,32 @@ export function saveFlowDraft(
       0,
       ...sameKeyFlows.map((f) => f.versionNumber)
     );
+    const baseSummaryConfig =
+      templateOverrides?.summaryConfig !== undefined
+        ? templateOverrides.summaryConfig === null
+          ? undefined
+          : structuredClone(templateOverrides.summaryConfig)
+        : sameKeyActive?.summaryConfig
+          ? structuredClone(sameKeyActive.summaryConfig)
+          : undefined;
+    const knownForNewSteps = buildAllKnownVariableKeys(cleanedSteps);
+    const isInheritedTemplateCompatible = (
+      tpl: string | undefined,
+      allowReference: boolean
+    ): string | undefined => {
+      if (!tpl) return undefined;
+      const vars = extractTemplateVariables(tpl);
+      const compatible = vars.every((v) => {
+        if (knownForNewSteps.allStepKeys.has(v)) return true;
+        if (v === 'referencia') return allowReference;
+        if (v === 'etiqueta_dato_contacto' || v === 'canal_contacto_texto') {
+          return knownForNewSteps.hasCanalContacto;
+        }
+        if (v === 'contexto') return knownForNewSteps.hasContextBuilder;
+        return false;
+      });
+      return compatible ? tpl : undefined;
+    };
     draft = {
       id: `flow_${businessId}_${resolvedFlowKey}_draft_${Date.now()}`,
       businessId,
@@ -722,15 +795,42 @@ export function saveFlowDraft(
       status: 'borrador',
       steps: cleanedSteps,
       outOfScriptRules,
-      summaryTemplate: sameKeyActive?.summaryTemplate,
-      closureTemplate: sameKeyActive?.closureTemplate,
-      referenceTemplate: sameKeyActive?.referenceTemplate,
-      alreadyRegisteredTemplate: sameKeyActive?.alreadyRegisteredTemplate,
-      cancelMessage: sameKeyActive?.cancelMessage,
+      summaryConfig: baseSummaryConfig,
+      summaryTemplate: resolveOptionalTextOverride(
+        templateOverrides?.summaryTemplate,
+        isInheritedTemplateCompatible(sameKeyActive?.summaryTemplate, false)
+      ),
+      closureTemplate: resolveOptionalTextOverride(
+        templateOverrides?.closureTemplate,
+        isInheritedTemplateCompatible(sameKeyActive?.closureTemplate, true)
+      ),
+      referenceTemplate: resolveOptionalTextOverride(
+        templateOverrides?.referenceTemplate,
+        sameKeyActive?.referenceTemplate
+      ),
+      alreadyRegisteredTemplate: resolveOptionalTextOverride(
+        templateOverrides?.alreadyRegisteredTemplate,
+        sameKeyActive?.alreadyRegisteredTemplate
+      ),
+      cancelMessage: resolveOptionalTextOverride(
+        templateOverrides?.cancelMessage,
+        sameKeyActive?.cancelMessage
+      ),
+      showReferenceInClosure:
+        templateOverrides?.showReferenceInClosure !== undefined
+          ? templateOverrides.showReferenceInClosure === null
+            ? undefined
+            : Boolean(templateOverrides.showReferenceInClosure)
+          : sameKeyActive?.showReferenceInClosure,
       handoffMessage: sameKeyActive?.handoffMessage,
       handoffNoContactMessage: sameKeyActive?.handoffNoContactMessage,
       outOfScriptPrompt: sameKeyActive?.outOfScriptPrompt,
-      hideInternalCategorizationInClosure: sameKeyActive?.hideInternalCategorizationInClosure,
+      hideInternalCategorizationInClosure:
+        templateOverrides?.hideInternalCategorizationInClosure !== undefined
+          ? templateOverrides.hideInternalCategorizationInClosure === null
+            ? undefined
+            : Boolean(templateOverrides.hideInternalCategorizationInClosure)
+          : sameKeyActive?.hideInternalCategorizationInClosure,
       humanHandoffConfig:
         normalizedHandoff ??
         (sameKeyActive?.humanHandoffConfig
@@ -746,6 +846,56 @@ export function saveFlowDraft(
     if (name) draft.name = name;
     if (normalizedHandoff !== undefined) {
       draft.humanHandoffConfig = normalizedHandoff;
+    }
+    if (templateOverrides) {
+      if (templateOverrides.summaryConfig !== undefined) {
+        draft.summaryConfig =
+          templateOverrides.summaryConfig === null
+            ? undefined
+            : structuredClone(templateOverrides.summaryConfig);
+      }
+      if (templateOverrides.summaryTemplate !== undefined) {
+        draft.summaryTemplate = resolveOptionalTextOverride(
+          templateOverrides.summaryTemplate,
+          draft.summaryTemplate
+        );
+      }
+      if (templateOverrides.closureTemplate !== undefined) {
+        draft.closureTemplate = resolveOptionalTextOverride(
+          templateOverrides.closureTemplate,
+          draft.closureTemplate
+        );
+      }
+      if (templateOverrides.referenceTemplate !== undefined) {
+        draft.referenceTemplate = resolveOptionalTextOverride(
+          templateOverrides.referenceTemplate,
+          draft.referenceTemplate
+        );
+      }
+      if (templateOverrides.alreadyRegisteredTemplate !== undefined) {
+        draft.alreadyRegisteredTemplate = resolveOptionalTextOverride(
+          templateOverrides.alreadyRegisteredTemplate,
+          draft.alreadyRegisteredTemplate
+        );
+      }
+      if (templateOverrides.cancelMessage !== undefined) {
+        draft.cancelMessage = resolveOptionalTextOverride(
+          templateOverrides.cancelMessage,
+          draft.cancelMessage
+        );
+      }
+      if (templateOverrides.showReferenceInClosure !== undefined) {
+        draft.showReferenceInClosure =
+          templateOverrides.showReferenceInClosure === null
+            ? undefined
+            : Boolean(templateOverrides.showReferenceInClosure);
+      }
+      if (templateOverrides.hideInternalCategorizationInClosure !== undefined) {
+        draft.hideInternalCategorizationInClosure =
+          templateOverrides.hideInternalCategorizationInClosure === null
+            ? undefined
+            : Boolean(templateOverrides.hideInternalCategorizationInClosure);
+      }
     }
   }
 
@@ -1667,6 +1817,12 @@ export function getAssistantProductionSummary(
             humanHandoffConfig: pub.humanHandoffConfig
               ? structuredClone(pub.humanHandoffConfig)
               : undefined,
+            summaryConfig: pub.summaryConfig ? structuredClone(pub.summaryConfig) : undefined,
+            summaryTemplate: pub.summaryTemplate,
+            closureTemplate: pub.closureTemplate,
+            referenceTemplate: pub.referenceTemplate,
+            alreadyRegisteredTemplate: pub.alreadyRegisteredTemplate,
+            showReferenceInClosure: pub.showReferenceInClosure,
             handoffMessage: pub.handoffMessage,
             cancelMessage: pub.cancelMessage,
             outOfScriptPrompt: pub.outOfScriptPrompt,

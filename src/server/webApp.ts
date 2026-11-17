@@ -6,6 +6,7 @@ import type {
   Edition,
   Environment,
   FlowStep,
+  FlowVersion,
   HumanHandoffConfig,
   NalasStore,
   Opportunity,
@@ -1159,6 +1160,14 @@ webApp.post('/api/flows/draft', async (c) => {
       name?: string;
       humanHandoffConfig?: Partial<HumanHandoffConfig>;
       flowKey?: string;
+      summaryConfig?: FlowVersion['summaryConfig'] | null;
+      summaryTemplate?: string | null;
+      closureTemplate?: string | null;
+      referenceTemplate?: string | null;
+      alreadyRegisteredTemplate?: string | null;
+      cancelMessage?: string | null;
+      showReferenceInClosure?: boolean | null;
+      hideInternalCategorizationInClosure?: boolean | null;
     };
     const result = await withFlowConfigTransaction(businessId, (store) => {
       const ctx = resolveActorContext(store, userId, businessId);
@@ -1171,7 +1180,17 @@ webApp.post('/api/flows/draft', async (c) => {
         body.outOfScriptRules ?? [],
         body.name,
         body.humanHandoffConfig,
-        body.flowKey
+        body.flowKey,
+        {
+          summaryConfig: body.summaryConfig,
+          summaryTemplate: body.summaryTemplate,
+          closureTemplate: body.closureTemplate,
+          referenceTemplate: body.referenceTemplate,
+          alreadyRegisteredTemplate: body.alreadyRegisteredTemplate,
+          cancelMessage: body.cancelMessage,
+          showReferenceInClosure: body.showReferenceInClosure,
+          hideInternalCategorizationInClosure: body.hideInternalCategorizationInClosure,
+        }
       );
       const biz = store.businesses.find((b) => b.id === businessId)!;
       const targetRuleset =

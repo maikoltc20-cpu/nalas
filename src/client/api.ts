@@ -26,6 +26,7 @@ import type {
   ProPolicyVersion,
   RulesetVersion,
   Session,
+  SummaryConfig,
   SupportGrant,
   Task,
   User,
@@ -329,6 +330,14 @@ export const nalasApi = {
       humanHandoffConfig?: HumanHandoffConfig;
       name?: string;
       flowKey?: string;
+      summaryConfig?: SummaryConfig | null;
+      summaryTemplate?: string | null;
+      closureTemplate?: string | null;
+      referenceTemplate?: string | null;
+      alreadyRegisteredTemplate?: string | null;
+      cancelMessage?: string | null;
+      showReferenceInClosure?: boolean | null;
+      hideInternalCategorizationInClosure?: boolean | null;
     }
   ) {
     return apiFetch<{ draft: FlowVersion; issues: ClientValidationIssue[] }>(

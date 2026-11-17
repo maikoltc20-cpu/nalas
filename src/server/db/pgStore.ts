@@ -328,7 +328,7 @@ export async function claimInboundEventPg(
 }
 
 export async function allocateCommercialReferencePg(
-  client: PoolClient,
+  client: PgQueryClient,
   params: {
     businessId: string;
     productKey: string;
@@ -1015,11 +1015,13 @@ export async function saveStoreToPg(client: PoolClient, store: NalasStore): Prom
   for (const f of store.flowVersions) {
     const templates = {
       flowKey: f.flowKey,
+      summaryConfig: f.summaryConfig,
       summaryTemplate: f.summaryTemplate,
       closureTemplate: f.closureTemplate,
       referenceTemplate: f.referenceTemplate,
       alreadyRegisteredTemplate: f.alreadyRegisteredTemplate,
       cancelMessage: f.cancelMessage,
+      showReferenceInClosure: f.showReferenceInClosure,
       handoffMessage: f.handoffMessage,
       handoffNoContactMessage: f.handoffNoContactMessage,
       outOfScriptPrompt: f.outOfScriptPrompt,
@@ -3392,11 +3394,13 @@ export async function persistFlowConfigSlicePg(
     if (beforeFlowMap.get(f.id) === JSON.stringify(f)) continue;
     const templates = {
       flowKey: f.flowKey,
+      summaryConfig: f.summaryConfig,
       summaryTemplate: f.summaryTemplate,
       closureTemplate: f.closureTemplate,
       referenceTemplate: f.referenceTemplate,
       alreadyRegisteredTemplate: f.alreadyRegisteredTemplate,
       cancelMessage: f.cancelMessage,
+      showReferenceInClosure: f.showReferenceInClosure,
       handoffMessage: f.handoffMessage,
       handoffNoContactMessage: f.handoffNoContactMessage,
       outOfScriptPrompt: f.outOfScriptPrompt,
