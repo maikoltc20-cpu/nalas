@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
   AlertTriangle,
@@ -463,6 +463,10 @@ export function OperationsWorkspace({
   const [tasksExpanded, setTasksExpanded] = useState(false);
   const [tasksPage, setTasksPage] = useState(1);
   const [restartConfirmConvId, setRestartConfirmConvId] = useState<string | null>(null);
+  const [restartBusy, setRestartBusy] = useState(false);
+  const [restartProgressMsg, setRestartProgressMsg] = useState<string | null>(null);
+  const [restartModalError, setRestartModalError] = useState<string | null>(null);
+  const restartInFlightRef = useRef(false);
 
   useEffect(() => {
     setProductFilter('todos');
@@ -478,6 +482,8 @@ export function OperationsWorkspace({
     setLeadsPage(1);
     setTasksPage(1);
     setRestartConfirmConvId(null);
+    setRestartProgressMsg(null);
+    setRestartModalError(null);
   }, [business.id, ctx.environment, view]);
 
   useEffect(() => {
@@ -806,21 +812,51 @@ export function OperationsWorkspace({
   }
 
   async function handleConfirmRestartPublished(convId: string) {
+    if (restartInFlightRef.current) return;
+    restartInFlightRef.current = true;
+    setRestartBusy(true);
     setBusy(true);
+    setRestartModalError(null);
+    setRestartProgressMsg('Reiniciando sesión y desvinculando selección previa...');
     try {
-      await nalasApi.restartConversationWithPublished(ctx, convId);
-      setRestartConfirmConvId(null);
+      const restarted = await nalasApi.restartConversationWithPublished(ctx, convId);
+      if (
+        !restarted?.conversation ||
+        !restarted?.session ||
+        restarted.conversation.control !== 'bot' ||
+        Boolean(restarted.conversation.productId) ||
+        Boolean(restarted.session.productId) ||
+        Boolean(restarted.session.pausedForReview)
+      ) {
+        throw new Error(
+          'El servidor no devolvió un estado reiniciado consistente. Recargá e intentá nuevamente.'
+        );
+      }
+      setRestartProgressMsg('Persistencia confirmada. Actualizando vista de Atención...');
       await onRefresh();
-      onNotice(
-        'Chat reiniciado con la versión publicada vigente. Historial conservado y 0 mensajes enviados.'
-      );
+      setRestartConfirmConvId(null);
+      setRestartProgressMsg(null);
+      const closedTasks = restarted.resolvedTaskIds?.length ?? 0;
+      const details = [
+        'Historial y contacto conservados',
+        `salidas previas excluidas: ${restarted.pausedOutboxCount}`,
+        closedTasks > 0 ? `revisiones cerradas: ${closedTasks}` : null,
+        '0 mensajes enviados',
+      ]
+        .filter(Boolean)
+        .join('; ');
+      onNotice(`Chat reiniciado y verificado con la versión publicada vigente (${details}).`);
     } catch (e) {
-      onError(
+      const msg =
         e instanceof Error
           ? e.message
-          : 'No se pudo reiniciar el chat con la versión publicada.'
-      );
+          : 'No se pudo reiniciar el chat con la versión publicada.';
+      setRestartModalError(msg);
+      setRestartProgressMsg(null);
+      onError(msg);
     } finally {
+      restartInFlightRef.current = false;
+      setRestartBusy(false);
       setBusy(false);
     }
   }
@@ -1403,8 +1439,12 @@ export function OperationsWorkspace({
                         )}
                         <button
                           type="button"
-                          disabled={busy}
-                          onClick={() => setRestartConfirmConvId(selectedConv.id)}
+                          disabled={busy || restartBusy}
+                          onClick={() => {
+                            setRestartModalError(null);
+                            setRestartProgressMsg(null);
+                            setRestartConfirmConvId(selectedConv.id);
+                          }}
                           className="inline-flex items-center gap-1.5 min-h-[40px] px-3.5 py-2 text-xs font-medium text-[#25364A] bg-white border border-[#DCE3E8] rounded-[9px] hover:bg-[#F7F8FA] whitespace-nowrap"
                         >
                           <RotateCcw className="w-3.5 h-3.5 text-[#167D83]" />
@@ -1712,8 +1752,14 @@ export function OperationsWorkspace({
                 </div>
                 <button
                   type="button"
-                  onClick={() => setRestartConfirmConvId(null)}
-                  className="p-1.5 text-[#5A6877] hover:text-[#25364A]"
+                  disabled={restartBusy}
+                  onClick={() => {
+                    if (restartBusy) return;
+                    setRestartConfirmConvId(null);
+                    setRestartModalError(null);
+                    setRestartProgressMsg(null);
+                  }}
+                  className="p-1.5 text-[#5A6877] hover:text-[#25364A] disabled:opacity-40"
                 >
                   <X className="w-5 h-5" />
                 </button>
@@ -1721,28 +1767,50 @@ export function OperationsWorkspace({
 
               <div className="p-3.5 bg-[#F7F8FA] border border-[#E2E7EB] rounded-[10px] text-xs text-[#25364A] space-y-1.5">
                 <div>• Conserva íntegros los mensajes anteriores y los datos del contacto.</div>
+                <div>• Desvincula selecciones previas inválidas o pausas por configuración y cierra su revisión pendiente.</div>
                 <div>• Excluye envíos pendientes o fallidos anteriores que pudieran haber quedado pendientes.</div>
                 <div>• Reinicia el punto del flujo y fija la configuración publicada vigente.</div>
                 <div>• Envía <strong>0 mensajes</strong> en este momento; cuando el cliente vuelva a escribir, recibirá el saludo o menú publicado actual.</div>
               </div>
 
+              {restartProgressMsg && (
+                <div className="p-3 rounded-[9px] border border-[#D4EAE4] bg-[#EAF5F2] text-xs text-[#116B70] font-medium">
+                  {restartProgressMsg}
+                </div>
+              )}
+
+              {restartModalError && (
+                <div className="p-3 rounded-[9px] border border-red-200 bg-red-50 text-xs text-red-800 flex items-start gap-2">
+                  <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
+                  <div>
+                    <div className="font-semibold">No se pudo completar el reinicio</div>
+                    <div className="mt-0.5">{restartModalError}</div>
+                  </div>
+                </div>
+              )}
+
               <div className="flex flex-wrap justify-end gap-2.5 pt-2">
                 <button
                   type="button"
-                  disabled={busy}
-                  onClick={() => setRestartConfirmConvId(null)}
-                  className="min-h-[42px] px-4 py-2 text-sm font-medium text-[#25364A] bg-white border border-[#DCE3E8] rounded-[9px] hover:bg-[#F7F8FA]"
+                  disabled={busy || restartBusy}
+                  onClick={() => {
+                    if (restartBusy) return;
+                    setRestartConfirmConvId(null);
+                    setRestartModalError(null);
+                    setRestartProgressMsg(null);
+                  }}
+                  className="min-h-[42px] px-4 py-2 text-sm font-medium text-[#25364A] bg-white border border-[#DCE3E8] rounded-[9px] hover:bg-[#F7F8FA] disabled:opacity-45"
                 >
                   Cancelar
                 </button>
                 <button
                   type="button"
-                  disabled={busy}
+                  disabled={busy || restartBusy}
                   onClick={() => handleConfirmRestartPublished(restartConfirmConvId)}
                   className="inline-flex items-center gap-1.5 min-h-[42px] px-4 py-2 text-sm font-semibold text-white bg-[#167D83] rounded-[9px] hover:bg-[#116B70] disabled:opacity-45"
                 >
-                  <RotateCcw className="w-4 h-4" />
-                  <span>{busy ? 'Reiniciando...' : 'Confirmar reinicio'}</span>
+                  <RotateCcw className={`w-4 h-4 ${restartBusy ? 'animate-spin' : ''}`} />
+                  <span>{restartBusy ? 'Reiniciando y verificando...' : 'Confirmar reinicio'}</span>
                 </button>
               </div>
             </div>

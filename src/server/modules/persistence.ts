@@ -1,10 +1,13 @@
-import type { NalasStore } from '../../shared/types.ts';
+import type { Conversation, NalasStore, Session } from '../../shared/types.ts';
 import {
   isPgUndefinedTableError,
   isPostgresConfigured,
+  loadConversationRestartSlicePg,
   loadFlowConfigStoreSlicePg,
   loadStoreFromPg,
+  persistConversationRestartSlicePg,
   persistFlowConfigSlicePg,
+  readConversationRestartVerificationPg,
   saveStoreToPg,
   withPgClient,
 } from '../db/pgStore.ts';
@@ -358,6 +361,149 @@ export async function withFlowConfigTransaction<T>(
       throw err;
     }
   });
+}
+
+export interface ConversationRestartTimings {
+  backend: 'postgres_focused' | 'local_json_dev';
+  loadSliceMs: number;
+  domainResetMs: number;
+  persistSliceMs: number;
+  verifyReadMs: number;
+  totalMs: number;
+  queriesExecuted?: number;
+}
+
+export interface ConversationRestartVerification {
+  conversation: Conversation | null;
+  session: Session | null;
+  openTaskCount: number;
+}
+
+export async function withConversationRestartTransaction<T>(
+  businessId: string,
+  conversationId: string,
+  fn: (store: NalasStore) => Promise<T> | T
+): Promise<{
+  result: T;
+  timings: ConversationRestartTimings;
+  verified: ConversationRestartVerification;
+}> {
+  const totalStart = Date.now();
+
+  if (isPostgresConfigured()) {
+    return withPgClient(async (client) => {
+      try {
+        const loadStart = Date.now();
+        await client.query('BEGIN');
+        await client.query(`SET LOCAL lock_timeout = '8000'`);
+        await client.query(`SET LOCAL statement_timeout = '10000'`);
+        await client.query(`SELECT pg_advisory_xact_lock(hashtext('conv_restart:' || $1))`, [
+          conversationId,
+        ]);
+        const current = await loadConversationRestartSlicePg(client, businessId, conversationId);
+        if (!current) {
+          throw createNotInitializedError();
+        }
+        const loadSliceMs = Date.now() - loadStart;
+
+        const domainStart = Date.now();
+        const draft = structuredClone(current);
+        const result = await fn(draft);
+        const domainResetMs = Date.now() - domainStart;
+
+        const persistStart = Date.now();
+        const { queriesExecuted } = await persistConversationRestartSlicePg(
+          client,
+          current,
+          draft,
+          conversationId
+        );
+        await client.query('COMMIT');
+        const persistSliceMs = Date.now() - persistStart;
+
+        const verifyStart = Date.now();
+        const verified = await readConversationRestartVerificationPg(
+          client,
+          businessId,
+          conversationId
+        );
+        const verifyReadMs = Date.now() - verifyStart;
+
+        return {
+          result,
+          verified,
+          timings: {
+            backend: 'postgres_focused',
+            loadSliceMs,
+            domainResetMs,
+            persistSliceMs,
+            verifyReadMs,
+            totalMs: Date.now() - totalStart,
+            queriesExecuted,
+          },
+        };
+      } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        if (isPgUndefinedTableError(err)) {
+          throw createNotInitializedError();
+        }
+        throw err;
+      }
+    });
+  }
+
+  let result!: T;
+  let loadSliceMs = 0;
+  let domainResetMs = 0;
+  let persistSliceMs = 0;
+
+  const run = async () => {
+    const loadStart = Date.now();
+    const current = await ensureFileStoreLoaded();
+    const draft = structuredClone(current);
+    loadSliceMs = Date.now() - loadStart;
+
+    const domainStart = Date.now();
+    result = await fn(draft);
+    domainResetMs = Date.now() - domainStart;
+
+    const persistStart = Date.now();
+    memoryStore = draft;
+    await persistFileAtomically(draft);
+    persistSliceMs = Date.now() - persistStart;
+  };
+  writeQueue = writeQueue.then(run, run);
+  await writeQueue;
+
+  const verifyStart = Date.now();
+  const verifiedStore = await readStore();
+  const verified: ConversationRestartVerification = {
+    conversation:
+      verifiedStore.conversations.find(
+        (c) => c.id === conversationId && c.businessId === businessId
+      ) ?? null,
+    session:
+      verifiedStore.sessions.find(
+        (s) => s.conversationId === conversationId && s.businessId === businessId
+      ) ?? null,
+    openTaskCount: verifiedStore.tasks.filter(
+      (t) => t.conversationId === conversationId && t.businessId === businessId && t.status !== 'resuelta'
+    ).length,
+  };
+  const verifyReadMs = Date.now() - verifyStart;
+
+  return {
+    result,
+    verified,
+    timings: {
+      backend: 'local_json_dev',
+      loadSliceMs,
+      domainResetMs,
+      persistSliceMs,
+      verifyReadMs,
+      totalMs: Date.now() - totalStart,
+    },
+  };
 }
 
 export function assertTenantScope<T extends { businessId: string }>(

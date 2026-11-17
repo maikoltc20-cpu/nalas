@@ -130,6 +130,7 @@ import {
   readFlowConfigSlice,
   readStore,
   restoreBackupSnapshot,
+  withConversationRestartTransaction,
   withFlowConfigTransaction,
   withStoreTransaction,
 } from './modules/persistence.ts';
@@ -2499,14 +2500,51 @@ webApp.post('/api/conversations/:conversationId/restart-published', async (c) =>
   try {
     const { userId, businessId } = getActorContext(c);
     const conversationId = c.req.param('conversationId');
-    const result = await runSerializedForConversation(conversationId, () =>
-      withStoreTransaction((store) => {
+    const { result, timings, verified } = await runSerializedForConversation(conversationId, () =>
+      withConversationRestartTransaction(businessId, conversationId, (store) => {
         const ctx = resolveActorContext(store, userId, businessId);
         assertPermission(ctx, 'handleHumanQueue');
         return restartConversationWithPublished(store, businessId, userId, conversationId);
       })
     );
-    return c.json(result);
+
+    const verifiedConv = verified.conversation ?? result.conversation;
+    const verifiedSession = verified.session ?? result.session;
+    const isConsistent =
+      verifiedConv.control === 'bot' &&
+      !verifiedConv.productId &&
+      !verifiedSession.productId &&
+      !verifiedSession.pausedForReview &&
+      verifiedSession.currentStepId === null &&
+      verified.openTaskCount === 0;
+
+    if (!isConsistent) {
+      const err = new Error(
+        'No se pudo confirmar la persistencia limpia del reinicio en el almacenamiento.'
+      ) as Error & { statusCode?: number };
+      err.statusCode = 500;
+      throw err;
+    }
+
+    console.info(
+      '[restart-published]',
+      JSON.stringify({
+        businessId,
+        conversationId,
+        pausedOutboxCount: result.pausedOutboxCount,
+        resolvedTasksCount: result.resolvedTaskIds.length,
+        timings,
+      })
+    );
+
+    return c.json({
+      conversation: verifiedConv,
+      session: verifiedSession,
+      pausedOutboxCount: result.pausedOutboxCount,
+      resolvedTaskIds: result.resolvedTaskIds,
+      verified: true,
+      timings,
+    });
   } catch (err) {
     return errorResponse(err);
   }

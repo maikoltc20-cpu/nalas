@@ -3508,4 +3508,485 @@ export async function persistFlowConfigSlicePg(
   return { queriesExecuted };
 }
 
+function mapPgConversationRow(r: Record<string, any>): Conversation {
+  return {
+    id: r.id,
+    businessId: r.business_id,
+    environment: r.environment,
+    assistantId: r.assistant_id,
+    connectionId: r.connection_id,
+    contactId: r.contact_id,
+    productId: r.product_id ?? undefined,
+    productName: r.product_name ?? undefined,
+    status: r.status,
+    control: r.control,
+    assignedUserId: r.assigned_user_id ?? undefined,
+    pinnedFlowVersionId: r.pinned_flow_version_id,
+    pinnedRulesetVersionId: r.pinned_ruleset_version_id,
+    pinnedProPolicyVersionId: r.pinned_pro_policy_version_id,
+    activeEngine: r.active_engine,
+    createdAt: toIsoPg(r.created_at)!,
+    updatedAt: toIsoPg(r.updated_at)!,
+  };
+}
+
+function mapPgSessionRow(r: Record<string, any>): Session {
+  const flags = r.flags || {};
+  return {
+    id: r.id,
+    businessId: r.business_id,
+    environment: r.environment,
+    conversationId: r.conversation_id,
+    productId: r.product_id ?? undefined,
+    productName: r.product_name ?? undefined,
+    pinnedFlowVersionId: r.pinned_flow_version_id,
+    pinnedRulesetVersionId: r.pinned_ruleset_version_id,
+    pinnedProPolicyVersionId: r.pinned_pro_policy_version_id,
+    currentStepId: r.current_step_id ?? null,
+    stepHistory: r.step_history ?? [],
+    captureStatus: r.capture_status,
+    answers: r.answers ?? {},
+    ...flags,
+    createdAt: toIsoPg(r.created_at)!,
+    updatedAt: toIsoPg(r.updated_at)!,
+  };
+}
+
+function mapPgOutboxRow(r: Record<string, any>): OutboxEvent {
+  return {
+    id: r.id,
+    businessId: r.business_id,
+    environment: r.environment,
+    conversationId: r.conversation_id,
+    messageId: r.message_id,
+    connectionId: r.connection_id,
+    payloadText: r.payload_text,
+    deliveryStatus: r.delivery_status,
+    providerMessageId: r.provider_message_id ?? undefined,
+    attempts: Number(r.attempts ?? 0),
+    maxAttempts: Number(r.max_attempts ?? 3),
+    nextRetryAt: toIsoPg(r.next_retry_at),
+    lastError: r.last_error ?? undefined,
+    createdAt: toIsoPg(r.created_at)!,
+    updatedAt: toIsoPg(r.updated_at)!,
+  };
+}
+
+function packPgSessionFlags(s: Session): Record<string, unknown> {
+  return {
+    confirmedIdempotencyKey: s.confirmedIdempotencyKey,
+    awaitingEntryProductSelection: s.awaitingEntryProductSelection,
+    enteredViaEntryMenu: s.enteredViaEntryMenu,
+    useEntryDraft: s.useEntryDraft,
+    awaitingUnconfiguredProductAction: s.awaitingUnconfiguredProductAction,
+    awaitingContextSubmode: s.awaitingContextSubmode,
+    awaitingCorrectionFieldSelection: s.awaitingCorrectionFieldSelection,
+    correctionQueue: s.correctionQueue,
+    correctionReturnToStepId: s.correctionReturnToStepId,
+    awaitingOutOfScriptChoice: s.awaitingOutOfScriptChoice,
+    awaitingHumanContactName: s.awaitingHumanContactName,
+    awaitingHumanContactPhone: s.awaitingHumanContactPhone,
+    awaitingHumanTaskId: s.awaitingHumanTaskId,
+    pausedForReview: s.pausedForReview,
+    pausedReason: s.pausedReason,
+    pausedAt: s.pausedAt,
+    completedAt: s.completedAt,
+    closureReason: s.closureReason,
+    closedByUserId: s.closedByUserId,
+  };
+}
+
+export async function loadConversationRestartSlicePg(
+  client: PgQueryClient,
+  businessId: string,
+  conversationId: string
+): Promise<NalasStore | null> {
+  const bizRes = await client.query('SELECT * FROM nalas_businesses WHERE id = $1 LIMIT 1', [
+    businessId,
+  ]);
+  if (bizRes.rowCount === 0) {
+    const anyBiz = await client.query('SELECT 1 FROM nalas_businesses LIMIT 1');
+    if (anyBiz.rowCount === 0) return null;
+  }
+
+  const [
+    usersRes,
+    memRes,
+    grantsRes,
+    asstRes,
+    flowRes,
+    rulesRes,
+    convRes,
+    sesRes,
+    outboxRes,
+    tasksRes,
+  ] = await Promise.all([
+    client.query('SELECT id, name, email, is_platform_admin FROM nalas_users ORDER BY id ASC'),
+    client.query(
+      'SELECT * FROM nalas_memberships WHERE business_id = $1 ORDER BY created_at ASC',
+      [businessId]
+    ),
+    client.query(
+      'SELECT * FROM nalas_support_grants WHERE business_id = $1 ORDER BY created_at DESC',
+      [businessId]
+    ),
+    client.query(
+      'SELECT * FROM nalas_assistants WHERE business_id = $1 ORDER BY created_at ASC',
+      [businessId]
+    ),
+    client.query(
+      'SELECT * FROM nalas_flow_versions WHERE business_id = $1 ORDER BY version_number ASC',
+      [businessId]
+    ),
+    client.query(
+      'SELECT * FROM nalas_ruleset_versions WHERE business_id = $1 ORDER BY version_number ASC',
+      [businessId]
+    ),
+    client.query(
+      'SELECT * FROM nalas_conversations WHERE id = $1 AND business_id = $2 LIMIT 1',
+      [conversationId, businessId]
+    ),
+    client.query(
+      'SELECT * FROM nalas_sessions WHERE conversation_id = $1 AND business_id = $2 LIMIT 1',
+      [conversationId, businessId]
+    ),
+    client.query(
+      `SELECT * FROM nalas_outbox_events
+       WHERE conversation_id = $1 AND business_id = $2 AND delivery_status IN ('pendiente', 'fallido')`,
+      [conversationId, businessId]
+    ),
+    client.query(
+      `SELECT * FROM nalas_tasks
+       WHERE conversation_id = $1 AND business_id = $2 AND status <> 'resuelta'`,
+      [conversationId, businessId]
+    ),
+  ]);
+
+  const businesses: Business[] = bizRes.rows.map((r) => {
+    const { entryConfig, entryDraft } = unpackPgEntryConfig(r.entry_config);
+    return {
+      id: r.id,
+      slug: r.slug,
+      name: r.name,
+      currency: r.currency,
+      currencyDecimals: r.currency_decimals,
+      timezone: r.timezone,
+      language: r.language,
+      contactFormat: r.contact_format,
+      defaultReferencePrefix: r.default_reference_prefix ?? undefined,
+      products: r.products ?? undefined,
+      entryConfig,
+      entryDraft,
+      subscription: r.subscription,
+      activeFlowVersionId: r.active_flow_version_id,
+      activeRulesetVersionId: r.active_ruleset_version_id,
+      activeProPolicyVersionId: r.active_pro_policy_version_id,
+      createdAt: toIsoPg(r.created_at)!,
+    };
+  });
+
+  const users: User[] = usersRes.rows.map((r) => ({
+    id: r.id,
+    name: r.name,
+    email: r.email,
+    isPlatformAdmin: Boolean(r.is_platform_admin),
+  }));
+
+  const memberships: Membership[] = memRes.rows.map((r) => ({
+    id: r.id,
+    userId: r.user_id,
+    businessId: r.business_id,
+    role: r.role,
+    createdAt: toIsoPg(r.created_at)!,
+  }));
+
+  const supportGrants: SupportGrant[] = grantsRes.rows.map((r) => ({
+    id: r.id,
+    supportUserId: r.support_user_id,
+    businessId: r.business_id,
+    reason: r.reason,
+    grantedByUserId: r.granted_by_user_id,
+    expiresAt: toIsoPg(r.expires_at)!,
+    active: Boolean(r.active),
+    createdAt: toIsoPg(r.created_at)!,
+  }));
+
+  const assistants: Assistant[] = asstRes.rows.map((r) => ({
+    id: r.id,
+    businessId: r.business_id,
+    name: r.name,
+    purpose: r.purpose,
+    language: r.language,
+    activeMode: r.active_mode,
+    adapterType: r.adapter_type,
+    createdAt: toIsoPg(r.created_at)!,
+  }));
+
+  const flowVersions: FlowVersion[] = flowRes.rows.map((r) => {
+    const t = r.templates || {};
+    return {
+      id: r.id,
+      businessId: r.business_id,
+      versionNumber: r.version_number,
+      name: r.name,
+      status: r.status,
+      steps: r.steps,
+      outOfScriptRules: r.out_of_script_rules,
+      ...t,
+      createdAt: toIsoPg(r.created_at)!,
+      publishedAt: toIsoPg(r.published_at),
+    };
+  });
+
+  const rulesetVersions: RulesetVersion[] = rulesRes.rows.map((r) => ({
+    id: r.id,
+    businessId: r.business_id,
+    versionNumber: r.version_number,
+    name: r.name,
+    status: r.status,
+    priorityStrategy: r.priority_strategy,
+    tagStrategy: r.tag_strategy,
+    defaultPriority: r.default_priority,
+    defaultReason: r.default_reason,
+    rules: r.rules,
+    createdAt: toIsoPg(r.created_at)!,
+    publishedAt: toIsoPg(r.published_at),
+  }));
+
+  const conversations: Conversation[] = convRes.rows.map(mapPgConversationRow);
+  const sessions: Session[] = sesRes.rows.map(mapPgSessionRow);
+  const outboxEvents: OutboxEvent[] = outboxRes.rows.map(mapPgOutboxRow);
+  const tasks: Task[] = tasksRes.rows.map((r) => ({
+    id: r.id,
+    businessId: r.business_id,
+    environment: r.environment,
+    conversationId: r.conversation_id,
+    contactId: r.contact_id,
+    productId: r.product_id ?? undefined,
+    productName: r.product_name ?? undefined,
+    title: r.title,
+    contextSummary: r.context_summary,
+    hasUsableContact: Boolean(r.has_usable_contact),
+    contactWarning: r.contact_warning ?? undefined,
+    assignedUserId: r.assigned_user_id ?? undefined,
+    status: r.status,
+    createdAt: toIsoPg(r.created_at)!,
+    updatedAt: toIsoPg(r.updated_at)!,
+  }));
+
+  const storeSlice: NalasStore = {
+    businesses,
+    users,
+    userCredentials: [],
+    userIdentities: [],
+    memberships,
+    supportGrants,
+    assistants,
+    channelConnections: [],
+    flowVersions,
+    rulesetVersions,
+    proPolicyVersions: [],
+    contacts: [],
+    channelIdentities: [],
+    conversations,
+    messages: [],
+    sessions,
+    leads: [],
+    opportunities: [],
+    tasks,
+    actionAttempts: [],
+    outboxEvents,
+    auditEvents: [],
+    processedInboundEvents: [],
+    referenceSequences: [],
+    backups: [],
+    counters: { basicaAiCallsTotal: 0, proAiCallsTotal: 0 },
+  };
+  reconcileStableProductFlowKeys(storeSlice);
+  return storeSlice;
+}
+
+export async function persistConversationRestartSlicePg(
+  client: PgQueryClient,
+  beforeStore: NalasStore,
+  afterStore: NalasStore,
+  conversationId: string
+): Promise<{ queriesExecuted: number }> {
+  let queriesExecuted = 0;
+  const writes: Promise<unknown>[] = [];
+
+  const beforeConvMap = new Map(beforeStore.conversations.map((c) => [c.id, JSON.stringify(c)]));
+  for (const cv of afterStore.conversations) {
+    if (cv.id !== conversationId) continue;
+    if (beforeConvMap.get(cv.id) === JSON.stringify(cv)) continue;
+    queriesExecuted += 1;
+    writes.push(
+      client.query(
+        `UPDATE nalas_conversations
+         SET product_id = $2,
+             product_name = $3,
+             status = $4,
+             control = $5,
+             assigned_user_id = $6,
+             pinned_flow_version_id = $7,
+             pinned_ruleset_version_id = $8,
+             pinned_pro_policy_version_id = $9,
+             active_engine = $10,
+             updated_at = $11
+         WHERE id = $1 AND business_id = $12`,
+        [
+          cv.id,
+          cv.productId ?? null,
+          cv.productName ?? null,
+          cv.status,
+          cv.control,
+          cv.assignedUserId ?? null,
+          cv.pinnedFlowVersionId,
+          cv.pinnedRulesetVersionId,
+          cv.pinnedProPolicyVersionId,
+          cv.activeEngine,
+          cv.updatedAt,
+          cv.businessId,
+        ]
+      )
+    );
+  }
+
+  const beforeSesMap = new Map(beforeStore.sessions.map((s) => [s.id, JSON.stringify(s)]));
+  for (const s of afterStore.sessions) {
+    if (s.conversationId !== conversationId) continue;
+    if (beforeSesMap.get(s.id) === JSON.stringify(s)) continue;
+    queriesExecuted += 1;
+    writes.push(
+      client.query(
+        `UPDATE nalas_sessions
+         SET product_id = $2,
+             product_name = $3,
+             pinned_flow_version_id = $4,
+             pinned_ruleset_version_id = $5,
+             pinned_pro_policy_version_id = $6,
+             current_step_id = $7,
+             step_history = $8,
+             capture_status = $9,
+             answers = $10,
+             flags = $11,
+             updated_at = $12
+         WHERE id = $1 AND business_id = $13`,
+        [
+          s.id,
+          s.productId ?? null,
+          s.productName ?? null,
+          s.pinnedFlowVersionId,
+          s.pinnedRulesetVersionId,
+          s.pinnedProPolicyVersionId,
+          s.currentStepId ?? null,
+          JSON.stringify(s.stepHistory),
+          s.captureStatus,
+          JSON.stringify(s.answers),
+          JSON.stringify(packPgSessionFlags(s)),
+          s.updatedAt,
+          s.businessId,
+        ]
+      )
+    );
+  }
+
+  const beforeOutboxMap = new Map(beforeStore.outboxEvents.map((o) => [o.id, JSON.stringify(o)]));
+  for (const ob of afterStore.outboxEvents) {
+    if (ob.conversationId !== conversationId) continue;
+    if (beforeOutboxMap.get(ob.id) === JSON.stringify(ob)) continue;
+    queriesExecuted += 1;
+    writes.push(
+      client.query(
+        `UPDATE nalas_outbox_events
+         SET next_retry_at = $2,
+             last_error = $3,
+             updated_at = $4
+         WHERE id = $1 AND business_id = $5`,
+        [ob.id, ob.nextRetryAt ?? null, ob.lastError ?? null, ob.updatedAt, ob.businessId]
+      )
+    );
+  }
+
+  const beforeTaskMap = new Map(beforeStore.tasks.map((t) => [t.id, JSON.stringify(t)]));
+  for (const t of afterStore.tasks) {
+    if (t.conversationId !== conversationId) continue;
+    if (beforeTaskMap.get(t.id) === JSON.stringify(t)) continue;
+    queriesExecuted += 1;
+    writes.push(
+      client.query(
+        `UPDATE nalas_tasks
+         SET status = $2,
+             context_summary = $3,
+             assigned_user_id = $4,
+             updated_at = $5
+         WHERE id = $1 AND business_id = $6`,
+        [t.id, t.status, t.contextSummary, t.assignedUserId ?? null, t.updatedAt, t.businessId]
+      )
+    );
+  }
+
+  const beforeAuditIds = new Set(beforeStore.auditEvents.map((a) => a.id));
+  for (const au of afterStore.auditEvents) {
+    if (beforeAuditIds.has(au.id)) continue;
+    queriesExecuted += 1;
+    writes.push(
+      client.query(
+        `INSERT INTO nalas_audit_events (
+           id, business_id, environment, actor_user_id, module, action, detail, correlation_id, created_at
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+         ON CONFLICT (id) DO NOTHING`,
+        [
+          au.id,
+          au.businessId,
+          au.environment ?? null,
+          au.actorUserId,
+          au.module,
+          au.action,
+          au.detail,
+          au.correlationId ?? null,
+          au.createdAt,
+        ]
+      )
+    );
+  }
+
+  if (writes.length > 0) {
+    await Promise.all(writes);
+  }
+  return { queriesExecuted };
+}
+
+export async function readConversationRestartVerificationPg(
+  client: PgQueryClient,
+  businessId: string,
+  conversationId: string
+): Promise<{
+  conversation: Conversation | null;
+  session: Session | null;
+  openTaskCount: number;
+}> {
+  const [convRes, sesRes, taskCountRes] = await Promise.all([
+    client.query(
+      'SELECT * FROM nalas_conversations WHERE id = $1 AND business_id = $2 LIMIT 1',
+      [conversationId, businessId]
+    ),
+    client.query(
+      'SELECT * FROM nalas_sessions WHERE conversation_id = $1 AND business_id = $2 LIMIT 1',
+      [conversationId, businessId]
+    ),
+    client.query<{ open_count: number | string }>(
+      `SELECT COUNT(*)::int AS open_count FROM nalas_tasks
+       WHERE conversation_id = $1 AND business_id = $2 AND status <> 'resuelta'`,
+      [conversationId, businessId]
+    ),
+  ]);
+  return {
+    conversation: convRes.rows[0] ? mapPgConversationRow(convRes.rows[0]) : null,
+    session: sesRes.rows[0] ? mapPgSessionRow(sesRes.rows[0]) : null,
+    openTaskCount: Number(taskCountRes.rows[0]?.open_count ?? 0),
+  };
+}
+
+
 

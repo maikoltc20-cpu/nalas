@@ -125,7 +125,7 @@ export interface ApiContext {
 async function apiFetch<T>(
   path: string,
   ctx?: ApiContext,
-  init?: RequestInit
+  init?: RequestInit & { timeoutMs?: number }
 ): Promise<T> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
@@ -135,11 +135,32 @@ async function apiFetch<T>(
     headers['x-nalas-business-id'] = ctx.businessId;
   }
 
-  const res = await fetch(path, {
-    ...init,
-    credentials: 'include',
-    headers,
-  });
+  const { timeoutMs, signal: externalSignal, ...fetchInit } = init ?? {};
+  const controller = timeoutMs && !externalSignal ? new AbortController() : null;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  if (controller && timeoutMs) {
+    timer = setTimeout(() => controller.abort(), timeoutMs);
+  }
+
+  let res: Response;
+  try {
+    res = await fetch(path, {
+      ...fetchInit,
+      signal: externalSignal ?? controller?.signal,
+      credentials: 'include',
+      headers,
+    });
+  } catch (err) {
+    if (err instanceof Error && err.name === 'AbortError') {
+      throw new Error(
+        'La solicitud tardó demasiado tiempo y fue cancelada para evitar espera indefinida. Intentá nuevamente.'
+      );
+    }
+    throw err;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+
   const text = await res.text();
   const contentType = res.headers.get('content-type') || '';
   let data: Record<string, unknown> = {};
@@ -704,9 +725,21 @@ export const nalasApi = {
       conversation: Conversation;
       session: Session;
       pausedOutboxCount: number;
+      resolvedTaskIds?: string[];
+      verified?: boolean;
+      timings?: {
+        backend: string;
+        loadSliceMs: number;
+        domainResetMs: number;
+        persistSliceMs: number;
+        verifyReadMs: number;
+        totalMs: number;
+        queriesExecuted?: number;
+      };
     }>(`/api/conversations/${conversationId}/restart-published`, ctx, {
       method: 'POST',
       body: JSON.stringify({}),
+      timeoutMs: 25000,
     });
   },
   updateLeadStatus(ctx: ApiContext, leadId: string, commercialStatus: CommercialStatus) {

@@ -608,6 +608,7 @@ export function restartConversationWithPublished(
   conversation: Conversation;
   session: Session;
   pausedOutboxCount: number;
+  resolvedTaskIds: string[];
 } {
   const conv = store.conversations.find(
     (c) => c.id === conversationId && c.businessId === businessId
@@ -615,6 +616,13 @@ export function restartConversationWithPublished(
   if (!conv) {
     const err = new Error('Conversación no encontrada en este negocio.');
     (err as Error & { statusCode?: number }).statusCode = 404;
+    throw err;
+  }
+  if (conv.status === 'cerrada') {
+    const err = new Error(
+      'La interacción ya está finalizada. Si el contacto vuelve a escribir, se abrirá una interacción nueva.'
+    );
+    (err as Error & { statusCode?: number }).statusCode = 400;
     throw err;
   }
   const biz = store.businesses.find((b) => b.id === businessId);
@@ -681,7 +689,13 @@ export function restartConversationWithPublished(
       flowVersionId: biz.activeFlowVersionId,
     });
     if (activeCheck.ok && activeCheck.flow) {
-      targetFlowId = activeCheck.flow.id;
+      const latestForActiveKey = inspectPublishedFlowTarget(store, businessId, {
+        flowKey: getFlowKey(activeCheck.flow),
+      });
+      targetFlowId =
+        latestForActiveKey.ok && latestForActiveKey.flow
+          ? latestForActiveKey.flow.id
+          : activeCheck.flow.id;
     } else if (firstValidFlowId) {
       targetFlowId = firstValidFlowId;
     } else {
@@ -722,6 +736,23 @@ export function restartConversationWithPublished(
     }
   }
 
+  const resolvedTaskIds: string[] = [];
+  for (const task of store.tasks) {
+    if (
+      task.businessId === businessId &&
+      task.conversationId === conv.id &&
+      task.status !== 'resuelta'
+    ) {
+      task.status = 'resuelta';
+      task.assignedUserId = task.assignedUserId ?? actorUserId;
+      if (!task.contextSummary.includes('Resuelta por reinicio con versión publicada')) {
+        task.contextSummary = `${task.contextSummary} · Resuelta por reinicio con versión publicada.`;
+      }
+      task.updatedAt = now;
+      resolvedTaskIds.push(task.id);
+    }
+  }
+
   conv.pinnedFlowVersionId = targetFlowId;
   conv.pinnedRulesetVersionId = activeRuleset.id;
   conv.pinnedProPolicyVersionId = biz.activeProPolicyVersionId;
@@ -758,6 +789,9 @@ export function restartConversationWithPublished(
   session.pausedReason = undefined;
   session.pausedAt = undefined;
   session.confirmedIdempotencyKey = undefined;
+  session.completedAt = undefined;
+  session.closureReason = undefined;
+  session.closedByUserId = undefined;
   session.updatedAt = now;
 
   appendAudit(store, {
@@ -766,7 +800,7 @@ export function restartConversationWithPublished(
     actorUserId,
     module: 'conversaciones',
     action: 'reiniciar_chat_version_publicada',
-    detail: `Conversación ${conv.id} reiniciada con la configuración publicada vigente (${targetFlowId}). Historial y contacto conservados; salidas previas excluidas: ${pausedOutboxCount}; mensajes enviados al reiniciar: 0.`,
+    detail: `Conversación ${conv.id} reiniciada con la configuración publicada vigente (${targetFlowId}). Historial y contacto conservados; salidas previas excluidas: ${pausedOutboxCount}; tareas de revisión cerradas: ${resolvedTaskIds.length}; mensajes enviados al reiniciar: 0.`,
     correlationId: conv.id,
   });
 
@@ -774,6 +808,7 @@ export function restartConversationWithPublished(
     conversation: conv,
     session,
     pausedOutboxCount,
+    resolvedTaskIds,
   };
 }
 
