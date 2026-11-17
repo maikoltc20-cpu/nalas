@@ -1,4 +1,5 @@
 import type { Conversation, NalasStore, Session } from '../../shared/types.ts';
+import { repairExistingFlowDraft } from '../../shared/flowTemplates.ts';
 import {
   isPgUndefinedTableError,
   isPostgresConfigured,
@@ -13,7 +14,7 @@ import {
 } from '../db/pgStore.ts';
 import { getEnv, isWorkerRuntime } from '../runtimeContext.ts';
 import { repairExistingAgentContacts } from './commercial.ts';
-import { reconcileStableProductFlowKeys } from './config.ts';
+import { getFlowKey, reconcileStableProductFlowKeys } from './config.ts';
 import { sanitizeErroneousProdWhatsAppBinding } from './metaAssetPolicy.ts';
 import { createInitialStore } from './seed.ts';
 
@@ -184,6 +185,22 @@ export function upgradeOptingDraftIfStale(store: NalasStore): boolean {
   return changed;
 }
 
+export function repairNonOptingBrokenDraftsIfNeeded(store: NalasStore): boolean {
+  let changed = false;
+  for (let i = 0; i < store.flowVersions.length; i++) {
+    const flow = store.flowVersions[i];
+    if (flow.status !== 'borrador') continue;
+    const key = getFlowKey(flow);
+    if (key === 'opting') continue;
+    const result = repairExistingFlowDraft(flow);
+    if (result.repaired) {
+      store.flowVersions[i] = result.flow;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
 function assertFileDevAllowed(): void {
   if (isWorkerRuntime() || getEnv('NODE_ENV') === 'production') {
     const err = new Error(
@@ -219,8 +236,9 @@ async function ensureFileStoreLoaded(): Promise<NalasStore> {
     const raw = await fs.readFile(storePath, 'utf8');
     memoryStore = JSON.parse(raw) as NalasStore;
     const upgraded = upgradeOptingDraftIfStale(memoryStore);
+    const repairedDrafts = repairNonOptingBrokenDraftsIfNeeded(memoryStore);
     const repaired = repairExistingAgentContacts(memoryStore);
-    if (upgraded || repaired) {
+    if (upgraded || repairedDrafts || repaired) {
       await persistFileAtomically(memoryStore);
     }
   } catch {

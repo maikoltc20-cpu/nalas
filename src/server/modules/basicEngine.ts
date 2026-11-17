@@ -1,6 +1,9 @@
 import {
   formatAnswerDisplayValue,
+  getReadableFlowStepTitle,
+  isAnswerableSummaryStep,
   isSkippedOptionalAnswer,
+  renderAutomaticSummary,
   renderSummaryFromConfig,
 } from '../../shared/flowTemplates.ts';
 import { hasValidContactName, normalizeInternationalPhone } from '../../shared/humanHandoff.ts';
@@ -208,17 +211,10 @@ function buildSummaryText(
     }
     return extraLines.length > 0 ? `${rendered}\n${extraLines.join('\n')}` : rendered;
   }
-  const lines: string[] = [];
-  for (const step of flow.steps) {
-    const ans = session.answers[step.id];
-    if (ans && !isSkippedOptionalAnswer(ans)) {
-      lines.push(`• ${step.title ?? step.prompt}: ${formatAnswerDisplayValue(ans)}`);
-    }
-  }
-  if (lines.length === 0) {
-    return 'Aún no registraste respuestas.';
-  }
-  return lines.join('\n');
+  return renderAutomaticSummary({
+    steps: flow.steps,
+    answers: session.answers,
+  });
 }
 
 function getChannelModeForSession(session: Session): 'whatsapp' | 'email' | 'generic' {
@@ -968,6 +964,24 @@ function validateAndParseStepAnswer(
   };
 }
 
+function resolveCorrectionFields(
+  flow: FlowVersion,
+  confirmStep: FlowStep
+): Array<{ stepId: string; label: string; followUpStepId?: string }> {
+  if (confirmStep.correctionFields && confirmStep.correctionFields.length > 0) {
+    return confirmStep.correctionFields;
+  }
+  const fields: Array<{ stepId: string; label: string; followUpStepId?: string }> = [];
+  flow.steps.forEach((s, idx) => {
+    if (!isAnswerableSummaryStep(s)) return;
+    fields.push({
+      stepId: s.id,
+      label: getReadableFlowStepTitle(s, idx),
+    });
+  });
+  return fields;
+}
+
 function advanceFromStep(
   flow: FlowVersion,
   session: Session,
@@ -976,6 +990,7 @@ function advanceFromStep(
 ): BasicEngineOutput {
   let nextId = findNextPlayableStepId(flow, startStepId, session.answers);
   const replyChunks = [...prefixChunks];
+  let summaryIncludedInTurn = false;
 
   while (nextId) {
     const nextStep = flow.steps.find((s) => s.id === nextId);
@@ -989,6 +1004,7 @@ function advanceFromStep(
 
     if (nextStep.type === 'resumen') {
       replyChunks.push(buildSummaryText(flow, session));
+      summaryIncludedInTurn = true;
       nextId = findNextPlayableStepId(flow, nextStep.nextStepId, session.answers);
       continue;
     }
@@ -1034,6 +1050,22 @@ function advanceFromStep(
             { id: 'ctx_continuar', label: 'Continuar.' },
           ],
         };
+      }
+    }
+
+    if (nextStep.type === 'confirmacion' && !summaryIncludedInTurn) {
+      const allExplicitlyDisabled = Boolean(
+        flow.summaryConfig &&
+          (flow.summaryConfig.fields?.length ?? 0) > 0 &&
+          flow.summaryConfig.fields.every((f) => !f.enabled) &&
+          !flow.summaryConfig.introPrompt?.trim()
+      );
+      if (!allExplicitlyDisabled) {
+        const autoSummary = buildSummaryText(flow, session);
+        if (autoSummary && autoSummary !== 'Aún no registraste respuestas.') {
+          replyChunks.push(autoSummary);
+          summaryIncludedInTurn = true;
+        }
       }
     }
 
@@ -1599,7 +1631,7 @@ export function runBasicEngine(params: {
   // Handle confirmacion step (including "Corregir un dato" menu & idempotent registration)
   if (currentStep.type === 'confirmacion') {
     if (session.awaitingCorrectionFieldSelection) {
-      const fields = currentStep.correctionFields ?? [];
+      const fields = resolveCorrectionFields(flow, currentStep);
       if (
         selectedOptionId === 'fix:resumen' ||
         normalized.includes('volver al resumen')
@@ -1637,6 +1669,7 @@ export function runBasicEngine(params: {
           return {
             replyText: getEffectiveStepPrompt(targetStep, session),
             options: getStepOptions(targetStep),
+            allowMultiple: targetStep.type === 'seleccion_multiple',
           };
         }
       }
@@ -1724,13 +1757,14 @@ export function runBasicEngine(params: {
     }
 
     if (isCorrect) {
-      if (currentStep.correctionFields && currentStep.correctionFields.length > 0) {
+      const correctionFields = resolveCorrectionFields(flow, currentStep);
+      if (correctionFields.length > 0) {
         session.awaitingCorrectionFieldSelection = true;
         session.updatedAt = new Date().toISOString();
         return {
           replyText: 'Claro. ¿Qué te gustaría corregir?',
           options: [
-            ...currentStep.correctionFields.map((f) => ({
+            ...correctionFields.map((f) => ({
               id: `fix:${f.stepId}`,
               label: f.label,
             })),

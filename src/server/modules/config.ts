@@ -624,15 +624,28 @@ export function createFlowConversation(
       title: '1. Consulta inicial',
       type: 'texto',
       prompt: `¡Hola! Gracias por escribir sobre ${cleanName}. ¿En qué te podemos ayudar hoy?`,
-      targetField: 'consulta',
       required: true,
+      nextStepId: `${baseStepPrefix}_confirmacion`,
+    },
+    {
+      id: `${baseStepPrefix}_confirmacion`,
+      title: '2. Confirmación',
+      type: 'confirmacion',
+      prompt: '¿Confirmás que registremos tu solicitud con estos datos?',
+      required: true,
+      options: [
+        { id: 'confirmar_si', label: 'Confirmar solicitud' },
+        { id: 'confirmar_corregir', label: 'Corregir un dato' },
+        { id: 'confirmar_no', label: 'Ahora no' },
+      ],
       nextStepId: `${baseStepPrefix}_cierre`,
     },
     {
       id: `${baseStepPrefix}_cierre`,
-      title: '2. Cierre',
+      title: '3. Despedida',
       type: 'cierre',
-      prompt: '¡Gracias por tu mensaje! Nuestro equipo revisará tu consulta y te responderá pronto.',
+      prompt:
+        '¡Gracias por tu mensaje! Registramos tu solicitud y nuestro equipo te responderá pronto.',
       required: false,
       nextStepId: null,
     },
@@ -647,17 +660,6 @@ export function createFlowConversation(
     status: 'borrador',
     steps: starterSteps,
     outOfScriptRules: [],
-    summaryConfig: {
-      introPrompt: 'Revisá tus respuestas antes de confirmar:',
-      fields: [
-        {
-          stepId: `${baseStepPrefix}_1`,
-          label: 'Consulta inicial',
-          enabled: true,
-          order: 0,
-        },
-      ],
-    },
     referenceTemplate: 'Referencia de tu solicitud: {{referencia}}',
     alreadyRegisteredTemplate:
       'Tu solicitud ya quedó registrada. Tu referencia es {{referencia}}. ¡Gracias por escribirnos!',

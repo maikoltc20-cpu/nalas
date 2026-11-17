@@ -1,10 +1,12 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   AlertTriangle,
   ArrowDown,
   ArrowUp,
   Ban,
   CheckCircle2,
+  ChevronDown,
+  ChevronUp,
   Eye,
   Play,
   Plus,
@@ -30,12 +32,15 @@ import type {
   SummaryConfig,
 } from '../../shared/types';
 import {
+  buildSampleAnswersForFlow,
+  formatTemplateTokensReadable,
   isAnswerableSummaryStep,
-  listAvailableFlowVariables,
-  PRESET_TARGET_FIELDS,
   previewSummaryInEditor,
+  renderAutomaticSummary,
+  repairExistingFlowDraft,
   resolveSummaryConfigForEditor,
   validateFlowTemplates,
+  type AmbiguousTemplateReference,
 } from '../../shared/flowTemplates';
 import { resolveHumanHandoffConfig } from '../../shared/humanHandoff';
 import {
@@ -44,6 +49,7 @@ import {
   type ClientValidationIssue,
   nalasApi,
 } from '../api';
+import { TemplateTokenEditor } from './TemplateTokenEditor';
 
 const PRIORITY_LABELS: Record<ClassificationLevel, string> = {
   alta: 'Prioridad alta',
@@ -445,12 +451,9 @@ export function FlowAndRulesDesigner({
   const [showReferenceInClosure, setShowReferenceInClosure] = useState<boolean>(
     () => draftFlow?.showReferenceInClosure ?? true
   );
-  const [customTargetFieldMode, setCustomTargetFieldMode] = useState<Record<string, boolean>>({});
-  const stepPromptRef = useRef<HTMLTextAreaElement | null>(null);
-  const summaryIntroRef = useRef<HTMLTextAreaElement | null>(null);
-  const closureTplRef = useRef<HTMLTextAreaElement | null>(null);
-  const referenceTplRef = useRef<HTMLInputElement | null>(null);
-  const alreadyRegTplRef = useRef<HTMLTextAreaElement | null>(null);
+  const [summaryCustomizerOpen, setSummaryCustomizerOpen] = useState<boolean>(false);
+  const [summaryTemplateCleared, setSummaryTemplateCleared] = useState<boolean>(false);
+  const [autoRepairNotice, setAutoRepairNotice] = useState<string[]>([]);
   const [draftDirty, setDraftDirty] = useState(false);
   const [selectedStepId, setSelectedStepId] = useState<string>(steps[0]?.id ?? '');
   const [validationMessages, setValidationMessages] = useState<ClientValidationIssue[]>([]);
@@ -546,23 +549,41 @@ export function FlowAndRulesDesigner({
 
   useEffect(() => {
     if (draftFlow && !draftDirty) {
-      setFlowName(draftFlow.name);
-      setSteps(structuredClone(draftFlow.steps));
-      setOosRules(structuredClone(draftFlow.outOfScriptRules));
-      setHumanHandoffConfig(resolveHumanHandoffConfig(draftFlow.humanHandoffConfig));
-      setSummaryConfig(resolveSummaryConfigForEditor(draftFlow.steps, draftFlow.summaryConfig));
-      setSummaryConfigCustomized(Boolean(draftFlow.summaryConfig));
-      setClosureTemplate(draftFlow.closureTemplate ?? '');
-      setReferenceTemplate(draftFlow.referenceTemplate ?? '');
-      setAlreadyRegisteredTemplate(draftFlow.alreadyRegisteredTemplate ?? '');
-      setCancelMessage(draftFlow.cancelMessage ?? '');
-      setShowReferenceInClosure(draftFlow.showReferenceInClosure ?? true);
-      setCustomTargetFieldMode({});
-      if (!draftFlow.steps.some((s) => s.id === selectedStepId)) {
-        setSelectedStepId(draftFlow.steps[0]?.id ?? '');
+      const repairRes =
+        getClientFlowKey(draftFlow) !== 'opting'
+          ? repairExistingFlowDraft(draftFlow)
+          : null;
+      const source = repairRes && repairRes.repaired ? repairRes.flow : draftFlow;
+      setFlowName(source.name);
+      setSteps(structuredClone(source.steps));
+      setOosRules(structuredClone(source.outOfScriptRules));
+      setHumanHandoffConfig(resolveHumanHandoffConfig(source.humanHandoffConfig));
+      setSummaryConfig(resolveSummaryConfigForEditor(source.steps, source.summaryConfig));
+      setSummaryConfigCustomized(Boolean(source.summaryConfig));
+      setSummaryTemplateCleared(
+        Boolean(repairRes?.replacedManualSummary && draftFlow.summaryTemplate && !source.summaryTemplate)
+      );
+      setClosureTemplate(source.closureTemplate ?? '');
+      setReferenceTemplate(source.referenceTemplate ?? '');
+      setAlreadyRegisteredTemplate(source.alreadyRegisteredTemplate ?? '');
+      setCancelMessage(source.cancelMessage ?? '');
+      setShowReferenceInClosure(source.showReferenceInClosure ?? true);
+      setSummaryCustomizerOpen(false);
+      if (repairRes && repairRes.repaired) {
+        setAutoRepairNotice(repairRes.summaryNotes);
+        setDraftDirty(true);
+      } else {
+        setAutoRepairNotice([]);
+      }
+      if (!source.steps.some((s) => s.id === selectedStepId)) {
+        setSelectedStepId(source.steps[0]?.id ?? '');
       }
     }
   }, [business.id, effectiveFlowKey, draftSignature]);
+
+  useEffect(() => {
+    setSummaryCustomizerOpen(false);
+  }, [selectedStepId, effectiveFlowKey]);
 
   useEffect(() => {
     if (!entryDirty) {
@@ -616,15 +637,16 @@ export function FlowAndRulesDesigner({
       title: `Pregunta ${steps.length + 1}`,
       type: 'texto',
       prompt: 'Escribí acá la pregunta para el cliente',
-      targetField: `campo_${steps.length + 1}`,
       required: true,
       nextStepId: null,
     };
 
     const resumenIdx = steps.findIndex((s) => s.type === 'resumen');
+    const confirmIdx = steps.findIndex((s) => s.type === 'confirmacion');
     const terminalIdx = steps.findIndex((s) => isTerminalStepType(s.type));
+    const candidateIndices = [resumenIdx, confirmIdx, terminalIdx].filter((idx) => idx > 0);
     const insertBeforeIdx =
-      resumenIdx > 0 ? resumenIdx : terminalIdx > 0 ? terminalIdx : -1;
+      candidateIndices.length > 0 ? Math.min(...candidateIndices) : -1;
     const updated = structuredClone(steps);
     if (insertBeforeIdx > 0) {
       const prev = updated[insertBeforeIdx - 1];
@@ -640,6 +662,34 @@ export function FlowAndRulesDesigner({
     }
     setDraftDirty(true);
     setSteps(updated);
+    setSelectedStepId(newId);
+  }
+
+  function addConfirmacionStep() {
+    if (steps.some((s) => s.type === 'confirmacion')) return;
+    const newId = `step_confirm_${Date.now().toString(36)}`;
+    const cierreIdx = steps.findIndex((s) => s.type === 'cierre');
+    const insertAt = cierreIdx >= 0 ? cierreIdx : steps.length;
+    const copy = structuredClone(steps);
+    const nextTarget = copy[insertAt]?.id ?? null;
+    copy.splice(insertAt, 0, {
+      id: newId,
+      title: 'Confirmación',
+      type: 'confirmacion',
+      prompt: '¿Confirmás que registremos tu solicitud con estos datos?',
+      required: true,
+      options: [
+        { id: 'confirmar_si', label: 'Confirmar solicitud' },
+        { id: 'confirmar_corregir', label: 'Corregir un dato' },
+        { id: 'confirmar_no', label: 'Ahora no' },
+      ],
+      nextStepId: nextTarget,
+    });
+    if (insertAt > 0 && copy[insertAt - 1]) {
+      copy[insertAt - 1].nextStepId = newId;
+    }
+    setDraftDirty(true);
+    setSteps(copy);
     setSelectedStepId(newId);
   }
 
@@ -701,7 +751,9 @@ export function FlowAndRulesDesigner({
   function buildFlowDraftPayload() {
     const resolvedSumCfg = summaryConfigCustomized
       ? resolveSummaryConfigForEditor(steps, summaryConfig)
-      : undefined;
+      : draftFlow?.summaryConfig
+        ? null
+        : undefined;
     const textOrNull = (val: string, existing?: string): string | null | undefined => {
       if (val.trim()) return val;
       return existing ? null : undefined;
@@ -713,6 +765,7 @@ export function FlowAndRulesDesigner({
       name: flowName.trim() || draftFlow?.name,
       flowKey: effectiveFlowKey,
       summaryConfig: resolvedSumCfg,
+      summaryTemplate: summaryTemplateCleared ? null : undefined,
       closureTemplate: textOrNull(closureTemplate, draftFlow?.closureTemplate),
       referenceTemplate: textOrNull(referenceTemplate, draftFlow?.referenceTemplate),
       alreadyRegisteredTemplate: textOrNull(
@@ -733,30 +786,49 @@ export function FlowAndRulesDesigner({
     setSummaryConfig((prev) => updater(resolveSummaryConfigForEditor(steps, prev)));
   }
 
-  function insertVariableIntoField(
-    varKey: string,
-    currentVal: string,
-    setter: (next: string) => void,
-    el: HTMLTextAreaElement | HTMLInputElement | null
+  function resolveAmbiguousReference(
+    ambig: AmbiguousTemplateReference,
+    chosenStepIdOrEmpty: string
   ) {
-    const token = `{{${varKey}}}`;
-    if (el && typeof el.selectionStart === 'number' && typeof el.selectionEnd === 'number') {
-      const start = el.selectionStart;
-      const end = el.selectionEnd;
-      const next = currentVal.slice(0, start) + token + currentVal.slice(end);
-      setter(next);
-      requestAnimationFrame(() => {
-        el.focus();
-        const pos = start + token.length;
-        el.setSelectionRange(pos, pos);
-      });
+    const replacement = chosenStepIdOrEmpty ? `{{${chosenStepIdOrEmpty}}}` : '';
+    const tokenRegex = new RegExp(`\\{\\{${ambig.token}\\}\\}`, 'g');
+    if (ambig.locationType === 'stepPrompt' && ambig.stepId) {
+      const target = steps.find((s) => s.id === ambig.stepId);
+      if (target) {
+        updateStep(target.id, { prompt: target.prompt.replace(tokenRegex, replacement) });
+      }
       return;
     }
-    const separator =
-      currentVal.length > 0 && !/\s$/.test(currentVal) && !currentVal.endsWith('(')
-        ? ' '
-        : '';
-    setter(`${currentVal}${separator}${token}`);
+    if (ambig.locationType === 'stepCorrection' && ambig.stepId) {
+      const target = steps.find((s) => s.id === ambig.stepId);
+      if (target?.correctionPrompt) {
+        updateStep(target.id, {
+          correctionPrompt: target.correctionPrompt.replace(tokenRegex, replacement),
+        });
+      }
+      return;
+    }
+    if (ambig.locationType === 'summaryIntro') {
+      mutateSummaryConfig((prev) => ({
+        ...prev,
+        introPrompt: (prev.introPrompt ?? '').replace(tokenRegex, replacement),
+      }));
+      return;
+    }
+    if (ambig.locationType === 'closureTemplate') {
+      setDraftDirty(true);
+      setClosureTemplate((prev) => prev.replace(tokenRegex, replacement));
+      return;
+    }
+    if (ambig.locationType === 'alreadyRegisteredTemplate') {
+      setDraftDirty(true);
+      setAlreadyRegisteredTemplate((prev) => prev.replace(tokenRegex, replacement));
+      return;
+    }
+    if (ambig.locationType === 'cancelMessage') {
+      setDraftDirty(true);
+      setCancelMessage((prev) => prev.replace(tokenRegex, replacement));
+    }
   }
 
   function applySelectedConversation(nextKey: string) {
@@ -767,22 +839,34 @@ export function FlowAndRulesDesigner({
     setValidationMessages([]);
     setPublishModalError(null);
     setPublishModalIssues([]);
-    setCustomTargetFieldMode({});
+    setSummaryCustomizerOpen(false);
     const grp = flowGroups.find((g) => g.flowKey === nextKey);
-    const fv = grp?.draft ?? grp?.latestPublished;
-    if (fv) {
+    const rawFv = grp?.draft ?? grp?.latestPublished;
+    if (rawFv) {
+      const repairRes =
+        getClientFlowKey(rawFv) !== 'opting' ? repairExistingFlowDraft(rawFv) : null;
+      const fv = repairRes && repairRes.repaired ? repairRes.flow : rawFv;
       setFlowName(fv.name);
       setSteps(structuredClone(fv.steps));
       setOosRules(structuredClone(fv.outOfScriptRules));
       setHumanHandoffConfig(resolveHumanHandoffConfig(fv.humanHandoffConfig));
       setSummaryConfig(resolveSummaryConfigForEditor(fv.steps, fv.summaryConfig));
       setSummaryConfigCustomized(Boolean(fv.summaryConfig));
+      setSummaryTemplateCleared(
+        Boolean(repairRes?.replacedManualSummary && rawFv.summaryTemplate && !fv.summaryTemplate)
+      );
       setClosureTemplate(fv.closureTemplate ?? '');
       setReferenceTemplate(fv.referenceTemplate ?? '');
       setAlreadyRegisteredTemplate(fv.alreadyRegisteredTemplate ?? '');
       setCancelMessage(fv.cancelMessage ?? '');
       setShowReferenceInClosure(fv.showReferenceInClosure ?? true);
       setSelectedStepId(fv.steps[0]?.id ?? '');
+      if (repairRes && repairRes.repaired) {
+        setAutoRepairNotice(repairRes.summaryNotes);
+        setDraftDirty(true);
+      } else {
+        setAutoRepairNotice([]);
+      }
     } else {
       setFlowName('');
       setSteps([]);
@@ -790,12 +874,14 @@ export function FlowAndRulesDesigner({
       setHumanHandoffConfig(resolveHumanHandoffConfig(undefined));
       setSummaryConfig(resolveSummaryConfigForEditor([], undefined));
       setSummaryConfigCustomized(false);
+      setSummaryTemplateCleared(false);
       setClosureTemplate('');
       setReferenceTemplate('');
       setAlreadyRegisteredTemplate('');
       setCancelMessage('');
       setShowReferenceInClosure(true);
       setSelectedStepId('');
+      setAutoRepairNotice([]);
     }
   }
 
@@ -823,7 +909,9 @@ export function FlowAndRulesDesigner({
       setPendingCreateConvName(null);
       setDraftDirty(false);
       setValidationMessages([]);
-      setCustomTargetFieldMode({});
+      setSummaryCustomizerOpen(false);
+      setSummaryTemplateCleared(false);
+      setAutoRepairNotice([]);
       setSelectedFlowKey(createdKey);
       setFlowName(created.name);
       setSteps(structuredClone(created.steps));
@@ -1312,17 +1400,11 @@ export function FlowAndRulesDesigner({
     draftDiffersFromPublishedFlow;
 
   const displayedSummaryConfig = resolveSummaryConfigForEditor(steps, summaryConfig);
-  const availableVariables = listAvailableFlowVariables(steps, {
-    includeBuiltIns: true,
-    flowKey: effectiveFlowKey,
-  });
-  const stepPromptVariables = availableVariables.filter(
-    (v) => v.source === 'step' || (selectedStep?.type === 'cierre' && v.key === 'referencia')
-  );
   const liveTemplateIssues = validateFlowTemplates({
     steps,
     summaryConfig: summaryConfigCustomized ? displayedSummaryConfig : undefined,
-    summaryTemplate: summaryConfigCustomized ? undefined : draftFlow?.summaryTemplate,
+    summaryTemplate:
+      summaryConfigCustomized || summaryTemplateCleared ? undefined : draftFlow?.summaryTemplate,
     closureTemplate: closureTemplate.trim() ? closureTemplate : undefined,
     referenceTemplate: referenceTemplate.trim() ? referenceTemplate : undefined,
     alreadyRegisteredTemplate: alreadyRegisteredTemplate.trim()
@@ -1331,6 +1413,24 @@ export function FlowAndRulesDesigner({
     cancelMessage: cancelMessage.trim() ? cancelMessage : undefined,
     showReferenceInClosure,
   });
+
+  const liveAmbiguousReferences: AmbiguousTemplateReference[] =
+    draftFlow && effectiveFlowKey !== 'opting'
+      ? repairExistingFlowDraft({
+          ...draftFlow,
+          steps,
+          summaryConfig: summaryConfigCustomized ? displayedSummaryConfig : undefined,
+          summaryTemplate:
+            summaryConfigCustomized || summaryTemplateCleared
+              ? undefined
+              : draftFlow.summaryTemplate,
+          closureTemplate: closureTemplate.trim() ? closureTemplate : undefined,
+          alreadyRegisteredTemplate: alreadyRegisteredTemplate.trim()
+            ? alreadyRegisteredTemplate
+            : undefined,
+          cancelMessage: cancelMessage.trim() ? cancelMessage : undefined,
+        }).ambiguousReferences
+      : [];
 
   const hasUnpublishedRulesetDraft = Boolean(
     draftRuleset &&
@@ -2301,6 +2401,85 @@ export function FlowAndRulesDesigner({
             </div>
           )}
 
+          {autoRepairNotice.length > 0 && (
+            <div className="bg-[#EAF5F2] border border-[#C6E3DA] rounded-[12px] p-4 space-y-1.5">
+              <div className="text-sm font-semibold text-[#116B70]">
+                Resumen automático y referencias actualizadas en este borrador
+              </div>
+              {autoRepairNotice.map((note, idx) => (
+                <div key={`repair_note_${idx}`} className="text-xs text-[#25364A]">
+                  • {note}
+                </div>
+              ))}
+              <div className="text-xs text-[#5A6877] pt-0.5">
+                La versión publicada actual no se modificó. Guardá o publicá cuando quieras aplicar estos cambios.
+              </div>
+            </div>
+          )}
+
+          {liveAmbiguousReferences.length > 0 && (
+            <div className="bg-[#FFF0E3] border border-[#F2D7BF] rounded-[12px] p-4 space-y-3">
+              <div>
+                <div className="text-sm font-semibold text-[#8C542C]">
+                  Referencias pendientes de vincular
+                </div>
+                <p className="text-xs text-[#8C542C] mt-0.5">
+                  Elegí a qué pregunta corresponde cada dato mencionado en los mensajes o quitalo si ya no se usa.
+                </p>
+              </div>
+              <div className="space-y-2.5">
+                {liveAmbiguousReferences.map((ambig) => {
+                  const candidateSteps = steps.filter((s) =>
+                    ambig.candidateStepIds.includes(s.id)
+                  );
+                  return (
+                    <div
+                      key={ambig.id}
+                      className="p-3 bg-white border border-[#F2D7BF] rounded-[9px] flex flex-wrap items-center justify-between gap-3"
+                    >
+                      <div className="min-w-0 space-y-0.5">
+                        <div className="text-xs font-semibold text-[#25364A]">
+                          En «{ambig.contextLabel}» · dato mencionado: «{ambig.token}»
+                        </div>
+                        <div className="text-xs text-[#5A6877] truncate max-w-[460px]">
+                          {formatTemplateTokensReadable(ambig.snippet, steps, {
+                            allowReference: true,
+                          })}
+                        </div>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <select
+                          aria-label={`Elegir pregunta para ${ambig.token}`}
+                          defaultValue=""
+                          onChange={(e) => {
+                            if (e.target.value) {
+                              resolveAmbiguousReference(ambig, e.target.value);
+                            }
+                          }}
+                          className="min-h-[36px] text-xs border border-[#DCE3E8] rounded-[8px] px-2.5 py-1.5 bg-white text-[#25364A]"
+                        >
+                          <option value="">Elegir pregunta correspondiente...</option>
+                          {candidateSteps.map((cs, cIdx) => (
+                            <option key={cs.id} value={cs.id}>
+                              {getStepTitle(cs, cIdx)}
+                            </option>
+                          ))}
+                        </select>
+                        <button
+                          type="button"
+                          onClick={() => resolveAmbiguousReference(ambig, '')}
+                          className="min-h-[36px] px-2.5 py-1.5 text-xs font-medium text-[#8C542C] bg-[#FFF8F1] border border-[#F2D7BF] rounded-[8px] hover:bg-[#FFEAD6]"
+                        >
+                          Quitar referencia
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
             {/* Left: Ordered steps */}
             <section className="lg:col-span-4 bg-white border border-[#E2E7EB] rounded-[13px] p-5 space-y-4">
@@ -2345,7 +2524,9 @@ export function FlowAndRulesDesigner({
                             )}
                           </div>
                           <div className="text-xs text-[#5A6877] mt-0.5 line-clamp-2">
-                            {step.prompt}
+                            {formatTemplateTokensReadable(step.prompt, steps, {
+                              allowReference: step.type === 'cierre',
+                            })}
                           </div>
                         </div>
                         <div
@@ -2383,14 +2564,26 @@ export function FlowAndRulesDesigner({
                 })}
               </div>
 
-              <button
-                type="button"
-                onClick={addCustomQuestion}
-                className="w-full inline-flex items-center justify-center gap-1.5 min-h-[44px] px-4 py-2 text-sm font-medium text-[#25364A] bg-white border border-[#DCE3E8] rounded-[10px] hover:bg-[#F7F8FA]"
-              >
-                <Plus className="w-4 h-4 text-[#167D83]" />
-                <span>Agregar pregunta</span>
-              </button>
+              <div className="space-y-2">
+                <button
+                  type="button"
+                  onClick={addCustomQuestion}
+                  className="w-full inline-flex items-center justify-center gap-1.5 min-h-[44px] px-4 py-2 text-sm font-medium text-[#25364A] bg-white border border-[#DCE3E8] rounded-[10px] hover:bg-[#F7F8FA]"
+                >
+                  <Plus className="w-4 h-4 text-[#167D83]" />
+                  <span>Agregar pregunta</span>
+                </button>
+                {!steps.some((s) => s.type === 'confirmacion') && (
+                  <button
+                    type="button"
+                    onClick={addConfirmacionStep}
+                    className="w-full inline-flex items-center justify-center gap-1.5 min-h-[40px] px-4 py-1.5 text-xs font-medium text-[#116B70] bg-[#EAF5F2] border border-[#D4EAE4] rounded-[10px] hover:bg-[#DCEFE9]"
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    <span>Agregar confirmación</span>
+                  </button>
+                )}
+              </div>
             </section>
 
             {/* Right: Question editor */}
@@ -2455,44 +2648,24 @@ export function FlowAndRulesDesigner({
 
                   <div>
                     <label className="block text-[13px] font-semibold text-[#25364A] mb-1.5">
-                      Lo que preguntará tu asistente
+                      {selectedStep.type === 'cierre'
+                        ? 'Mensaje de despedida al confirmar'
+                        : selectedStep.type === 'mensaje' || selectedStep.type === 'resumen'
+                          ? 'Mensaje que enviará tu asistente'
+                          : 'Lo que preguntará tu asistente'}
                     </label>
-                    <textarea
-                      ref={stepPromptRef}
-                      rows={3}
+                    <TemplateTokenEditor
                       value={selectedStep.prompt}
-                      onChange={(e) => updateStep(selectedStep.id, { prompt: e.target.value })}
-                      className="w-full text-[15px] border border-[#DCE3E8] rounded-[9px] px-3.5 py-2.5 leading-relaxed"
+                      onChange={(nextPrompt) =>
+                        updateStep(selectedStep.id, { prompt: nextPrompt })
+                      }
+                      steps={steps}
+                      allowReference={selectedStep.type === 'cierre'}
+                      excludedStepId={selectedStep.id}
+                      flowKey={effectiveFlowKey}
+                      ariaLabel="Lo que preguntará tu asistente"
+                      placeholder="Escribí acá el mensaje para el cliente"
                     />
-                    {stepPromptVariables.filter((v) => v.stepId !== selectedStep.id).length > 0 && (
-                      <div className="mt-2 space-y-1.5">
-                        <div className="text-[11px] font-medium text-[#5A6877]">
-                          Insertar respuesta guardada en este mensaje:
-                        </div>
-                        <div className="flex flex-wrap gap-1.5">
-                          {stepPromptVariables
-                            .filter((v) => v.stepId !== selectedStep.id)
-                            .map((v) => (
-                              <button
-                                key={v.key}
-                                type="button"
-                                onClick={() =>
-                                  insertVariableIntoField(
-                                    v.key,
-                                    selectedStep.prompt,
-                                    (nextPrompt) =>
-                                      updateStep(selectedStep.id, { prompt: nextPrompt }),
-                                    stepPromptRef.current
-                                  )
-                                }
-                                className="px-2.5 py-1 text-[11px] font-medium text-[#116B70] bg-[#EAF5F2] border border-[#D4EAE4] rounded-[7px] hover:bg-[#DCEFE9]"
-                              >
-                                + {v.label} ({`{{${v.key}}}`})
-                              </button>
-                            ))}
-                        </div>
-                      </div>
-                    )}
                     {liveTemplateIssues
                       .filter((i) => i.stepId === selectedStep.id)
                       .map((issue, iIdx) => (
@@ -2509,82 +2682,46 @@ export function FlowAndRulesDesigner({
                       ))}
                   </div>
 
-                  {isAnswerableSummaryStep(selectedStep) && (() => {
-                    const currentTarget = selectedStep.targetField ?? '';
-                    const isPreset = PRESET_TARGET_FIELDS.some((p) => p.key === currentTarget);
-                    const isCustomMode = Boolean(
-                      customTargetFieldMode[selectedStep.id] || (currentTarget && !isPreset)
-                    );
-                    const activePreset = PRESET_TARGET_FIELDS.find((p) => p.key === currentTarget);
-                    const effectiveVarKey = currentTarget.trim() || selectedStep.id;
+                  {selectedStep.type === 'texto' && (() => {
+                    const CONTACT_KEYS = new Set(['nombre', 'telefono', 'correo', 'empresa']);
+                    const currentContactKey = CONTACT_KEYS.has(selectedStep.targetField ?? '')
+                      ? selectedStep.targetField!
+                      : '';
                     return (
-                      <div className="p-3.5 bg-[#F7F8FA] border border-[#E2E7EB] rounded-[10px] space-y-2.5">
-                        <div className="flex flex-wrap items-center justify-between gap-2">
-                          <div>
-                            <label className="block text-[13px] font-semibold text-[#25364A]">
-                              Dato que guarda esta pregunta
-                            </label>
-                            <p className="text-xs text-[#5A6877]">
-                              Definí dónde se almacena la respuesta (contacto, solicitud y textos con variables).
-                            </p>
-                          </div>
-                          <span className="text-[11px] font-medium text-[#116B70] bg-[#EAF5F2] border border-[#D4EAE4] rounded-[6px] px-2 py-1">
-                            Variable: {`{{${effectiveVarKey}}}`}
-                          </span>
-                        </div>
-                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-                          <select
-                            aria-label="Dato que guarda esta pregunta"
-                            value={isCustomMode ? '__custom__' : currentTarget}
-                            onChange={(e) => {
-                              const val = e.target.value;
-                              if (val === '__custom__') {
-                                setCustomTargetFieldMode((prev) => ({
-                                  ...prev,
-                                  [selectedStep.id]: true,
-                                }));
-                              } else {
-                                setCustomTargetFieldMode((prev) => ({
-                                  ...prev,
-                                  [selectedStep.id]: false,
-                                }));
-                                updateStep(selectedStep.id, { targetField: val });
-                              }
-                            }}
-                            className="w-full min-h-[40px] text-sm border border-[#DCE3E8] rounded-[8px] px-3 py-1.5 bg-white"
+                      <div className="p-3 bg-[#F7F8FA] border border-[#E2E7EB] rounded-[10px] flex flex-wrap items-center justify-between gap-3">
+                        <div className="min-w-0">
+                          <label
+                            htmlFor="contact-field-select"
+                            className="block text-[13px] font-semibold text-[#25364A]"
                           >
-                            <option value="">Elegir campo...</option>
-                            {PRESET_TARGET_FIELDS.map((preset) => (
-                              <option key={preset.key} value={preset.key}>
-                                {preset.label} ({preset.key})
-                              </option>
-                            ))}
-                            <option value="__custom__">Otro campo personalizado...</option>
-                          </select>
-
-                          {isCustomMode ? (
-                            <input
-                              type="text"
-                              aria-label="Nombre del campo personalizado"
-                              value={currentTarget}
-                              onChange={(e) =>
-                                updateStep(selectedStep.id, {
-                                  targetField: e.target.value
-                                    .toLowerCase()
-                                    .replace(/[^a-z0-9_]/g, '_'),
-                                })
-                              }
-                              placeholder="ej: rubro, cantidad_empleados"
-                              className="w-full min-h-[40px] text-sm border border-[#DCE3E8] rounded-[8px] px-3 py-1.5 bg-white"
-                            />
-                          ) : (
-                            <div className="flex items-center text-xs text-[#5A6877] px-1">
-                              {activePreset
-                                ? activePreset.description
-                                : 'Asignar «nombre», «empresa», «correo», «necesidad» o «interes» conecta la respuesta con Contacto y Solicitud.'}
-                            </div>
-                          )}
+                            ¿Guardar también en la ficha del contacto? (opcional)
+                          </label>
+                          <p className="text-xs text-[#5A6877]">
+                            Cada respuesta se guarda automáticamente; esto solo organiza la ficha del contacto.
+                          </p>
                         </div>
+                        <select
+                          id="contact-field-select"
+                          aria-label="¿Guardar también en la ficha del contacto?"
+                          value={currentContactKey}
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            if (val === '') {
+                              if (CONTACT_KEYS.has(selectedStep.targetField ?? '')) {
+                                updateStep(selectedStep.id, { targetField: undefined });
+                              }
+                            } else {
+                              updateStep(selectedStep.id, { targetField: val });
+                            }
+                          }}
+                          className="min-h-[38px] text-sm border border-[#DCE3E8] rounded-[8px] px-3 py-1.5 bg-white text-[#25364A]"
+                        >
+                          <option value="">No vincular (solo guardar respuesta)</option>
+                          <option value="nombre">Nombre del cliente</option>
+                          <option value="telefono">Teléfono / WhatsApp</option>
+                          <option value="correo">Correo electrónico</option>
+                          <option value="empresa">Empresa o negocio</option>
+                        </select>
                       </div>
                     );
                   })()}
@@ -2765,6 +2902,237 @@ export function FlowAndRulesDesigner({
                     </div>
                   )}
 
+                  {selectedStep.type === 'confirmacion' && (
+                    <div className="border-t border-[#EDF0F2] pt-5 space-y-3">
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        <div>
+                          <div className="text-[13px] font-semibold text-[#25364A]">
+                            Resumen previo a confirmar
+                          </div>
+                          <p className="text-xs text-[#5A6877]">
+                            {summaryConfigCustomized
+                              ? 'Resumen personalizado activo. Podés elegir qué preguntas mostrar, su etiqueta y orden.'
+                              : 'Sin ajustes, el resumen incluye automáticamente todas las preguntas respondidas en orden.'}
+                          </p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setSummaryCustomizerOpen((prev) => !prev)}
+                          className="inline-flex items-center gap-1.5 min-h-[38px] px-3.5 py-1.5 text-xs font-semibold text-[#116B70] bg-[#EAF5F2] border border-[#D4EAE4] rounded-[8px] hover:bg-[#DCEFE9]"
+                        >
+                          <span>
+                            {summaryCustomizerOpen ? 'Cerrar ajustes' : 'Personalizar resumen'}
+                          </span>
+                          {summaryCustomizerOpen ? (
+                            <ChevronUp className="w-3.5 h-3.5" />
+                          ) : (
+                            <ChevronDown className="w-3.5 h-3.5" />
+                          )}
+                        </button>
+                      </div>
+
+                      {summaryCustomizerOpen && (
+                        <div className="p-4 bg-[#F7F8FA] border border-[#E2E7EB] rounded-[11px] space-y-4">
+                          <div>
+                            <label className="block text-[13px] font-semibold text-[#25364A] mb-1">
+                              Texto de introducción del resumen (opcional)
+                            </label>
+                            <TemplateTokenEditor
+                              value={displayedSummaryConfig.introPrompt ?? ''}
+                              onChange={(nextVal) =>
+                                mutateSummaryConfig((prev) => ({ ...prev, introPrompt: nextVal }))
+                              }
+                              steps={steps}
+                              allowReference={false}
+                              multiline={false}
+                              flowKey={effectiveFlowKey}
+                              ariaLabel="Introducción del resumen"
+                              placeholder="Revisá tus respuestas antes de confirmar:"
+                            />
+                          </div>
+
+                          <div className="space-y-2">
+                            <div className="flex flex-wrap items-center justify-between gap-2">
+                              <div className="text-[13px] font-semibold text-[#25364A]">
+                                Preguntas incluidas y orden
+                              </div>
+                              {summaryConfigCustomized && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setDraftDirty(true);
+                                    setSummaryConfigCustomized(false);
+                                    setSummaryConfig(resolveSummaryConfigForEditor(steps, null));
+                                    if (draftFlow?.summaryTemplate) {
+                                      setSummaryTemplateCleared(true);
+                                    }
+                                  }}
+                                  className="text-xs font-medium text-[#116B70] underline hover:no-underline"
+                                >
+                                  Restaurar resumen automático
+                                </button>
+                              )}
+                            </div>
+
+                            {displayedSummaryConfig.fields.length === 0 ? (
+                              <p className="text-xs text-[#5A6877]">
+                                Todavía no hay preguntas respondidas para incluir en el resumen.
+                              </p>
+                            ) : (
+                              <div className="space-y-2">
+                                {displayedSummaryConfig.fields.map((field, fIdx) => (
+                                  <div
+                                    key={field.stepId}
+                                    className="flex flex-wrap items-center gap-2 p-2.5 border border-[#E2E7EB] rounded-[9px] bg-white"
+                                  >
+                                    <input
+                                      type="checkbox"
+                                      aria-label={`Incluir ${field.label} en el resumen`}
+                                      checked={field.enabled}
+                                      onChange={(e) => {
+                                        const checked = e.target.checked;
+                                        mutateSummaryConfig((prev) => ({
+                                          ...prev,
+                                          fields: prev.fields.map((f) =>
+                                            f.stepId === field.stepId
+                                              ? { ...f, enabled: checked }
+                                              : f
+                                          ),
+                                        }));
+                                      }}
+                                      className="w-4 h-4 accent-[#167D83]"
+                                    />
+                                    <input
+                                      type="text"
+                                      aria-label={`Etiqueta en resumen para ${field.stepId}`}
+                                      value={field.label}
+                                      onChange={(e) => {
+                                        const nextLabel = e.target.value;
+                                        mutateSummaryConfig((prev) => ({
+                                          ...prev,
+                                          fields: prev.fields.map((f) =>
+                                            f.stepId === field.stepId
+                                              ? { ...f, label: nextLabel }
+                                              : f
+                                          ),
+                                        }));
+                                      }}
+                                      className="flex-1 min-w-[160px] min-h-[36px] text-sm border border-[#DCE3E8] rounded-[8px] px-2.5 py-1 bg-white"
+                                    />
+                                    <div className="flex items-center gap-1">
+                                      <button
+                                        type="button"
+                                        aria-label="Subir campo en resumen"
+                                        disabled={fIdx === 0}
+                                        onClick={() =>
+                                          mutateSummaryConfig((prev) => {
+                                            const arr = [...prev.fields];
+                                            if (fIdx <= 0) return prev;
+                                            const [moved] = arr.splice(fIdx, 1);
+                                            arr.splice(fIdx - 1, 0, moved);
+                                            return {
+                                              ...prev,
+                                              fields: arr.map((item, idx) => ({
+                                                ...item,
+                                                order: idx,
+                                              })),
+                                            };
+                                          })
+                                        }
+                                        className="p-1.5 text-[#5A6877] hover:text-[#25364A] bg-[#F7F8FA] border border-[#E2E7EB] rounded disabled:opacity-40"
+                                      >
+                                        <ArrowUp className="w-3.5 h-3.5" />
+                                      </button>
+                                      <button
+                                        type="button"
+                                        aria-label="Bajar campo en resumen"
+                                        disabled={fIdx === displayedSummaryConfig.fields.length - 1}
+                                        onClick={() =>
+                                          mutateSummaryConfig((prev) => {
+                                            const arr = [...prev.fields];
+                                            if (fIdx >= arr.length - 1) return prev;
+                                            const [moved] = arr.splice(fIdx, 1);
+                                            arr.splice(fIdx + 1, 0, moved);
+                                            return {
+                                              ...prev,
+                                              fields: arr.map((item, idx) => ({
+                                                ...item,
+                                                order: idx,
+                                              })),
+                                            };
+                                          })
+                                        }
+                                        className="p-1.5 text-[#5A6877] hover:text-[#25364A] bg-[#F7F8FA] border border-[#E2E7EB] rounded disabled:opacity-40"
+                                      >
+                                        <ArrowDown className="w-3.5 h-3.5" />
+                                      </button>
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+
+                          <div className="space-y-1.5">
+                            <div className="text-xs font-semibold text-[#25364A]">
+                              Vista previa del resumen con datos de ejemplo
+                            </div>
+                            <div className="p-3 bg-white border border-[#DCE3E8] rounded-[9px] text-xs text-[#25364A] whitespace-pre-wrap leading-relaxed">
+                              {summaryConfigCustomized
+                                ? previewSummaryInEditor({
+                                    steps,
+                                    summaryConfig: displayedSummaryConfig,
+                                    flowKey: effectiveFlowKey,
+                                  })
+                                : renderAutomaticSummary({
+                                    steps,
+                                    answers: buildSampleAnswersForFlow(steps, null),
+                                  })}
+                            </div>
+                          </div>
+                        </div>
+                      )}
+
+                      {!steps.some((s) => s.type === 'cierre') &&
+                        effectiveFlowKey !== 'opting' && (
+                          <div className="pt-2">
+                            <label className="inline-flex items-center gap-2.5 text-sm font-semibold text-[#25364A] cursor-pointer">
+                              <input
+                                type="checkbox"
+                                checked={showReferenceInClosure}
+                                onChange={(e) => {
+                                  setDraftDirty(true);
+                                  setShowReferenceInClosure(e.target.checked);
+                                }}
+                                className="w-4 h-4 accent-[#167D83]"
+                              />
+                              <span>Mostrar número de solicitud al cliente</span>
+                            </label>
+                          </div>
+                        )}
+                    </div>
+                  )}
+
+                  {selectedStep.type === 'cierre' && (
+                    <div className="border-t border-[#EDF0F2] pt-4 space-y-1.5">
+                      <label className="inline-flex items-center gap-2.5 text-sm font-semibold text-[#25364A] cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={showReferenceInClosure}
+                          onChange={(e) => {
+                            setDraftDirty(true);
+                            setShowReferenceInClosure(e.target.checked);
+                          }}
+                          className="w-4 h-4 accent-[#167D83]"
+                        />
+                        <span>Mostrar número de solicitud al cliente</span>
+                      </label>
+                      <p className="text-xs text-[#5A6877]">
+                        Cada solicitud confirmada genera siempre un número único interno. Desmarcá esta opción si preferís guardarlo solo para tu equipo sin mostrarlo al cliente.
+                      </p>
+                    </div>
+                  )}
+
                   <div className="border-t border-[#EDF0F2] pt-4 space-y-3">
                     <div className="flex flex-wrap items-center justify-between gap-4">
                       {isTerminalStepType(selectedStep.type) ? (
@@ -2879,483 +3247,6 @@ export function FlowAndRulesDesigner({
                   Elegí una pregunta de la lista para editarla.
                 </div>
               )}
-
-              {/* Configurable Summary, Confirmation, Closure & Request Reference */}
-              <section className="bg-white border border-[#E2E7EB] rounded-[13px] p-6 space-y-5">
-                <div className="flex flex-wrap items-start justify-between gap-3 border-b border-[#EDF0F2] pb-4">
-                  <div>
-                    <h3 className="text-base font-semibold text-[#25364A]">
-                      Resumen, confirmación, cierre y referencia
-                    </h3>
-                    <p className="text-xs text-[#5A6877] mt-0.5">
-                      Elegí qué respuestas incluir en el resumen antes de confirmar y cómo mostrar la referencia única al finalizar.
-                    </p>
-                  </div>
-                  <div className="flex flex-wrap items-center gap-2">
-                    {!steps.some((s) => s.type === 'resumen') && (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          const newId = `step_resumen_${Date.now().toString(36)}`;
-                          const confirmIdx = steps.findIndex((s) => s.type === 'confirmacion');
-                          const cierreIdx = steps.findIndex((s) => s.type === 'cierre');
-                          const insertAt =
-                            confirmIdx >= 0
-                              ? confirmIdx
-                              : cierreIdx >= 0
-                                ? cierreIdx
-                                : steps.length;
-                          const copy = structuredClone(steps);
-                          const nextTarget = copy[insertAt]?.id ?? null;
-                          copy.splice(insertAt, 0, {
-                            id: newId,
-                            title: 'Resumen',
-                            type: 'resumen',
-                            prompt: 'Resumen previo a confirmar:',
-                            targetField: 'resumen',
-                            required: false,
-                            nextStepId: nextTarget,
-                          });
-                          if (insertAt > 0 && copy[insertAt - 1]) {
-                            copy[insertAt - 1].nextStepId = newId;
-                          }
-                          setDraftDirty(true);
-                          setSummaryConfigCustomized(true);
-                          setSteps(copy);
-                          setSelectedStepId(newId);
-                        }}
-                        className="px-3 py-1.5 text-xs font-medium text-[#116B70] bg-[#EAF5F2] border border-[#D4EAE4] rounded-[8px] hover:bg-[#DCEFE9]"
-                      >
-                        + Agregar paso de Resumen
-                      </button>
-                    )}
-                    {!steps.some((s) => s.type === 'confirmacion') && (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          const newId = `step_confirm_${Date.now().toString(36)}`;
-                          const cierreIdx = steps.findIndex((s) => s.type === 'cierre');
-                          const insertAt = cierreIdx >= 0 ? cierreIdx : steps.length;
-                          const copy = structuredClone(steps);
-                          const nextTarget = copy[insertAt]?.id ?? null;
-                          copy.splice(insertAt, 0, {
-                            id: newId,
-                            title: 'Confirmación',
-                            type: 'confirmacion',
-                            prompt: '¿Confirmás que registremos tu solicitud con estos datos?',
-                            targetField: 'confirmacion',
-                            required: true,
-                            options: [
-                              { id: 'confirmar_si', label: 'Confirmar solicitud' },
-                              { id: 'confirmar_corregir', label: 'Corregir un dato' },
-                              { id: 'confirmar_no', label: 'Ahora no' },
-                            ],
-                            nextStepId: nextTarget,
-                          });
-                          if (insertAt > 0 && copy[insertAt - 1]) {
-                            copy[insertAt - 1].nextStepId = newId;
-                          }
-                          setDraftDirty(true);
-                          setSteps(copy);
-                          setSelectedStepId(newId);
-                        }}
-                        className="px-3 py-1.5 text-xs font-medium text-[#116B70] bg-[#EAF5F2] border border-[#D4EAE4] rounded-[8px] hover:bg-[#DCEFE9]"
-                      >
-                        + Agregar paso de Confirmación
-                      </button>
-                    )}
-                  </div>
-                </div>
-
-                {!summaryConfigCustomized && draftFlow?.summaryTemplate && (
-                  <div className="p-3.5 bg-[#F7F8FA] border border-[#E2E7EB] rounded-[10px] flex flex-wrap items-center justify-between gap-3 text-xs">
-                    <div className="text-[#5A6877]">
-                      Esta conversación conserva su plantilla de resumen clásica. Podés mantenerla intacta o activar el selector visual de campos para editar etiquetas y orden.
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setDraftDirty(true);
-                        setSummaryConfigCustomized(true);
-                        setSummaryConfig(resolveSummaryConfigForEditor(steps, summaryConfig));
-                      }}
-                      className="px-3 py-1.5 font-semibold text-[#116B70] bg-white border border-[#D4EAE4] rounded-[8px] hover:bg-[#EAF5F2]"
-                    >
-                      Personalizar campos del resumen
-                    </button>
-                  </div>
-                )}
-
-                {(summaryConfigCustomized || !draftFlow?.summaryTemplate) && (
-                  <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
-                    <div className="lg:col-span-7 space-y-4">
-                      <div>
-                        <label className="block text-[13px] font-semibold text-[#25364A] mb-1">
-                          Introducción del resumen
-                        </label>
-                        <textarea
-                          ref={summaryIntroRef}
-                          rows={2}
-                          value={displayedSummaryConfig.introPrompt ?? ''}
-                          onChange={(e) => {
-                            const val = e.target.value;
-                            mutateSummaryConfig((prev) => ({ ...prev, introPrompt: val }));
-                          }}
-                          placeholder="ej: Gracias, {{nombre}}. Revisá tus respuestas antes de confirmar:"
-                          className="w-full text-sm border border-[#DCE3E8] rounded-[9px] px-3.5 py-2 bg-white"
-                        />
-                        {availableVariables.filter((v) => v.source === 'step').length > 0 && (
-                          <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
-                            <span className="text-[11px] text-[#5A6877]">Insertar:</span>
-                            {availableVariables
-                              .filter((v) => v.source === 'step')
-                              .map((v) => (
-                                <button
-                                  key={`sum_intro_${v.key}`}
-                                  type="button"
-                                  onClick={() =>
-                                    insertVariableIntoField(
-                                      v.key,
-                                      displayedSummaryConfig.introPrompt ?? '',
-                                      (nextVal) =>
-                                        mutateSummaryConfig((prev) => ({
-                                          ...prev,
-                                          introPrompt: nextVal,
-                                        })),
-                                      summaryIntroRef.current
-                                    )
-                                  }
-                                  className="px-2 py-0.5 text-[11px] font-medium text-[#116B70] bg-[#EAF5F2] border border-[#D4EAE4] rounded-[6px] hover:bg-[#DCEFE9]"
-                                >
-                                  + {v.label} ({`{{${v.key}}}`})
-                                </button>
-                              ))}
-                          </div>
-                        )}
-                      </div>
-
-                      <div className="space-y-2">
-                        <div className="text-[13px] font-semibold text-[#25364A]">
-                          Respuestas incluidas y orden en el resumen
-                        </div>
-                        <p className="text-xs text-[#5A6877]">
-                          Las preguntas opcionales que el cliente omita se ocultan automáticamente. Las selecciones múltiples muestran todas sus etiquetas completas.
-                        </p>
-                        {displayedSummaryConfig.fields.length === 0 ? (
-                          <p className="text-xs text-[#5A6877]">
-                            Todavía no hay preguntas con captura de respuesta en esta conversación.
-                          </p>
-                        ) : (
-                          <div className="space-y-2">
-                            {displayedSummaryConfig.fields.map((field, fIdx) => {
-                              const sourceStep = steps.find((s) => s.id === field.stepId);
-                              return (
-                                <div
-                                  key={field.stepId}
-                                  className="flex flex-wrap items-center gap-2 p-2.5 border border-[#E2E7EB] rounded-[9px] bg-[#F7F8FA]/60"
-                                >
-                                  <input
-                                    type="checkbox"
-                                    aria-label={`Incluir ${field.label} en el resumen`}
-                                    checked={field.enabled}
-                                    onChange={(e) => {
-                                      const checked = e.target.checked;
-                                      mutateSummaryConfig((prev) => ({
-                                        ...prev,
-                                        fields: prev.fields.map((f) =>
-                                          f.stepId === field.stepId ? { ...f, enabled: checked } : f
-                                        ),
-                                      }));
-                                    }}
-                                    className="w-4 h-4 accent-[#167D83]"
-                                  />
-                                  <input
-                                    type="text"
-                                    aria-label={`Etiqueta en resumen para ${field.stepId}`}
-                                    value={field.label}
-                                    onChange={(e) => {
-                                      const nextLabel = e.target.value;
-                                      mutateSummaryConfig((prev) => ({
-                                        ...prev,
-                                        fields: prev.fields.map((f) =>
-                                          f.stepId === field.stepId
-                                            ? { ...f, label: nextLabel }
-                                            : f
-                                        ),
-                                      }));
-                                    }}
-                                    className="flex-1 min-w-[160px] min-h-[36px] text-sm border border-[#DCE3E8] rounded-[8px] px-2.5 py-1 bg-white"
-                                  />
-                                  {sourceStep?.targetField && (
-                                    <span className="text-[11px] text-[#5A6877]">
-                                      {`{{${sourceStep.targetField}}}`}
-                                    </span>
-                                  )}
-                                  <div className="flex items-center gap-1">
-                                    <button
-                                      type="button"
-                                      aria-label="Subir campo en resumen"
-                                      disabled={fIdx === 0}
-                                      onClick={() =>
-                                        mutateSummaryConfig((prev) => {
-                                          const arr = [...prev.fields];
-                                          if (fIdx <= 0) return prev;
-                                          const [moved] = arr.splice(fIdx, 1);
-                                          arr.splice(fIdx - 1, 0, moved);
-                                          return {
-                                            ...prev,
-                                            fields: arr.map((item, idx) => ({ ...item, order: idx })),
-                                          };
-                                        })
-                                      }
-                                      className="p-1.5 text-[#5A6877] hover:text-[#25364A] bg-white border border-[#E2E7EB] rounded disabled:opacity-40"
-                                    >
-                                      <ArrowUp className="w-3.5 h-3.5" />
-                                    </button>
-                                    <button
-                                      type="button"
-                                      aria-label="Bajar campo en resumen"
-                                      disabled={fIdx === displayedSummaryConfig.fields.length - 1}
-                                      onClick={() =>
-                                        mutateSummaryConfig((prev) => {
-                                          const arr = [...prev.fields];
-                                          if (fIdx >= arr.length - 1) return prev;
-                                          const [moved] = arr.splice(fIdx, 1);
-                                          arr.splice(fIdx + 1, 0, moved);
-                                          return {
-                                            ...prev,
-                                            fields: arr.map((item, idx) => ({ ...item, order: idx })),
-                                          };
-                                        })
-                                      }
-                                      className="p-1.5 text-[#5A6877] hover:text-[#25364A] bg-white border border-[#E2E7EB] rounded disabled:opacity-40"
-                                    >
-                                      <ArrowDown className="w-3.5 h-3.5" />
-                                    </button>
-                                  </div>
-                                </div>
-                              );
-                            })}
-                          </div>
-                        )}
-                      </div>
-
-                      {(() => {
-                        const confirmStep = steps.find((s) => s.type === 'confirmacion');
-                        if (!confirmStep) return null;
-                        return (
-                          <div>
-                            <label className="block text-[13px] font-semibold text-[#25364A] mb-1">
-                              Pregunta de confirmación (paso «{getStepTitle(confirmStep)}»)
-                            </label>
-                            <input
-                              type="text"
-                              value={confirmStep.prompt}
-                              onChange={(e) =>
-                                updateStep(confirmStep.id, { prompt: e.target.value })
-                              }
-                              className="w-full min-h-[40px] text-sm border border-[#DCE3E8] rounded-[8px] px-3 py-1.5 bg-white"
-                            />
-                          </div>
-                        );
-                      })()}
-                    </div>
-
-                    <div className="lg:col-span-5 p-4 bg-[#F7F8FA] border border-[#E2E7EB] rounded-[11px] space-y-2.5">
-                      <div className="text-xs font-semibold text-[#25364A]">
-                        Vista previa del resumen con datos de ejemplo
-                      </div>
-                      <div className="p-3 bg-white border border-[#DCE3E8] rounded-[9px] text-xs text-[#25364A] whitespace-pre-wrap leading-relaxed">
-                        {previewSummaryInEditor({
-                          steps,
-                          summaryConfig: displayedSummaryConfig,
-                          flowKey: effectiveFlowKey,
-                        })}
-                      </div>
-                      {(() => {
-                        const confirmStep = steps.find((s) => s.type === 'confirmacion');
-                        if (!confirmStep) return null;
-                        return (
-                          <div className="p-2.5 bg-white border border-[#DCE3E8] rounded-[9px] text-xs space-y-1.5">
-                            <div className="text-[#25364A]">{confirmStep.prompt}</div>
-                            {confirmStep.options && confirmStep.options.length > 0 && (
-                              <div className="flex flex-wrap gap-1.5">
-                                {confirmStep.options.map((opt) => (
-                                  <span
-                                    key={opt.id}
-                                    className="px-2 py-0.5 text-[11px] bg-[#EAF5F2] text-[#116B70] border border-[#D4EAE4] rounded"
-                                  >
-                                    {opt.label}
-                                  </span>
-                                ))}
-                              </div>
-                            )}
-                          </div>
-                        );
-                      })()}
-                    </div>
-                  </div>
-                )}
-
-                <div className="border-t border-[#EDF0F2] pt-4 space-y-4">
-                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-                    <div>
-                      <label className="block text-[13px] font-semibold text-[#25364A] mb-1">
-                        Mensaje de cierre al confirmar
-                      </label>
-                      <textarea
-                        ref={closureTplRef}
-                        rows={2}
-                        value={closureTemplate}
-                        onChange={(e) => {
-                          setDraftDirty(true);
-                          setClosureTemplate(e.target.value);
-                        }}
-                        placeholder="ej: ¡Gracias, {{nombre}}! Tu solicitud quedó registrada y nuestro equipo te contactará pronto."
-                        className="w-full text-sm border border-[#DCE3E8] rounded-[9px] px-3.5 py-2 bg-white"
-                      />
-                      <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
-                        <span className="text-[11px] text-[#5A6877]">Insertar:</span>
-                        {availableVariables.map((v) => (
-                          <button
-                            key={`closure_var_${v.key}`}
-                            type="button"
-                            onClick={() => {
-                              setDraftDirty(true);
-                              insertVariableIntoField(
-                                v.key,
-                                closureTemplate,
-                                setClosureTemplate,
-                                closureTplRef.current
-                              );
-                            }}
-                            className="px-2 py-0.5 text-[11px] font-medium text-[#116B70] bg-[#EAF5F2] border border-[#D4EAE4] rounded-[6px] hover:bg-[#DCEFE9]"
-                          >
-                            + {v.label} ({`{{${v.key}}}`})
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-
-                    <div className="space-y-3 p-3.5 bg-[#F7F8FA] border border-[#E2E7EB] rounded-[10px]">
-                      <label className="inline-flex items-center gap-2.5 text-sm font-semibold text-[#25364A] cursor-pointer">
-                        <input
-                          type="checkbox"
-                          checked={showReferenceInClosure}
-                          onChange={(e) => {
-                            setDraftDirty(true);
-                            setShowReferenceInClosure(e.target.checked);
-                          }}
-                          className="w-4 h-4 accent-[#167D83]"
-                        />
-                        <span>Mostrar referencia en el cierre</span>
-                      </label>
-                      <p className="text-xs text-[#5A6877]">
-                        El formato consecutivo (ej. <code>{`${effectiveFlowKey === 'default' ? 'nexo' : effectiveFlowKey}_1`}</code>) lo controla la plataforma de forma única al registrar la solicitud. Si desmarcás esta opción, el registro interno y su referencia se siguen guardando sin mostrarse al cliente.
-                      </p>
-                      <div>
-                        <label className="block text-xs font-semibold text-[#25364A] mb-1">
-                          Texto que acompaña la referencia
-                        </label>
-                        <input
-                          ref={referenceTplRef}
-                          type="text"
-                          disabled={!showReferenceInClosure}
-                          value={referenceTemplate}
-                          onChange={(e) => {
-                            setDraftDirty(true);
-                            setReferenceTemplate(e.target.value);
-                          }}
-                          placeholder="Referencia de tu solicitud: {{referencia}}"
-                          className="w-full min-h-[38px] text-sm border border-[#DCE3E8] rounded-[8px] px-3 py-1.5 bg-white disabled:bg-[#EDF0F2] disabled:text-[#5A6877]"
-                        />
-                        {showReferenceInClosure && (
-                          <div className="mt-1 flex flex-wrap gap-1.5">
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setDraftDirty(true);
-                                insertVariableIntoField(
-                                  'referencia',
-                                  referenceTemplate,
-                                  setReferenceTemplate,
-                                  referenceTplRef.current
-                                );
-                              }}
-                              className="px-2 py-0.5 text-[11px] font-medium text-[#116B70] bg-white border border-[#D4EAE4] rounded-[6px] hover:bg-[#EAF5F2]"
-                            >
-                              + Referencia ({'{{referencia}}'})
-                            </button>
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-                    <div>
-                      <label className="block text-xs font-semibold text-[#25364A] mb-1">
-                        Mensaje si el cliente elige «Ahora no» (no registra solicitud)
-                      </label>
-                      <input
-                        type="text"
-                        value={cancelMessage}
-                        onChange={(e) => {
-                          setDraftDirty(true);
-                          setCancelMessage(e.target.value);
-                        }}
-                        placeholder="Entendido. Cancelamos el registro; podés escribirnos cuando gustes."
-                        className="w-full min-h-[40px] text-sm border border-[#DCE3E8] rounded-[8px] px-3 py-1.5 bg-white"
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-xs font-semibold text-[#25364A] mb-1">
-                        Mensaje si intenta confirmar de nuevo una solicitud ya registrada
-                      </label>
-                      <textarea
-                        ref={alreadyRegTplRef}
-                        rows={1}
-                        value={alreadyRegisteredTemplate}
-                        onChange={(e) => {
-                          setDraftDirty(true);
-                          setAlreadyRegisteredTemplate(e.target.value);
-                        }}
-                        placeholder="Tu solicitud ya había quedado registrada."
-                        className="w-full min-h-[40px] text-sm border border-[#DCE3E8] rounded-[8px] px-3 py-1.5 bg-white"
-                      />
-                    </div>
-                  </div>
-
-                  {liveTemplateIssues.length > 0 && (
-                    <div className="space-y-1.5">
-                      {liveTemplateIssues.map((issue, idx) => (
-                        <div
-                          key={`tpl_issue_${issue.code}_${idx}`}
-                          className={`p-2.5 rounded-[8px] text-xs flex flex-wrap items-center justify-between gap-2 ${
-                            issue.severity === 'error'
-                              ? 'bg-red-50 border border-red-200 text-red-800'
-                              : 'bg-[#FFF0E3] border border-[#F2D7BF] text-[#8C542C]'
-                          }`}
-                        >
-                          <span>
-                            • {issue.message}
-                            {issue.suggestion ? ` ${issue.suggestion}` : ''}
-                          </span>
-                          {issue.stepId && steps.some((s) => s.id === issue.stepId) && (
-                            <button
-                              type="button"
-                              onClick={() => setSelectedStepId(issue.stepId!)}
-                              className="font-semibold text-[#116B70] underline shrink-0"
-                            >
-                              Ir a la pregunta
-                            </button>
-                          )}
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              </section>
 
               {/* Out-of-script explicit rules */}
               <section className="bg-white border border-[#E2E7EB] rounded-[13px] p-6 space-y-3">
@@ -4230,7 +4121,15 @@ export function FlowAndRulesDesigner({
                             <div className="font-semibold text-[#25364A]">
                               {idx + 1}. {st.title?.trim() || `Pregunta ${idx + 1}`} ({STEP_TYPE_LABELS[st.type]})
                             </div>
-                            <div className="text-[#25364A] whitespace-pre-wrap">{st.prompt}</div>
+                            <div className="text-[#25364A] whitespace-pre-wrap">
+                              {formatTemplateTokensReadable(
+                                st.prompt,
+                                conv.latestPublished?.steps ?? [],
+                                {
+                                  allowReference: st.type === 'cierre',
+                                }
+                              )}
+                            </div>
                             {st.options && st.options.length > 0 && (
                               <div className="text-[#5A6877] pt-0.5">
                                 Opciones: {st.options.map((o) => o.label).join(' · ')}
@@ -4267,7 +4166,11 @@ export function FlowAndRulesDesigner({
                               {conv.latestPublished.summaryConfig.introPrompt && (
                                 <div>
                                   <span className="font-medium text-[#25364A]">Introducción:</span>{' '}
-                                  {conv.latestPublished.summaryConfig.introPrompt}
+                                  {formatTemplateTokensReadable(
+                                    conv.latestPublished.summaryConfig.introPrompt,
+                                    conv.latestPublished.steps,
+                                    { allowReference: false }
+                                  )}
                                 </div>
                               )}
                               <div>
@@ -4283,22 +4186,29 @@ export function FlowAndRulesDesigner({
                           {!conv.latestPublished.summaryConfig &&
                             conv.latestPublished.summaryTemplate && (
                               <div className="text-[#5A6877] whitespace-pre-wrap">
-                                <span className="font-medium text-[#25364A]">Plantilla de resumen:</span>{' '}
-                                {conv.latestPublished.summaryTemplate}
+                                <span className="font-medium text-[#25364A]">Resumen configurado:</span>{' '}
+                                {formatTemplateTokensReadable(
+                                  conv.latestPublished.summaryTemplate,
+                                  conv.latestPublished.steps,
+                                  { allowReference: false }
+                                )}
                               </div>
                             )}
                           {conv.latestPublished.closureTemplate && (
                             <div className="text-[#5A6877] whitespace-pre-wrap">
                               <span className="font-medium text-[#25364A]">Mensaje de cierre:</span>{' '}
-                              {conv.latestPublished.closureTemplate}
+                              {formatTemplateTokensReadable(
+                                conv.latestPublished.closureTemplate,
+                                conv.latestPublished.steps,
+                                { allowReference: true }
+                              )}
                             </div>
                           )}
                           <div className="text-[#5A6877]">
-                            <span className="font-medium text-[#25364A]">Referencia en el cierre:</span>{' '}
+                            <span className="font-medium text-[#25364A]">Mostrar número de solicitud al cliente:</span>{' '}
                             {conv.latestPublished.showReferenceInClosure === false
-                              ? 'Oculta para el cliente (se registra internamente)'
-                              : conv.latestPublished.referenceTemplate ||
-                                'Visible (Referencia de tu solicitud: {{referencia}})'}
+                              ? 'Oculto internamente (se registra igual)'
+                              : 'Visible para el cliente'}
                           </div>
                         </div>
                       )}

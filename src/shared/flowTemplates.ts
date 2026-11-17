@@ -25,6 +25,32 @@ export interface TemplateValidationIssue {
   suggestion?: string;
 }
 
+export interface AmbiguousTemplateReference {
+  id: string;
+  token: string;
+  locationType:
+    | 'stepPrompt'
+    | 'stepCorrection'
+    | 'summaryIntro'
+    | 'closureTemplate'
+    | 'alreadyRegisteredTemplate'
+    | 'cancelMessage';
+  stepId?: string;
+  contextLabel: string;
+  snippet: string;
+  candidateStepIds: string[];
+}
+
+export interface FlowDraftRepairResult {
+  flow: FlowVersion;
+  repaired: boolean;
+  repairedCount: number;
+  replacedManualSummary: boolean;
+  unifiedClosureIntoCierreStep: boolean;
+  ambiguousReferences: AmbiguousTemplateReference[];
+  summaryNotes: string[];
+}
+
 export const PRESET_TARGET_FIELDS: Array<{
   key: string;
   label: string;
@@ -158,7 +184,7 @@ export function listAvailableFlowVariables(
   steps.forEach((step, idx) => {
     if (!isAnswerableSummaryStep(step)) return;
     const readable = getReadableFlowStepTitle(step, idx);
-    const primaryKey = step.targetField?.trim() || step.id;
+    const primaryKey = step.id;
     if (primaryKey && !seenKeys.has(primaryKey)) {
       seenKeys.add(primaryKey);
       options.push({
@@ -315,13 +341,13 @@ export function resolveSummaryConfigForEditor(
     fields.push({
       stepId: id,
       label: getReadableFlowStepTitle(meta.step, meta.idx),
-      enabled: false,
+      enabled: true,
       order: fields.length,
     });
   }
 
   return {
-    introPrompt: existing.introPrompt ?? '',
+    introPrompt: existing.introPrompt ?? 'Revisá tus respuestas antes de confirmar:',
     fields,
   };
 }
@@ -333,8 +359,9 @@ export function renderSummaryFromConfig(params: {
   interpolate: (template: string) => string;
 }): string {
   const { summaryConfig, steps, answers, interpolate } = params;
+  const resolvedConfig = resolveSummaryConfigForEditor(steps, summaryConfig);
   const stepMap = new Map(steps.map((s, idx) => [s.id, { step: s, idx }]));
-  const orderedFields = [...(summaryConfig.fields ?? [])].sort((a, b) => a.order - b.order);
+  const orderedFields = [...(resolvedConfig.fields ?? [])].sort((a, b) => a.order - b.order);
 
   const lines: string[] = [];
   for (const field of orderedFields) {
@@ -351,7 +378,7 @@ export function renderSummaryFromConfig(params: {
     lines.push(`• ${label}: ${valText}`);
   }
 
-  const rawIntro = summaryConfig.introPrompt?.trim();
+  const rawIntro = resolvedConfig.introPrompt?.trim();
   const intro = rawIntro ? interpolate(rawIntro).trim() : '';
 
   if (intro && lines.length > 0) {
@@ -360,6 +387,29 @@ export function renderSummaryFromConfig(params: {
   if (intro) return intro;
   if (lines.length > 0) return lines.join('\n');
   return 'Aún no registraste respuestas.';
+}
+
+export function renderAutomaticSummary(params: {
+  steps: FlowStep[];
+  answers: Record<string, AnswerRecord>;
+  introPrompt?: string;
+}): string {
+  const { steps, answers, introPrompt } = params;
+  const lines: string[] = [];
+  steps.forEach((step, idx) => {
+    if (!isAnswerableSummaryStep(step)) return;
+    const ans = answers[step.id];
+    if (isSkippedOptionalAnswer(ans)) return;
+    const valText = formatAnswerDisplayValue(ans!);
+    if (!valText) return;
+    const label = getReadableFlowStepTitle(step, idx);
+    lines.push(`• ${label}: ${valText}`);
+  });
+  if (lines.length === 0) {
+    return 'Aún no registraste respuestas.';
+  }
+  const intro = introPrompt?.trim() ?? 'Revisá tus respuestas antes de confirmar:';
+  return intro ? `${intro}\n\n${lines.join('\n')}` : lines.join('\n');
 }
 
 export function buildSampleAnswersForFlow(
@@ -476,15 +526,15 @@ export function validateFlowTemplates(
       if (!allStepKeys.has(v) && !isKnownBuiltIn(v, params.allowReference)) {
         const suggestion =
           v === 'referencia'
-            ? 'La variable {{referencia}} solo está disponible después de confirmar la solicitud (en el cierre o referencia).'
-            : `Asigná el dato "${v}" a una pregunta en «Dato que guarda esta pregunta» o elegí otra variable desde «Insertar respuesta».`;
+            ? 'El número de solicitud solo está disponible después de confirmar (en la Despedida).'
+            : 'Elegí la pregunta correspondiente usando «Insertar respuesta» o resolvé la referencia pendiente.';
         issues.push({
           code: 'UNKNOWN_TEMPLATE_VARIABLE',
           severity: params.warnOnly ? 'warning' : 'error',
           stepId: params.stepId,
           stepTitle: params.stepTitle,
           suggestion,
-          message: `${params.contextLabel} usa "{{${v}}}", pero ninguna pregunta de esta conversación guarda ese dato.`,
+          message: `${params.contextLabel} hace referencia a un dato («${v}») que no corresponde a ninguna pregunta actual de la conversación.`,
         });
         continue;
       }
@@ -497,8 +547,8 @@ export function validateFlowTemplates(
           stepId: params.stepId ?? sourceStep.id,
           stepTitle: params.stepTitle ?? getReadableFlowStepTitle(sourceStep),
           suggestion:
-            'Si el cliente omite esa pregunta opcional, el texto podría quedar incompleto. Considerá marcar la pregunta como obligatoria o quitar la variable del texto.',
-          message: `${params.contextLabel} usa "{{${v}}}", que pertenece a una pregunta opcional y puede quedar vacía si el cliente la omite.`,
+            'Si el cliente omite esa pregunta opcional, el texto podría quedar incompleto. Considerá marcarla como obligatoria o quitar esa referencia.',
+          message: `${params.contextLabel} usa la respuesta de «${getReadableFlowStepTitle(sourceStep)}», que es opcional y podría quedar vacía si el cliente la omite.`,
         });
       }
     }
@@ -560,8 +610,8 @@ export function validateFlowTemplates(
       issues.push({
         code: 'EMPTY_SUMMARY_FIELDS',
         severity: 'warning',
-        suggestion: 'Marcá al menos una respuesta en la sección «Resumen y cierre» para mostrarla antes de confirmar.',
-        message: 'La conversación tiene un paso de Resumen, pero no hay respuestas seleccionadas para mostrar.',
+        suggestion: 'Abrí «Personalizar resumen» dentro de Confirmación y marcá al menos una respuesta.',
+        message: 'No hay respuestas seleccionadas para mostrar en el resumen previo a confirmar.',
       });
     }
   }
@@ -600,11 +650,419 @@ export function validateFlowTemplates(
     issues.push({
       code: 'CLOSURE_WITHOUT_CONFIRMATION',
       severity: 'warning',
-      suggestion: 'Agregá un paso de tipo «Confirmación» antes del cierre para registrar la solicitud y generar su referencia.',
+      suggestion: 'Agregá un paso de «Confirmación» antes de la despedida para registrar la solicitud y generar su número automáticamente.',
       message:
-        'Esta conversación muestra resumen o menciona referencia, pero no tiene un paso de «Confirmación»: el cierre no creará la solicitud ni generará referencia hasta agregar Confirmación.',
+        'Esta conversación menciona resumen o número de solicitud, pero no tiene un paso de «Confirmación»: la despedida no creará la solicitud hasta agregar Confirmación.',
     });
   }
 
   return issues;
+}
+
+function foldPlainLower(raw: string): string {
+  return raw
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+}
+
+function stripLeadingStepNumber(title: string): string {
+  return title.replace(/^\s*\d+[a-z]?\s*[.)\-:]\s*/i, '').trim();
+}
+
+export function resolveTemplateTokenMeta(
+  token: string,
+  steps: FlowStep[],
+  opts?: { allowReference?: boolean }
+): { status: 'valid' | 'unresolved'; label: string; stepId?: string } {
+  if (token === 'referencia') {
+    return opts?.allowReference === false
+      ? { status: 'unresolved', label: 'Número de solicitud (solo al despedirse)' }
+      : { status: 'valid', label: 'Número de solicitud' };
+  }
+  const hasCanal = steps.some((s) => s.targetField?.trim() === 'canal_contacto');
+  if (token === 'canal_contacto_texto' && hasCanal) {
+    return { status: 'valid', label: 'Canal de contacto' };
+  }
+  if (token === 'etiqueta_dato_contacto' && hasCanal) {
+    return { status: 'valid', label: 'Medio de contacto' };
+  }
+  const byIdIdx = steps.findIndex((s) => s.id === token);
+  if (byIdIdx >= 0) {
+    return {
+      status: 'valid',
+      label: getReadableFlowStepTitle(steps[byIdIdx], byIdIdx),
+      stepId: steps[byIdIdx].id,
+    };
+  }
+  const byFieldIdx = steps.findIndex((s) => s.targetField?.trim() === token);
+  if (byFieldIdx >= 0) {
+    return {
+      status: 'valid',
+      label: getReadableFlowStepTitle(steps[byFieldIdx], byFieldIdx),
+      stepId: steps[byFieldIdx].id,
+    };
+  }
+  return {
+    status: 'unresolved',
+    label: `Dato sin vincular (${token})`,
+  };
+}
+
+export function formatTemplateTokensReadable(
+  template: string | undefined,
+  steps: FlowStep[],
+  opts?: { allowReference?: boolean }
+): string {
+  if (!template) return '';
+  return template.replace(/\{\{([a-zA-Z0-9_]+)\}\}/g, (_m, key: string) => {
+    const meta = resolveTemplateTokenMeta(key, steps, opts);
+    return `[${meta.label}]`;
+  });
+}
+
+const REPAIR_SYNONYMS: Record<string, { keywords: string[]; stepTypes?: StepType[] }> = {
+  nombre: {
+    keywords: ['nombre', 'como te llamas', 'tu nombre', 'quien escribe'],
+  },
+  empresa: {
+    keywords: ['empresa', 'negocio', 'organizacion', 'compania', 'marca'],
+  },
+  negocio: {
+    keywords: ['empresa', 'negocio', 'organizacion', 'compania'],
+  },
+  correo: {
+    keywords: ['correo', 'email', 'e mail', 'mail'],
+    stepTypes: ['correo'],
+  },
+  email: {
+    keywords: ['correo', 'email', 'e mail', 'mail'],
+    stepTypes: ['correo'],
+  },
+  telefono: {
+    keywords: ['telefono', 'whatsapp', 'celular', 'numero de telefono', 'movil'],
+    stepTypes: ['telefono'],
+  },
+  whatsapp: {
+    keywords: ['whatsapp', 'telefono', 'celular'],
+    stepTypes: ['telefono'],
+  },
+  contacto: {
+    keywords: ['contacto', 'dato de contacto', 'medio de contacto', 'telefono', 'correo'],
+    stepTypes: ['captura_contacto', 'correo', 'telefono'],
+  },
+  dato_contacto: {
+    keywords: ['dato de contacto', 'contacto', 'telefono o correo', 'correo o telefono'],
+    stepTypes: ['captura_contacto', 'correo', 'telefono'],
+  },
+  necesidad: {
+    keywords: ['necesidad', 'necesitas', 'ayudemos', 'ayudar', 'requerimiento', 'apoyo'],
+  },
+  interes: {
+    keywords: ['interes', 'interesa', 'producto', 'servicio', 'plan', 'solucion'],
+  },
+  consulta: {
+    keywords: ['consulta', 'consulta inicial', 'motivo', 'mensaje'],
+  },
+  plazo: {
+    keywords: ['plazo', 'cuando', 'tiempo', 'fecha'],
+  },
+  areas: {
+    keywords: ['areas', 'area', 'temas'],
+  },
+};
+
+function findCandidateStepMatchesForToken(
+  token: string,
+  steps: FlowStep[],
+  referencingStepIndex?: number
+): FlowStep[] {
+  const answerable = steps
+    .map((step, idx) => ({ step, idx }))
+    .filter(({ step }) => isAnswerableSummaryStep(step));
+  const pool =
+    referencingStepIndex !== undefined && referencingStepIndex > 0
+      ? answerable.filter(({ idx }) => idx < referencingStepIndex)
+      : answerable;
+  const searchPool = pool.length > 0 ? pool : answerable;
+
+  const normToken = foldPlainLower(token).replace(/_/g, ' ').trim();
+  const syn = REPAIR_SYNONYMS[foldPlainLower(token)];
+
+  const exactTitleMatches: FlowStep[] = [];
+  const typeOrTitleKeywordMatches: FlowStep[] = [];
+  const promptMatches: FlowStep[] = [];
+
+  for (const { step } of searchPool) {
+    const cleanTitle = foldPlainLower(stripLeadingStepNumber(step.title ?? ''));
+    const cleanPrompt = foldPlainLower(step.prompt ?? '');
+    const tf = foldPlainLower(step.targetField ?? '');
+
+    if (cleanTitle && (cleanTitle === normToken || tf === foldPlainLower(token))) {
+      exactTitleMatches.push(step);
+      continue;
+    }
+
+    let matchedByTitleOrType = false;
+    if (syn?.stepTypes?.includes(step.type)) {
+      matchedByTitleOrType = true;
+    }
+    const keywords = syn ? syn.keywords : [normToken];
+    for (const kw of keywords) {
+      if (!kw) continue;
+      if (cleanTitle && (cleanTitle === kw || cleanTitle.includes(kw))) {
+        matchedByTitleOrType = true;
+        break;
+      }
+    }
+    if (matchedByTitleOrType) {
+      typeOrTitleKeywordMatches.push(step);
+      continue;
+    }
+
+    for (const kw of keywords) {
+      if (!kw) continue;
+      if (cleanPrompt.includes(kw)) {
+        promptMatches.push(step);
+        break;
+      }
+    }
+  }
+
+  if (exactTitleMatches.length > 0) return exactTitleMatches;
+  if (typeOrTitleKeywordMatches.length > 0) return typeOrTitleKeywordMatches;
+  if (promptMatches.length > 0) return promptMatches;
+  return [];
+}
+
+function isBrokenManualSummaryPrompt(text: string): boolean {
+  const vars = extractTemplateVariables(text);
+  if (vars.length >= 2 && (/resumen/i.test(text) || /^[\s•\-*]+.*\{\{/m.test(text))) {
+    return true;
+  }
+  return false;
+}
+
+function stripManualSummaryBlockFromConfirmPrompt(prompt: string): string {
+  const lines = prompt.split('\n');
+  const kept = lines.filter((line) => {
+    const trimmed = line.trim();
+    if (/^[•\-*]\s*.*\{\{[a-zA-Z0-9_]+\}\}/.test(trimmed)) return false;
+    if (/^resumen[:\s]*$/i.test(trimmed)) return false;
+    return true;
+  });
+  const joined = kept.join('\n').trim();
+  return joined || '¿Confirmás que registremos tu solicitud con estos datos?';
+}
+
+export function repairExistingFlowDraft(sourceFlow: FlowVersion): FlowDraftRepairResult {
+  const flow = structuredClone(sourceFlow);
+  const summaryNotes: string[] = [];
+  let repairedCount = 0;
+  let replacedManualSummary = false;
+  let unifiedClosureIntoCierreStep = false;
+
+  // Preserve Opting untouched
+  if (flow.flowKey === 'opting') {
+    return {
+      flow,
+      repaired: false,
+      repairedCount: 0,
+      replacedManualSummary: false,
+      unifiedClosureIntoCierreStep: false,
+      ambiguousReferences: [],
+      summaryNotes,
+    };
+  }
+
+  // 1. Replace broken manual summaryTemplate or manual summary message blocks with automatic summary
+  if (flow.summaryTemplate !== undefined) {
+    const vars = extractTemplateVariables(flow.summaryTemplate);
+    const { allStepKeys } = buildAllKnownVariableKeys(flow.steps);
+    const hasBrokenVar = vars.some((v) => !allStepKeys.has(v));
+    if (hasBrokenVar || !flow.summaryConfig) {
+      flow.summaryTemplate = undefined;
+      replacedManualSummary = true;
+      summaryNotes.push(
+        'Se sustituyó la plantilla manual de resumen por el resumen automático de preguntas respondidas.'
+      );
+    }
+  }
+
+  const confirmStepIdx = flow.steps.findIndex((s) => s.type === 'confirmacion');
+  const cierreStep = flow.steps.find((s) => s.type === 'cierre');
+
+  // Convert a manual summary 'mensaje' step into automatic 'resumen' without adding duplicate steps
+  flow.steps.forEach((step, idx) => {
+    if (
+      step.type === 'mensaje' &&
+      (isBrokenManualSummaryPrompt(step.prompt) ||
+        (/^resumen/i.test(stripLeadingStepNumber(step.title ?? '')) &&
+          confirmStepIdx >= 0 &&
+          idx < confirmStepIdx))
+    ) {
+      step.type = 'resumen';
+      step.prompt = 'Resumen previo a confirmar:';
+      replacedManualSummary = true;
+      summaryNotes.push(
+        `El paso «${getReadableFlowStepTitle(step, idx)}» pasó a usar resumen automático.`
+      );
+    }
+    if (step.type === 'confirmacion' && isBrokenManualSummaryPrompt(step.prompt)) {
+      step.prompt = stripManualSummaryBlockFromConfirmPrompt(step.prompt);
+      replacedManualSummary = true;
+      summaryNotes.push(
+        'Se limpió el bloque manual de resumen dentro de Confirmación para usar el resumen automático.'
+      );
+    }
+  });
+
+  // Clean stale summaryConfig fields if any stepId was removed
+  if (flow.summaryConfig) {
+    const validIds = new Set(flow.steps.filter(isAnswerableSummaryStep).map((s) => s.id));
+    const filtered = (flow.summaryConfig.fields ?? []).filter((f) => validIds.has(f.stepId));
+    if (filtered.length !== (flow.summaryConfig.fields ?? []).length) {
+      flow.summaryConfig = resolveSummaryConfigForEditor(flow.steps, {
+        ...flow.summaryConfig,
+        fields: filtered,
+      });
+      replacedManualSummary = true;
+    }
+  }
+
+  // 2. Unify closureTemplate into existing cierre step without duplicating
+  if (cierreStep && flow.closureTemplate?.trim()) {
+    cierreStep.prompt = flow.closureTemplate;
+    flow.closureTemplate = undefined;
+    if (flow.hideInternalCategorizationInClosure === undefined) {
+      flow.hideInternalCategorizationInClosure = true;
+    }
+    unifiedClosureIntoCierreStep = true;
+  }
+
+  // Ensure default showReferenceInClosure is active unless explicitly disabled
+  if (flow.showReferenceInClosure === undefined) {
+    flow.showReferenceInClosure = true;
+  }
+
+  // 3. Repair verifiable message references & detect ambiguous ones
+  const { allStepKeys, hasCanalContacto, hasContextBuilder } = buildAllKnownVariableKeys(flow.steps);
+  const isKnownBuiltIn = (key: string, allowReference: boolean): boolean => {
+    if (key === 'referencia') return allowReference;
+    if (key === 'etiqueta_dato_contacto' || key === 'canal_contacto_texto') return hasCanalContacto;
+    if (key === 'contexto') return hasContextBuilder;
+    return false;
+  };
+
+  const ambiguousReferences: AmbiguousTemplateReference[] = [];
+  const answerableStepIds = flow.steps.filter(isAnswerableSummaryStep).map((s) => s.id);
+
+  const repairString = (params: {
+    text: string | undefined;
+    locationType: AmbiguousTemplateReference['locationType'];
+    contextLabel: string;
+    allowReference: boolean;
+    stepId?: string;
+    stepIndex?: number;
+  }): string | undefined => {
+    if (!params.text) return params.text;
+    return params.text.replace(/\{\{([a-zA-Z0-9_]+)\}\}/g, (full, token: string) => {
+      if (allStepKeys.has(token) || isKnownBuiltIn(token, params.allowReference)) {
+        return full;
+      }
+      const candidates = findCandidateStepMatchesForToken(token, flow.steps, params.stepIndex);
+      if (candidates.length === 1) {
+        repairedCount += 1;
+        return `{{${candidates[0].id}}}`;
+      }
+      ambiguousReferences.push({
+        id: `${params.locationType}:${params.stepId ?? 'global'}:${token}:${ambiguousReferences.length}`,
+        token,
+        locationType: params.locationType,
+        stepId: params.stepId,
+        contextLabel: params.contextLabel,
+        snippet: params.text!.slice(0, 140),
+        candidateStepIds:
+          candidates.length > 0
+            ? candidates.map((c) => c.id)
+            : answerableStepIds,
+      });
+      return full;
+    });
+  };
+
+  flow.steps.forEach((step, idx) => {
+    const label = getReadableFlowStepTitle(step, idx);
+    const allowRef = step.type === 'cierre';
+    step.prompt =
+      repairString({
+        text: step.prompt,
+        locationType: 'stepPrompt',
+        contextLabel: label,
+        allowReference: allowRef,
+        stepId: step.id,
+        stepIndex: idx,
+      }) ?? '';
+    if (step.correctionPrompt) {
+      step.correctionPrompt = repairString({
+        text: step.correctionPrompt,
+        locationType: 'stepCorrection',
+        contextLabel: `${label} (corrección)`,
+        allowReference: allowRef,
+        stepId: step.id,
+        stepIndex: idx,
+      });
+    }
+  });
+
+  if (flow.summaryConfig?.introPrompt) {
+    flow.summaryConfig.introPrompt = repairString({
+      text: flow.summaryConfig.introPrompt,
+      locationType: 'summaryIntro',
+      contextLabel: 'Introducción del resumen',
+      allowReference: false,
+    });
+  }
+  if (flow.closureTemplate) {
+    flow.closureTemplate = repairString({
+      text: flow.closureTemplate,
+      locationType: 'closureTemplate',
+      contextLabel: 'Mensaje de cierre',
+      allowReference: true,
+    });
+  }
+  if (flow.alreadyRegisteredTemplate) {
+    flow.alreadyRegisteredTemplate = repairString({
+      text: flow.alreadyRegisteredTemplate,
+      locationType: 'alreadyRegisteredTemplate',
+      contextLabel: 'Solicitud ya registrada',
+      allowReference: true,
+    });
+  }
+  if (flow.cancelMessage) {
+    flow.cancelMessage = repairString({
+      text: flow.cancelMessage,
+      locationType: 'cancelMessage',
+      contextLabel: 'Mensaje al cancelar',
+      allowReference: false,
+    });
+  }
+
+  if (repairedCount > 0) {
+    summaryNotes.push(
+      `Se repararon automáticamente ${repairedCount} referencia(s) en los mensajes de la conversación.`
+    );
+  }
+
+  return {
+    flow,
+    repaired:
+      repairedCount > 0 || replacedManualSummary || unifiedClosureIntoCierreStep,
+    repairedCount,
+    replacedManualSummary,
+    unifiedClosureIntoCierreStep,
+    ambiguousReferences,
+    summaryNotes,
+  };
 }
