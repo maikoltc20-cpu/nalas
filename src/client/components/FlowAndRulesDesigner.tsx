@@ -2145,6 +2145,112 @@ export function FlowAndRulesDesigner({
                     </div>
                   )}
 
+                  {(selectedStep.type === 'texto' ||
+                    (selectedStep.quickReplies && selectedStep.quickReplies.length > 0)) && (
+                    <div className="border-t border-[#EDF0F2] pt-5 space-y-3">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div>
+                          <div className="text-[13px] font-semibold text-[#25364A]">
+                            Opciones rápidas opcionales (conserva escritura libre)
+                          </div>
+                          <p className="text-xs text-[#5A6877]">
+                            El cliente puede tocar una de estas opciones o seguir escribiendo su respuesta libremente. Los cambios quedan en borrador hasta publicar.
+                          </p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const qrs = selectedStep.quickReplies ?? [];
+                            updateStep(selectedStep.id, {
+                              quickReplies: [
+                                ...qrs,
+                                { id: `qr_${Date.now().toString(36)}`, label: '' },
+                              ],
+                            });
+                          }}
+                          className="inline-flex items-center gap-1 min-h-[40px] px-3 py-1.5 text-sm font-medium text-[#116B70] bg-[#EAF5F2] border border-[#D4EAE4] rounded-[9px] hover:bg-[#DCEFE9]"
+                        >
+                          <Plus className="w-4 h-4" />
+                          <span>Agregar opción rápida</span>
+                        </button>
+                      </div>
+
+                      {(selectedStep.quickReplies ?? []).length === 0 ? (
+                        <p className="text-xs text-[#5A6877]">
+                          Sin opciones rápidas configuradas. El cliente responderá escribiendo texto libre.
+                        </p>
+                      ) : (
+                        <div className="space-y-2.5">
+                          {(selectedStep.quickReplies ?? []).map((qr, qIdx) => (
+                            <div
+                              key={qr.id}
+                              className="p-3 border border-[#E2E7EB] rounded-[9px] bg-[#F7F8FA]/50 space-y-2"
+                            >
+                              <div className="flex items-center gap-2.5">
+                                <span className="text-xs font-medium text-[#5A6877] w-6 text-right">
+                                  {qIdx + 1}.
+                                </span>
+                                <div className="flex-1 grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                                  <div>
+                                    <label className="block text-[11px] font-medium text-[#5A6877] mb-1">
+                                      Etiqueta visible en WhatsApp
+                                    </label>
+                                    <input
+                                      type="text"
+                                      value={qr.label}
+                                      placeholder="ej: Estoy iniciando un negocio"
+                                      onChange={(e) => {
+                                        const copy = [...(selectedStep.quickReplies ?? [])];
+                                        copy[qIdx] = { ...qr, label: e.target.value };
+                                        updateStep(selectedStep.id, { quickReplies: copy });
+                                      }}
+                                      className="w-full min-h-[40px] text-sm border border-[#DCE3E8] rounded-[8px] px-3 py-2 bg-white"
+                                    />
+                                  </div>
+                                  <div>
+                                    <label className="block text-[11px] font-medium text-[#5A6877] mb-1">
+                                      Valor guardado (opcional)
+                                    </label>
+                                    <input
+                                      type="text"
+                                      value={qr.storedValue ?? ''}
+                                      placeholder="Si queda vacío guarda la etiqueta"
+                                      onChange={(e) => {
+                                        const copy = [...(selectedStep.quickReplies ?? [])];
+                                        copy[qIdx] = {
+                                          ...qr,
+                                          storedValue:
+                                            e.target.value === '' ? undefined : e.target.value,
+                                        };
+                                        updateStep(selectedStep.id, { quickReplies: copy });
+                                      }}
+                                      className="w-full min-h-[40px] text-sm border border-[#DCE3E8] rounded-[8px] px-3 py-2 bg-white"
+                                    />
+                                  </div>
+                                </div>
+                                <button
+                                  type="button"
+                                  aria-label="Quitar opción rápida"
+                                  onClick={() => {
+                                    const copy = (selectedStep.quickReplies ?? []).filter(
+                                      (_, i) => i !== qIdx
+                                    );
+                                    updateStep(selectedStep.id, {
+                                      quickReplies: copy.length > 0 ? copy : undefined,
+                                    });
+                                  }}
+                                  className="p-2 text-[#5A6877] hover:text-red-700 rounded self-end mb-0.5"
+                                >
+                                  <Trash2 className="w-4 h-4" />
+                                </button>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
                   <div className="border-t border-[#EDF0F2] pt-4 flex flex-wrap items-center justify-between gap-4">
                     <label className="inline-flex items-center gap-2.5 text-sm text-[#25364A] cursor-pointer min-h-[40px]">
                       <input
@@ -3081,6 +3187,19 @@ export function FlowAndRulesDesigner({
                             {st.options && st.options.length > 0 && (
                               <div className="text-[#5A6877] pt-0.5">
                                 Opciones: {st.options.map((o) => o.label).join(' · ')}
+                              </div>
+                            )}
+                            {st.quickReplies && st.quickReplies.length > 0 && (
+                              <div className="text-[#5A6877] pt-1 space-y-0.5">
+                                <div className="font-medium text-[#25364A]">
+                                  Opciones rápidas (conserva escritura libre):
+                                </div>
+                                {st.quickReplies.map((qr) => (
+                                  <div key={qr.id}>
+                                    • {qr.label} — valor guardado:{' '}
+                                    {qr.storedValue?.trim() || qr.label}
+                                  </div>
+                                ))}
                               </div>
                             )}
                           </div>
