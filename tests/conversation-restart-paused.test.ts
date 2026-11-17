@@ -47,7 +47,23 @@ test('Reinicio tras seleccionar destino sin flujo publicado (VOLVÉ): desvincula
     );
     const { published: optingPub } = publishFlowDraft(seed, 'biz_nexo', 'user_michael', 'opting');
 
-    // Configurar menú general publicado con Opting (válido) y VOLVÉ (sin conversación publicada vinculada, como en datos heredados)
+    // Registrar una versión retirada de VOLVÉ para simular destino inválido que pausa la conversación
+    const retiredVolveId = 'flow_nexo_volve_retired_v1';
+    seed.flowVersions.push({
+      id: retiredVolveId,
+      businessId: 'biz_nexo',
+      flowKey: 'volve',
+      versionNumber: 1,
+      name: 'VOLVÉ v1',
+      status: 'retirada',
+      retiredAt: new Date().toISOString(),
+      retiredReason: 'Versión retirada en prueba de reinicio.',
+      steps: [],
+      outOfScriptRules: [],
+      createdAt: new Date().toISOString(),
+    });
+
+    // Configurar menú general publicado con Opting (válido) y VOLVÉ (apuntando a versión retirada/inválida)
     nexoBiz.entryConfig = {
       enabled: true,
       greetingPrompt: 'MENU_NEXO_PUBLICADO: Elegí una opción.',
@@ -70,6 +86,8 @@ test('Reinicio tras seleccionar destino sin flujo publicado (VOLVÉ): desvincula
         optionLabel: 'VOLVÉ',
         referencePrefix: 'volv',
         targetType: 'flow',
+        flowKey: 'volve',
+        flowVersionId: retiredVolveId,
         active: true,
       },
     ];

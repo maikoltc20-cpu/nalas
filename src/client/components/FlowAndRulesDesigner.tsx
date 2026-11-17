@@ -1494,7 +1494,7 @@ export function FlowAndRulesDesigner({
                                 ? `Deriva a persona (${opt.handoffLabel ?? 'Atención humana'})`
                                 : opt.targetFlowName && opt.targetFlowVersionNumber
                                   ? `Destino: ${opt.targetFlowName} · v${opt.targetFlowVersionNumber}`
-                                  : opt.destinationReason ?? 'Sin conversación publicada válida'}
+                                  : opt.destinationReason ?? 'Sin conversación publicada · Usa alternativa de atención humana'}
                             </div>
                           </div>
                           <span
@@ -1502,16 +1502,20 @@ export function FlowAndRulesDesigner({
                               opt.destinationStatus === 'valida' ||
                               opt.destinationStatus === 'atencion_humana'
                                 ? 'bg-[#EAF5F2] text-[#116B70]'
-                                : 'bg-red-50 text-red-700 border border-red-200'
+                                : opt.destinationStatus === 'sin_publicar'
+                                  ? 'bg-[#FFF0E3] text-[#8C542C]'
+                                  : 'bg-red-50 text-red-700 border border-red-200'
                             }`}
                           >
                             {opt.destinationStatus === 'valida'
                               ? `v${opt.targetFlowVersionNumber}`
                               : opt.destinationStatus === 'atencion_humana'
                                 ? 'Persona'
-                                : opt.destinationStatus === 'retirada'
-                                  ? 'Retirada'
-                                  : 'Bloqueada'}
+                                : opt.destinationStatus === 'sin_publicar'
+                                  ? 'Atención humana (alt.)'
+                                  : opt.destinationStatus === 'retirada'
+                                    ? 'Retirada'
+                                    : 'Bloqueada'}
                           </span>
                         </div>
                       ))}
@@ -1675,7 +1679,7 @@ export function FlowAndRulesDesigner({
                 <div>
                   <h3 className="text-base font-semibold text-[#25364A]">Opciones del menú</h3>
                   <p className="text-xs text-[#5A6877] mt-0.5">
-                    Vinculá cada opción activa a una conversación publicada de {business.name} o a atención humana. No podés publicar opciones activas sin destino válido.
+                    Vinculá cada opción activa a una conversación publicada de {business.name} o a atención humana. Si una opción activa aún no tiene conversación publicada, usará el mensaje alternativo configurable de atención humana.
                   </p>
                 </div>
                 <button
@@ -1695,6 +1699,7 @@ export function FlowAndRulesDesigner({
                   { id: 'prod_nexo_opting', name: 'Opting', optionLabel: 'Opting', targetType: 'flow' as const, referencePrefix: 'opt' },
                   { id: 'prod_nexo_volve', name: 'VOLVÉ', optionLabel: 'VOLVÉ', targetType: 'flow' as const, referencePrefix: 'vol' },
                   { id: 'prod_nexo_benefitos', name: 'BenefitOS', optionLabel: 'BenefitOS', targetType: 'flow' as const, referencePrefix: 'ben' },
+                  { id: 'prod_nexo_giro', name: 'GIRO', optionLabel: 'GIRO', targetType: 'flow' as const, referencePrefix: 'giro' },
                   { id: 'prod_nexo_humano', name: 'Consulta general / Hablar con una persona', optionLabel: 'Consulta general / Hablar con una persona', targetType: 'handoff' as const, referencePrefix: 'hum' },
                 ]
                   .filter(
@@ -1724,6 +1729,10 @@ export function FlowAndRulesDesigner({
                   const linkedGroup = flowGroups.find((g) => g.flowKey === effectiveProdFlowKey);
                   const missingPublishedTarget =
                     prod.active && targetType === 'flow' && !linkedGroup?.latestPublished;
+                  const isRetiredTarget = Boolean(
+                    linkedGroup && !linkedGroup.latestPublished && linkedGroup.latestRetired
+                  );
+                  const hasFallbackPrompt = Boolean(entryConfig.unconfiguredProductPrompt?.trim());
                   return (
                     <div
                       key={prod.id}
@@ -1751,10 +1760,18 @@ export function FlowAndRulesDesigner({
                             <span>{prod.active ? 'Visible en menú' : 'Pausada / En preparación'}</span>
                           </label>
                           {missingPublishedTarget && (
-                            <span className="text-xs font-medium text-[#8C542C] bg-[#FFF0E3] px-2 py-0.5 rounded">
-                              {linkedGroup && !linkedGroup.latestPublished && linkedGroup.latestRetired
-                                ? `Versión retirada (v${linkedGroup.latestRetired.versionNumber}) · Publicá una nueva edición`
-                                : `Requiere conversación publicada en ${business.name}`}
+                            <span
+                              className={`text-xs font-medium px-2 py-0.5 rounded ${
+                                isRetiredTarget || !hasFallbackPrompt
+                                  ? 'text-red-700 bg-red-50 border border-red-200'
+                                  : 'text-[#8C542C] bg-[#FFF0E3]'
+                              }`}
+                            >
+                              {isRetiredTarget
+                                ? `Versión retirada (v${linkedGroup!.latestRetired!.versionNumber}) · Publicá una nueva edición`
+                                : hasFallbackPrompt
+                                  ? 'Sin conversación publicada · Usará alternativa de atención humana'
+                                  : 'Requiere mensaje alternativo de atención humana'}
                             </span>
                           )}
                         </div>
@@ -1863,10 +1880,21 @@ export function FlowAndRulesDesigner({
                               value={effectiveProdFlowKey}
                               onChange={(e) => {
                                 const val = e.target.value || undefined;
+                                const nextGroup = val
+                                  ? flowGroups.find((g) => g.flowKey === val)
+                                  : undefined;
                                 setEntryDirty(true);
                                 setEntryError(null);
                                 setEntryProducts((prev) =>
-                                  prev.map((p, i) => (i === idx ? { ...p, flowKey: val } : p))
+                                  prev.map((p, i) =>
+                                    i === idx
+                                      ? {
+                                          ...p,
+                                          flowKey: val,
+                                          flowVersionId: nextGroup?.latestPublished?.id,
+                                        }
+                                      : p
+                                  )
                                 );
                               }}
                               className="w-full min-h-[40px] text-sm border border-[#DCE3E8] rounded-[8px] px-3 py-1.5 bg-white"
@@ -3426,7 +3454,9 @@ export function FlowAndRulesDesigner({
                             ? `Atención humana (${opt.handoffLabel ?? 'Sin detalle'})`
                             : opt.targetFlowName && opt.targetFlowVersionNumber
                               ? `${opt.targetFlowName} · v${opt.targetFlowVersionNumber}`
-                              : opt.destinationReason ?? 'Destino inválido'}
+                              : opt.destinationStatus === 'sin_publicar'
+                                ? 'Atención humana (alternativa configurable)'
+                                : opt.destinationReason ?? 'Destino inválido'}
                         </span>
                       </div>
                     ))}
@@ -3533,6 +3563,9 @@ export function FlowAndRulesDesigner({
       {publishConfirmModal === 'entry' && (() => {
         const activeDraftOptions = entryProducts.filter((p) => p.active);
         const blockingProblems: string[] = [];
+        const fallbackOptions: string[] = [];
+        const hasFallbackPrompt = Boolean(entryConfig.unconfiguredProductPrompt?.trim());
+
         if (entryConfig.enabled && !entryConfig.greetingPrompt.trim()) {
           blockingProblems.push('El saludo inicial no puede estar vacío.');
         }
@@ -3540,13 +3573,36 @@ export function FlowAndRulesDesigner({
           blockingProblems.push('Debés mantener al menos una opción activa en el menú.');
         }
         for (const opt of activeDraftOptions) {
+          if (!opt.optionLabel.trim() && !opt.name.trim()) {
+            blockingProblems.push('Toda opción activa necesita un texto visible en WhatsApp.');
+            continue;
+          }
           if (opt.targetType === 'handoff') continue;
           const k = resolveProductFlowKey(opt);
           const grp = flowGroups.find((g) => g.flowKey === k);
-          if (!k || !grp || !grp.latestPublished) {
+          if (grp?.latestPublished) continue;
+
+          if (grp && !grp.latestPublished && grp.latestRetired) {
             blockingProblems.push(
-              `La opción «${opt.optionLabel || opt.name}» no apunta a una conversación publicada válida en ${business.name}.`
+              `La opción «${opt.optionLabel || opt.name}» apunta a una versión retirada (${grp.label} v${grp.latestRetired.versionNumber}). Publicá una nueva edición antes de publicar el menú.`
             );
+            continue;
+          }
+          if (opt.flowVersionId) {
+            const explicitFlow = scoped.flowVersions.find((f) => f.id === opt.flowVersionId);
+            if (!explicitFlow || explicitFlow.status !== 'publicada') {
+              blockingProblems.push(
+                `La opción «${opt.optionLabel || opt.name}» apunta a una versión sin publicar o inexistente.`
+              );
+              continue;
+            }
+          }
+          if (!hasFallbackPrompt) {
+            blockingProblems.push(
+              `La opción «${opt.optionLabel || opt.name}» no tiene conversación publicada y falta configurar el mensaje alternativo de atención humana.`
+            );
+          } else {
+            fallbackOptions.push(opt.optionLabel || opt.name);
           }
         }
         return (
@@ -3596,7 +3652,9 @@ export function FlowAndRulesDesigner({
                             ? 'Atención humana'
                             : grp?.latestPublished
                               ? `${grp.label} (v${grp.latestPublished.versionNumber})`
-                              : 'Sin conversación publicada'}
+                              : grp?.latestRetired
+                                ? `Versión retirada (v${grp.latestRetired.versionNumber})`
+                                : 'Atención humana (alternativa configurable)'}
                         </li>
                       );
                     })}
@@ -3607,6 +3665,13 @@ export function FlowAndRulesDesigner({
               <div className="p-3 bg-[#EAF5F2] border border-[#D4EAE4] rounded-[10px] text-xs text-[#116B70]">
                 <strong>Alcance:</strong> aplica de inmediato a chats nuevos y contactos que inicien en el menú. Los chats ya iniciados con una conversación abierta conservan su versión hasta reinicio manual.
               </div>
+
+              {fallbackOptions.length > 0 && blockingProblems.length === 0 && (
+                <div className="p-3 bg-[#FFF0E3] border border-[#F2D7BF] rounded-[10px] text-xs text-[#8C542C]">
+                  <strong>Opciones sin conversación publicada ({fallbackOptions.length}):</strong>{' '}
+                  {fallbackOptions.join(', ')}. Si un cliente las elige, se responderá con el mensaje alternativo de atención humana configurado (sin bloquearlo ni ejecutar otro flujo).
+                </div>
+              )}
 
               {blockingProblems.length > 0 && (
                 <div className="p-3 bg-red-50 border border-red-200 rounded-[10px] text-xs text-red-800 space-y-1">

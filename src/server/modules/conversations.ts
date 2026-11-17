@@ -499,7 +499,9 @@ export function validateLiveFlowForConversation(
     : business.products ?? [];
 
   const isEntryMenuStart =
-    !session.currentStepId && !session.productId && Boolean(entryCfg?.enabled);
+    !session.currentStepId &&
+    (!session.productId || Boolean(session.awaitingUnconfiguredProductAction)) &&
+    Boolean(entryCfg?.enabled);
 
   if (isEntryMenuStart) {
     if (!entryCfg?.greetingPrompt?.trim()) {
@@ -510,6 +512,7 @@ export function validateLiveFlowForConversation(
     }
 
     const activeProducts = entryProducts.filter((p) => p.active && Boolean(p.optionLabel?.trim()));
+    const hasHumanFallback = Boolean(entryCfg?.unconfiguredProductPrompt?.trim());
     const hasPlayableOption = activeProducts.some((p) => {
       if (p.targetType === 'handoff') return true;
       if (useDraftEntry && p.flowKey) {
@@ -525,15 +528,17 @@ export function validateLiveFlowForConversation(
             flowKey: p.flowKey,
             flowVersionId: p.flowVersionId,
           }).flow;
-        return Boolean(draftOrPub);
+        if (draftOrPub) return true;
       }
       if (p.flowVersionId || p.flowKey) {
-        return inspectPublishedFlowTarget(store, business.id, {
+        const insp = inspectPublishedFlowTarget(store, business.id, {
           flowKey: p.flowKey,
           flowVersionId: p.flowVersionId,
-        }).ok;
+        });
+        if (insp.ok) return true;
+        return !p.flowVersionId && insp.reason === 'unpublished' && hasHumanFallback;
       }
-      return false;
+      return hasHumanFallback;
     });
 
     if (!hasPlayableOption) {
@@ -662,11 +667,16 @@ export function restartConversationWithPublished(
     const activeProducts = (biz.products ?? []).filter(
       (p) => p.active && Boolean(p.optionLabel?.trim())
     );
+    const hasHumanFallback = Boolean(biz.entryConfig?.unconfiguredProductPrompt?.trim());
     let firstValidFlowId: string | undefined;
     let hasValidTarget = false;
     for (const prod of activeProducts) {
       if (prod.targetType === 'handoff') {
         hasValidTarget = true;
+        continue;
+      }
+      if (!prod.flowVersionId && !prod.flowKey) {
+        if (hasHumanFallback) hasValidTarget = true;
         continue;
       }
       const insp = inspectPublishedFlowTarget(store, businessId, {
@@ -676,6 +686,8 @@ export function restartConversationWithPublished(
       if (insp.ok && insp.flow) {
         hasValidTarget = true;
         if (!firstValidFlowId) firstValidFlowId = insp.flow.id;
+      } else if (!prod.flowVersionId && insp.reason === 'unpublished' && hasHumanFallback) {
+        hasValidTarget = true;
       }
     }
     if (!hasValidTarget) {

@@ -403,6 +403,55 @@ function getPlayableEntryProducts(
   return products.filter((p) => p.active && Boolean(p.optionLabel?.trim()));
 }
 
+function foldAccentsLower(text: string): string {
+  return text
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\.$/, '')
+    .trim();
+}
+
+function isUnconfiguredFallbackEligible(
+  store: NalasStore,
+  businessId: string,
+  product: BusinessProduct
+): boolean {
+  if (product.targetType === 'handoff') return false;
+  if (product.flowVersionId) {
+    const explicit = inspectPublishedFlowTarget(store, businessId, {
+      flowKey: product.flowKey,
+      flowVersionId: product.flowVersionId,
+    });
+    if (!explicit.ok) return false;
+  }
+  const cleanKey = product.flowKey?.trim();
+  if (!cleanKey) return true;
+  const byKey = inspectPublishedFlowTarget(store, businessId, { flowKey: cleanKey });
+  return byKey.reason === 'unpublished';
+}
+
+function buildUnconfiguredProductOutput(
+  entryConfig: BusinessEntryConfig | undefined,
+  session: Session,
+  productName: string
+): BasicEngineOutput {
+  const rawPrompt =
+    entryConfig?.unconfiguredProductPrompt?.trim() ||
+    'Podemos derivar tu consulta sobre {{producto}} al equipo de atención. ¿Querés solicitar atención humana?';
+  const replyText = interpolateTemplate(rawPrompt, session, {
+    producto: productName,
+  });
+  return {
+    replyText,
+    options: [
+      { id: 'cmd_humano', label: 'Solicitar atención humana.' },
+      { id: 'cmd_entry_menu', label: 'Elegir otro producto.' },
+    ],
+  };
+}
+
 function buildEntryMenuOutput(
   store: NalasStore,
   business: Business,
@@ -1133,14 +1182,69 @@ export function runBasicEngine(params: {
     };
   }
 
-  // Pending action on a legacy unconfigured product session: fail closed for review
+  // Pending action on an option without a published conversation: use configurable human attention alternative
   if (session.awaitingUnconfiguredProductAction && business) {
-    session.awaitingUnconfiguredProductAction = false;
-    return {
-      replyText: '',
-      configInvalid: true,
-      configInvalidReason: `La opción seleccionada "${session.productName ?? 'sin destino'}" no tiene una conversación publicada válida.`,
-    };
+    const entryMeta = getEffectiveEntrySettings(business, session, flow);
+    const normClean = foldAccentsLower(inputText);
+    const affirmativeAnswers = new Set([
+      'si',
+      'claro',
+      'por favor',
+      'si por favor',
+      'dale',
+      'ok',
+      'bueno',
+      'quiero',
+      'de acuerdo',
+      'adelante',
+      'hablar con una persona',
+      'hablar con persona',
+      'atencion',
+    ]);
+    const backToMenuAnswers = new Set([
+      'no',
+      'no gracias',
+      'menu',
+      'otro',
+      'otra opcion',
+      'elegir otro',
+      'cambiar',
+    ]);
+
+    if (affirmativeAnswers.has(normClean)) {
+      session.awaitingUnconfiguredProductAction = false;
+      session.updatedAt = new Date().toISOString();
+      const baseMsg =
+        flow.handoffMessage ??
+        'Derivando tu conversación a una persona de nuestro equipo. Conservaremos tus respuestas registradas hasta este momento.';
+      const productSuffix = session.productName ? ` (Producto: ${session.productName})` : '';
+      return {
+        replyText: baseMsg,
+        requestHumanHandoff: true,
+        handoffReason: `Solicitó atención humana desde la alternativa configurable${productSuffix}.`,
+      };
+    }
+
+    if (backToMenuAnswers.has(normClean) && entryMeta.entryConfig?.enabled) {
+      session.productId = undefined;
+      session.productName = undefined;
+      session.awaitingUnconfiguredProductAction = false;
+      session.awaitingEntryProductSelection = true;
+      session.enteredViaEntryMenu = false;
+      session.updatedAt = new Date().toISOString();
+      if (conversation) {
+        conversation.productId = undefined;
+        conversation.productName = undefined;
+        conversation.updatedAt = session.updatedAt;
+      }
+      return buildEntryMenuOutput(store, business, session, flow);
+    }
+
+    return buildUnconfiguredProductOutput(
+      entryMeta.entryConfig,
+      session,
+      session.productName ?? 'esta consulta'
+    );
   }
 
   // First turn initialization & optional business common entry menu
@@ -1158,6 +1262,7 @@ export function runBasicEngine(params: {
       }
 
       const trimmedNorm = normalized.replace(/\.$/, '');
+      const foldedNorm = foldAccentsLower(inputText);
       const matchedProduct =
         (selectedOptionId?.startsWith('prod:')
           ? activeProducts.find((p) => `prod:${p.id}` === selectedOptionId)
@@ -1167,6 +1272,11 @@ export function runBasicEngine(params: {
             p.id.toLowerCase() === trimmedNorm ||
             p.name.toLowerCase() === trimmedNorm ||
             p.optionLabel.replace(/\.$/, '').toLowerCase() === trimmedNorm
+        ) ??
+        activeProducts.find(
+          (p) =>
+            foldAccentsLower(p.name) === foldedNorm ||
+            foldAccentsLower(p.optionLabel) === foldedNorm
         ) ??
         (/^\d+$/.test(trimmedNorm) ? activeProducts[Number(trimmedNorm) - 1] : undefined);
 
@@ -1204,6 +1314,16 @@ export function runBasicEngine(params: {
       );
 
       if (!targetFlow || targetFlow.steps.length === 0) {
+        if (isUnconfiguredFallbackEligible(store, business.id, matchedProduct)) {
+          session.enteredViaEntryMenu = true;
+          session.awaitingUnconfiguredProductAction = true;
+          session.updatedAt = new Date().toISOString();
+          return buildUnconfiguredProductOutput(
+            entryMeta.entryConfig,
+            session,
+            matchedProduct.name || matchedProduct.optionLabel.replace(/\.$/, '')
+          );
+        }
         return {
           replyText: '',
           configInvalid: true,

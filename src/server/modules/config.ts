@@ -1403,6 +1403,9 @@ export function publishEntryMenu(
           (err as Error & { statusCode?: number }).statusCode = 400;
           throw err;
         }
+        if (!prod.flowKey) {
+          prod.flowKey = getFlowKey(directCheck);
+        }
       }
       if (prod.draftFlowVersionId) {
         const draftCheck = store.flowVersions.find((f) => f.id === prod.draftFlowVersionId);
@@ -1424,14 +1427,6 @@ export function publishEntryMenu(
     }
     if (prod.targetType === 'handoff') continue;
 
-    if (!prod.flowKey) {
-      const err = new Error(
-        `La opción activa "${prod.name}" no tiene una conversación vinculada. Vinculá una conversación publicada de este negocio, elegí "Atención humana" o dejala inactiva.`
-      );
-      (err as Error & { statusCode?: number }).statusCode = 400;
-      throw err;
-    }
-
     if (prod.flowVersionId) {
       const explicitInspection = inspectPublishedFlowTarget(store, businessId, {
         flowKey: prod.flowKey,
@@ -1446,24 +1441,52 @@ export function publishEntryMenu(
       }
       if (!explicitInspection.ok && explicitInspection.reason === 'retired') {
         const err = new Error(
-          `La opción activa "${prod.name}" apunta a una versión retirada de "${prod.flowKey}". Publicá una nueva versión antes de publicar el menú.`
+          `La opción activa "${prod.name}" apunta a una versión retirada de "${prod.flowKey ?? ''}". Publicá una nueva versión antes de publicar el menú.`
+        );
+        (err as Error & { statusCode?: number }).statusCode = 400;
+        throw err;
+      }
+      if (!explicitInspection.ok) {
+        const err = new Error(
+          `La opción activa "${prod.name}": ${explicitInspection.message ?? 'conversación destino inválida.'}`
         );
         (err as Error & { statusCode?: number }).statusCode = 400;
         throw err;
       }
     }
 
-    const inspection = inspectPublishedFlowTarget(store, businessId, {
-      flowKey: prod.flowKey,
-    });
-    if (!inspection.ok || !inspection.flow) {
+    if (prod.flowKey) {
+      const inspection = inspectPublishedFlowTarget(store, businessId, {
+        flowKey: prod.flowKey,
+      });
+      if (inspection.ok && inspection.flow) {
+        prod.flowVersionId = inspection.flow.id;
+        continue;
+      }
+      if (inspection.reason === 'retired') {
+        const err = new Error(
+          `La opción activa "${prod.name}": ${inspection.message ?? 'conversación destino retirada.'}`
+        );
+        (err as Error & { statusCode?: number }).statusCode = 400;
+        throw err;
+      }
+      if (inspection.reason !== 'unpublished') {
+        const err = new Error(
+          `La opción activa "${prod.name}": ${inspection.message ?? 'conversación destino inválida o no publicada.'}`
+        );
+        (err as Error & { statusCode?: number }).statusCode = 400;
+        throw err;
+      }
+      prod.flowVersionId = undefined;
+    }
+
+    if (!source.entryConfig.unconfiguredProductPrompt.trim()) {
       const err = new Error(
-        `La opción activa "${prod.name}": ${inspection.message ?? 'conversación destino inválida o no publicada.'}`
+        `La opción activa "${prod.name}" aún no tiene conversación publicada. Configurá el mensaje alternativo de atención humana, vinculá una conversación publicada o elegí "Atención humana".`
       );
       (err as Error & { statusCode?: number }).statusCode = 400;
       throw err;
     }
-    prod.flowVersionId = inspection.flow.id;
   }
 
   const now = new Date().toISOString();
@@ -1708,16 +1731,30 @@ export function getAssistantProductionSummary(
           inspectPublishedFlowTarget(store, businessId, { flowKey })
         : inspectPublishedFlowTarget(store, businessId, {});
 
+    const hasHumanFallbackPrompt = Boolean(biz.entryConfig?.unconfiguredProductPrompt?.trim());
+    const isUnpublishedFallbackOption =
+      !targetInspection.ok &&
+      !p.flowVersionId &&
+      (!flowKey || targetInspection.reason === 'unpublished');
+
     const destinationStatus: ProductionMenuOptionSummary['destinationStatus'] = targetInspection.ok
       ? 'valida'
       : targetInspection.reason === 'retired'
         ? 'retirada'
-        : targetInspection.reason === 'unpublished' || targetInspection.reason === 'draft'
+        : isUnpublishedFallbackOption || targetInspection.reason === 'draft'
           ? 'sin_publicar'
           : 'invalida';
 
-    if (p.active && !targetInspection.ok && targetInspection.message) {
-      validationErrors.push(`Opción «${p.optionLabel}»: ${targetInspection.message}`);
+    if (p.active && !targetInspection.ok) {
+      if (isUnpublishedFallbackOption && hasHumanFallbackPrompt) {
+        // Opción activa válida usando la alternativa configurable de atención humana
+      } else if (isUnpublishedFallbackOption && !hasHumanFallbackPrompt) {
+        validationErrors.push(
+          `Opción «${p.optionLabel}»: no tiene conversación publicada ni mensaje alternativo de atención humana.`
+        );
+      } else if (targetInspection.message) {
+        validationErrors.push(`Opción «${p.optionLabel}»: ${targetInspection.message}`);
+      }
     }
 
     return {
@@ -1729,7 +1766,11 @@ export function getAssistantProductionSummary(
       flowKey: flowKey ?? (targetInspection.flow ? getFlowKey(targetInspection.flow) : null),
       handoffLabel: null,
       destinationStatus,
-      destinationReason: targetInspection.ok ? undefined : targetInspection.message,
+      destinationReason: targetInspection.ok
+        ? undefined
+        : isUnpublishedFallbackOption && hasHumanFallbackPrompt
+          ? 'Sin conversación publicada · Usa alternativa de atención humana'
+          : targetInspection.message,
       targetFlowId: targetInspection.ok && targetInspection.flow ? targetInspection.flow.id : null,
       targetFlowName: targetInspection.flow
         ? targetInspection.flow.name.replace(/\s+v\d+$/i, '')
