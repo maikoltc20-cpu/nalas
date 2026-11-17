@@ -29,7 +29,36 @@ export interface ValidationIssue {
   severity: 'error' | 'warning';
   message: string;
   stepId?: string;
+  stepTitle?: string;
+  suggestion?: string;
   ruleId?: string;
+}
+
+const STEP_TYPE_LABELS_ES: Record<FlowStep['type'], string> = {
+  mensaje: 'Mensaje informativo',
+  texto: 'Texto libre',
+  seleccion_unica: 'Elegir una opción',
+  seleccion_multiple: 'Elegir varias opciones',
+  numero: 'Número',
+  correo: 'Correo electrónico',
+  telefono: 'Teléfono',
+  captura_contacto: 'Datos de contacto',
+  resumen: 'Resumen',
+  confirmacion: 'Confirmación',
+  derivacion_humana: 'Pasar a una persona',
+  cierre: 'Despedida',
+};
+
+function getReadableStepTitle(step: FlowStep, index?: number): string {
+  const title = step.title?.trim();
+  if (title) return title;
+  if (step.targetField?.trim()) return step.targetField.trim();
+  return index !== undefined ? `Pregunta ${index + 1}` : STEP_TYPE_LABELS_ES[step.type] ?? step.id;
+}
+
+function formatStepReference(step: FlowStep, index?: number): string {
+  const title = getReadableStepTitle(step, index);
+  return index !== undefined ? `«${title}» (pregunta ${index + 1})` : `«${title}»`;
 }
 
 export function validateFlowAndDependencies(
@@ -47,29 +76,39 @@ export function validateFlowAndDependencies(
   }
 
   const stepIds = new Set<string>();
-  for (const s of flow.steps) {
+  const stepByIdForLabels = new Map<string, { step: FlowStep; index: number }>();
+  flow.steps.forEach((s, idx) => {
+    const stepTitle = getReadableStepTitle(s, idx);
+    const stepRef = formatStepReference(s, idx);
     if (!s.id.trim()) {
       issues.push({
         code: 'MISSING_STEP_ID',
         severity: 'error',
-        message: 'Todos los pasos requieren un identificador estable.',
+        stepTitle,
+        message: `La pregunta ${idx + 1} requiere un identificador estable.`,
       });
     } else if (stepIds.has(s.id)) {
       issues.push({
         code: 'DUPLICATE_STEP_ID',
         severity: 'error',
         stepId: s.id,
-        message: `El identificador de paso "${s.id}" está duplicado.`,
+        stepTitle,
+        message: `La pregunta ${stepRef} tiene un identificador duplicado (${s.id}).`,
       });
     }
     stepIds.add(s.id);
+    if (!stepByIdForLabels.has(s.id)) {
+      stepByIdForLabels.set(s.id, { step: s, index: idx });
+    }
 
     if (!s.prompt.trim()) {
       issues.push({
         code: 'EMPTY_PROMPT',
         severity: 'error',
         stepId: s.id,
-        message: `El paso "${s.id}" no tiene texto configurado.`,
+        stepTitle,
+        suggestion: 'Escribí el mensaje que enviará el asistente en «Lo que preguntará tu asistente».',
+        message: `La pregunta ${stepRef} no tiene texto configurado. Escribí el mensaje que enviará el asistente.`,
       });
     }
 
@@ -81,14 +120,20 @@ export function validateFlowAndDependencies(
         code: 'MISSING_OPTIONS',
         severity: 'error',
         stepId: s.id,
-        message: `El paso de selección "${s.id}" requiere al menos una opción con ID estable.`,
+        stepTitle,
+        suggestion: 'Agregá al menos una opción en «Opciones de respuesta» o cambiá el tipo de respuesta.',
+        message: `La pregunta ${stepRef} es de selección y requiere al menos una opción configurada.`,
       });
     }
-  }
+  });
 
   // Validate destinations & cycles (no cycles allowed initially per Section 5)
   const adjacency = new Map<string, string[]>();
-  for (const s of flow.steps) {
+  for (let idx = 0; idx < flow.steps.length; idx++) {
+    const s = flow.steps[idx];
+    const stepTitle = getReadableStepTitle(s, idx);
+    const stepRef = formatStepReference(s, idx);
+    const typeLabel = STEP_TYPE_LABELS_ES[s.type] ?? s.type;
     const targets: string[] = [];
     if (s.nextStepId) {
       if (!stepIds.has(s.nextStepId)) {
@@ -96,7 +141,9 @@ export function validateFlowAndDependencies(
           code: 'MISSING_TARGET_STEP',
           severity: 'error',
           stepId: s.id,
-          message: `El paso "${s.id}" apunta a un destino inexistente: "${s.nextStepId}".`,
+          stepTitle,
+          suggestion: 'Elegí un destino válido en «Después sigue».',
+          message: `La pregunta ${stepRef} apunta a un destino que ya no existe. Elegí otro paso en «Después sigue».`,
         });
       } else {
         targets.push(s.nextStepId);
@@ -109,7 +156,9 @@ export function validateFlowAndDependencies(
             code: 'MISSING_OPTION_TARGET',
             severity: 'error',
             stepId: s.id,
-            message: `La opción "${opt.label}" del paso "${s.id}" apunta a un destino inexistente: "${opt.nextStepId}".`,
+            stepTitle,
+            suggestion: 'Revisá el destino de la opción afectada o elegí un paso existente.',
+            message: `La opción «${opt.label || opt.id}» de la pregunta ${stepRef} apunta a un destino que ya no existe.`,
           });
         } else {
           targets.push(opt.nextStepId);
@@ -121,11 +170,17 @@ export function validateFlowAndDependencies(
     // Dead-end check for non-terminal steps
     const isTerminal = s.type === 'cierre' || s.type === 'derivacion_humana';
     if (!isTerminal && !s.nextStepId && (!s.options || s.options.every((o) => !o.nextStepId))) {
+      const suggestion =
+        s.type === 'texto' || s.type === 'mensaje'
+          ? 'Elegí el paso siguiente en «Después sigue» o, si aquí termina la conversación, cambiá «Cómo responde el cliente» a «Despedida» (o «Pasar a una persona»).'
+          : 'Elegí el paso siguiente en «Después sigue» o cambiá «Cómo responde el cliente» a «Despedida» si aquí termina la conversación.';
       issues.push({
         code: 'DEAD_END_STEP',
         severity: 'error',
         stepId: s.id,
-        message: `El paso "${s.id}" (${s.type}) no es terminal y no tiene ruta de salida.`,
+        stepTitle,
+        suggestion,
+        message: `La pregunta ${stepRef} es de tipo «${typeLabel}» (no finaliza automáticamente la conversación) y no tiene ruta de salida. ${suggestion}`,
       });
     }
   }
@@ -144,13 +199,18 @@ export function validateFlowAndDependencies(
     visited.add(nodeId);
     return false;
   };
-  for (const s of flow.steps) {
+  for (let idx = 0; idx < flow.steps.length; idx++) {
+    const s = flow.steps[idx];
     if (hasCycle(s.id)) {
+      const stepTitle = getReadableStepTitle(s, idx);
+      const stepRef = formatStepReference(s, idx);
       issues.push({
         code: 'CYCLE_DETECTED',
         severity: 'error',
         stepId: s.id,
-        message: `Se detectó un ciclo en las transiciones involucrando el paso "${s.id}". Inicialmente no se permiten ciclos.`,
+        stepTitle,
+        suggestion: 'Revisá «Después sigue» para que ningún paso vuelva a apuntar a una pregunta anterior.',
+        message: `Se detectó un ciclo en las transiciones involucrando la pregunta ${stepRef}. Ajustá «Después sigue» para evitar ciclos.`,
       });
       break;
     }

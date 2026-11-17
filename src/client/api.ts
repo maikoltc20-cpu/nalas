@@ -164,11 +164,24 @@ async function apiFetch<T>(
   if (!res.ok) {
     const err = new Error(
       (typeof data.error === 'string' && data.error) || `Error HTTP ${res.status}`
-    ) as Error & { status?: number };
+    ) as Error & { status?: number; issues?: ClientValidationIssue[] };
     err.status = res.status;
+    if (Array.isArray(data.issues)) {
+      err.issues = data.issues as ClientValidationIssue[];
+    }
     throw err;
   }
   return data as T;
+}
+
+export interface ClientValidationIssue {
+  code?: string;
+  severity: string;
+  message: string;
+  stepId?: string;
+  stepTitle?: string;
+  suggestion?: string;
+  ruleId?: string;
 }
 
 export const nalasApi = {
@@ -297,7 +310,7 @@ export const nalasApi = {
       flowKey?: string;
     }
   ) {
-    return apiFetch<{ draft: FlowVersion; issues: Array<{ severity: string; message: string }> }>(
+    return apiFetch<{ draft: FlowVersion; issues: ClientValidationIssue[] }>(
       '/api/flows/draft',
       ctx,
       { method: 'POST', body: JSON.stringify(payload) }

@@ -2,7 +2,9 @@ import type { NalasStore } from '../../shared/types.ts';
 import {
   isPgUndefinedTableError,
   isPostgresConfigured,
+  loadFlowConfigStoreSlicePg,
   loadStoreFromPg,
+  persistFlowConfigSlicePg,
   saveStoreToPg,
   withPgClient,
 } from '../db/pgStore.ts';
@@ -306,6 +308,56 @@ export async function withStoreTransaction<T>(
   writeQueue = writeQueue.then(run, run);
   await writeQueue;
   return result;
+}
+
+export async function readFlowConfigSlice(businessId: string): Promise<NalasStore> {
+  if (!isPostgresConfigured()) {
+    return readStore();
+  }
+  return withPgClient(async (client) => {
+    try {
+      const loaded = await loadFlowConfigStoreSlicePg(client, businessId);
+      if (!loaded) {
+        throw createNotInitializedError();
+      }
+      return loaded;
+    } catch (err) {
+      if (isPgUndefinedTableError(err)) {
+        throw createNotInitializedError();
+      }
+      throw err;
+    }
+  });
+}
+
+export async function withFlowConfigTransaction<T>(
+  businessId: string,
+  fn: (store: NalasStore) => Promise<T> | T
+): Promise<T> {
+  if (!isPostgresConfigured()) {
+    return withStoreTransaction(fn);
+  }
+  return withPgClient(async (client) => {
+    try {
+      await client.query('BEGIN');
+      await client.query('SELECT pg_advisory_xact_lock($1)', [PG_ADVISORY_LOCK_ID]);
+      const current = await loadFlowConfigStoreSlicePg(client, businessId);
+      if (!current) {
+        throw createNotInitializedError();
+      }
+      const draft = structuredClone(current);
+      const result = await fn(draft);
+      await persistFlowConfigSlicePg(client, current, draft);
+      await client.query('COMMIT');
+      return result;
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      if (isPgUndefinedTableError(err)) {
+        throw createNotInitializedError();
+      }
+      throw err;
+    }
+  });
 }
 
 export function assertTenantScope<T extends { businessId: string }>(

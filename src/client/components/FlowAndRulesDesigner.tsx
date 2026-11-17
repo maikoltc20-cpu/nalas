@@ -29,7 +29,12 @@ import type {
   StepType,
 } from '../../shared/types';
 import { resolveHumanHandoffConfig } from '../../shared/humanHandoff';
-import { type ApiContext, type BootstrapResponse, nalasApi } from '../api';
+import {
+  type ApiContext,
+  type BootstrapResponse,
+  type ClientValidationIssue,
+  nalasApi,
+} from '../api';
 
 const PRIORITY_LABELS: Record<ClassificationLevel, string> = {
   alta: 'Prioridad alta',
@@ -97,6 +102,167 @@ const STEP_TYPE_LABELS: Record<StepType, string> = {
   derivacion_humana: 'Pasar a una persona',
   cierre: 'Despedida',
 };
+
+function isTerminalStepType(type: StepType): boolean {
+  return type === 'cierre' || type === 'derivacion_humana';
+}
+
+function getReadableClientStepTitle(step: FlowStep, fallbackIndex?: number): string {
+  if (step.title && step.title.trim()) return step.title.trim();
+  if (step.targetField && step.targetField.trim()) return step.targetField.trim();
+  return fallbackIndex !== undefined
+    ? `Pregunta ${fallbackIndex + 1}`
+    : STEP_TYPE_LABELS[step.type];
+}
+
+function validateClientFlowSteps(steps: FlowStep[]): ClientValidationIssue[] {
+  const issues: ClientValidationIssue[] = [];
+  if (steps.length === 0) {
+    issues.push({
+      code: 'EMPTY_FLOW',
+      severity: 'error',
+      message: 'La conversación debe tener al menos una pregunta o mensaje.',
+    });
+    return issues;
+  }
+
+  const stepIds = new Set<string>();
+  steps.forEach((s, idx) => {
+    const stepTitle = getReadableClientStepTitle(s, idx);
+    const stepRef = `«${stepTitle}» (pregunta ${idx + 1})`;
+    if (!s.id.trim()) {
+      issues.push({
+        code: 'MISSING_STEP_ID',
+        severity: 'error',
+        stepTitle,
+        message: `La pregunta ${idx + 1} requiere un identificador válido.`,
+      });
+    } else if (stepIds.has(s.id)) {
+      issues.push({
+        code: 'DUPLICATE_STEP_ID',
+        severity: 'error',
+        stepId: s.id,
+        stepTitle,
+        message: `La pregunta ${stepRef} tiene un identificador duplicado.`,
+      });
+    }
+    stepIds.add(s.id);
+
+    if (!s.prompt.trim()) {
+      issues.push({
+        code: 'EMPTY_PROMPT',
+        severity: 'error',
+        stepId: s.id,
+        stepTitle,
+        suggestion: 'Escribí el mensaje que enviará el asistente.',
+        message: `La pregunta ${stepRef} no tiene texto configurado. Escribí lo que preguntará tu asistente.`,
+      });
+    }
+
+    if (
+      (s.type === 'seleccion_unica' || s.type === 'seleccion_multiple') &&
+      (!s.options || s.options.length === 0)
+    ) {
+      issues.push({
+        code: 'MISSING_OPTIONS',
+        severity: 'error',
+        stepId: s.id,
+        stepTitle,
+        suggestion: 'Agregá al menos una opción en «Opciones de respuesta».',
+        message: `La pregunta ${stepRef} es de selección y necesita al menos una opción.`,
+      });
+    }
+  });
+
+  const adjacency = new Map<string, string[]>();
+  for (let idx = 0; idx < steps.length; idx++) {
+    const s = steps[idx];
+    const stepTitle = getReadableClientStepTitle(s, idx);
+    const stepRef = `«${stepTitle}» (pregunta ${idx + 1})`;
+    const targets: string[] = [];
+
+    if (s.nextStepId) {
+      if (!stepIds.has(s.nextStepId)) {
+        issues.push({
+          code: 'MISSING_TARGET_STEP',
+          severity: 'error',
+          stepId: s.id,
+          stepTitle,
+          suggestion: 'Elegí otro paso en «Después sigue».',
+          message: `La pregunta ${stepRef} apunta a un destino que ya no existe. Elegí otro paso en «Después sigue».`,
+        });
+      } else {
+        targets.push(s.nextStepId);
+      }
+    }
+
+    for (const opt of s.options ?? []) {
+      if (opt.nextStepId) {
+        if (!stepIds.has(opt.nextStepId)) {
+          issues.push({
+            code: 'MISSING_OPTION_TARGET',
+            severity: 'error',
+            stepId: s.id,
+            stepTitle,
+            suggestion: 'Revisá el destino de la opción afectada.',
+            message: `La opción «${opt.label || opt.id}» de la pregunta ${stepRef} apunta a un destino que ya no existe.`,
+          });
+        } else {
+          targets.push(opt.nextStepId);
+        }
+      }
+    }
+
+    adjacency.set(s.id, targets);
+
+    const hasOptionTargets = Boolean(s.options && s.options.some((o) => Boolean(o.nextStepId)));
+    if (!isTerminalStepType(s.type) && !s.nextStepId && !hasOptionTargets) {
+      const suggestion =
+        s.type === 'texto' || s.type === 'mensaje'
+          ? 'Elegí el paso siguiente en «Después sigue» o, si aquí termina la conversación, cambiá «Cómo responde el cliente» a «Despedida» (o «Pasar a una persona»).'
+          : 'Elegí el paso siguiente en «Después sigue» o cambiá «Cómo responde el cliente» a «Despedida» si aquí termina la conversación.';
+      issues.push({
+        code: 'DEAD_END_STEP',
+        severity: 'error',
+        stepId: s.id,
+        stepTitle,
+        suggestion,
+        message: `La pregunta ${stepRef} es de tipo «${STEP_TYPE_LABELS[s.type]}» (no finaliza automáticamente la conversación) y no tiene ruta de salida. ${suggestion}`,
+      });
+    }
+  }
+
+  const visiting = new Set<string>();
+  const visited = new Set<string>();
+  const hasCycle = (nodeId: string): boolean => {
+    if (visiting.has(nodeId)) return true;
+    if (visited.has(nodeId)) return false;
+    visiting.add(nodeId);
+    for (const nextId of adjacency.get(nodeId) ?? []) {
+      if (hasCycle(nextId)) return true;
+    }
+    visiting.delete(nodeId);
+    visited.add(nodeId);
+    return false;
+  };
+  for (let idx = 0; idx < steps.length; idx++) {
+    const s = steps[idx];
+    if (hasCycle(s.id)) {
+      const stepTitle = getReadableClientStepTitle(s, idx);
+      issues.push({
+        code: 'CYCLE_DETECTED',
+        severity: 'error',
+        stepId: s.id,
+        stepTitle,
+        suggestion: 'Revisá «Después sigue» para evitar ciclos entre preguntas.',
+        message: `Se detectó un ciclo involucrando la pregunta «${stepTitle}» (pregunta ${idx + 1}).`,
+      });
+      break;
+    }
+  }
+
+  return issues;
+}
 
 const OPERATOR_LABELS: Record<RuleOperator, string> = {
   eq: 'Es igual a',
@@ -251,9 +417,9 @@ export function FlowAndRulesDesigner({
   );
   const [draftDirty, setDraftDirty] = useState(false);
   const [selectedStepId, setSelectedStepId] = useState<string>(steps[0]?.id ?? '');
-  const [validationMessages, setValidationMessages] = useState<
-    Array<{ severity: string; message: string }>
-  >([]);
+  const [validationMessages, setValidationMessages] = useState<ClientValidationIssue[]>([]);
+  const [publishModalError, setPublishModalError] = useState<string | null>(null);
+  const [publishModalIssues, setPublishModalIssues] = useState<ClientValidationIssue[]>([]);
   const [busy, setBusy] = useState(false);
 
   // Estado de Saludo y menú de entrada (borrador vs publicado)
@@ -321,6 +487,8 @@ export function FlowAndRulesDesigner({
     setShowNewConvForm(false);
     setNewConvName('');
     setPublishConfirmModal(null);
+    setPublishModalError(null);
+    setPublishModalIssues([]);
     setRetireTargetFlow(null);
     setRetireReason('');
     void reloadProductionSummary();
@@ -410,12 +578,16 @@ export function FlowAndRulesDesigner({
     };
 
     const resumenIdx = steps.findIndex((s) => s.type === 'resumen');
+    const terminalIdx = steps.findIndex((s) => isTerminalStepType(s.type));
+    const insertBeforeIdx =
+      resumenIdx > 0 ? resumenIdx : terminalIdx > 0 ? terminalIdx : -1;
     const updated = structuredClone(steps);
-    if (resumenIdx > 0) {
-      const prev = updated[resumenIdx - 1];
-      newStep.nextStepId = prev.nextStepId;
+    if (insertBeforeIdx > 0) {
+      const prev = updated[insertBeforeIdx - 1];
+      const targetAfter = updated[insertBeforeIdx];
+      newStep.nextStepId = prev.nextStepId ?? targetAfter.id;
       prev.nextStepId = newId;
-      updated.splice(resumenIdx, 0, newStep);
+      updated.splice(insertBeforeIdx, 0, newStep);
     } else {
       if (updated.length > 0) {
         updated[updated.length - 1].nextStepId = newId;
@@ -488,6 +660,8 @@ export function FlowAndRulesDesigner({
     setSelectedFlowKey(nextKey);
     setDraftDirty(false);
     setValidationMessages([]);
+    setPublishModalError(null);
+    setPublishModalIssues([]);
     const grp = flowGroups.find((g) => g.flowKey === nextKey);
     const fv = grp?.draft ?? grp?.latestPublished;
     if (fv) {
@@ -840,16 +1014,33 @@ export function FlowAndRulesDesigner({
 
   async function handleConfirmPublishFlow() {
     setBusy(true);
+    setPublishModalError(null);
+    setPublishModalIssues([]);
     try {
-      await nalasApi.saveFlowDraft(ctx, {
-        steps,
-        outOfScriptRules: oosRules,
-        humanHandoffConfig,
-        name: flowName.trim() || draftFlow?.name,
-        flowKey: effectiveFlowKey,
-      });
+      if (draftDirty || !activeGroup?.draft) {
+        const draftRes = await nalasApi.saveFlowDraft(ctx, {
+          steps,
+          outOfScriptRules: oosRules,
+          humanHandoffConfig,
+          name: flowName.trim() || draftFlow?.name,
+          flowKey: effectiveFlowKey,
+        });
+        setDraftDirty(false);
+        if (draftRes.issues.some((i) => i.severity === 'error')) {
+          setValidationMessages(draftRes.issues);
+          setPublishModalIssues(draftRes.issues);
+          setPublishModalError(
+            draftRes.issues
+              .filter((i) => i.severity === 'error')
+              .map((i) => i.message)
+              .join(' | ')
+          );
+          return;
+        }
+      }
+
       const res = await nalasApi.publishFlow(ctx, effectiveFlowKey);
-      const verified = await nalasApi.getProductionSummary(ctx);
+      const verified = res.verifiedSummary ?? (await nalasApi.getProductionSummary(ctx));
       const verifiedConv = verified.conversations.find((c) => c.flowKey === effectiveFlowKey);
       if (
         !verifiedConv?.latestPublished ||
@@ -862,14 +1053,23 @@ export function FlowAndRulesDesigner({
       setProductionSummary(verified);
       setDraftDirty(false);
       setValidationMessages([]);
+      setPublishModalError(null);
+      setPublishModalIssues([]);
       setPublishConfirmModal(null);
       await onRefresh();
       onNotice(
         `Conversación «${res.published.name}» publicada y verificada (v${res.published.versionNumber}) para nuevas personas. Los chats ya iniciados conservan su versión.`
       );
     } catch (e) {
+      const errWithIssues = e as Error & { issues?: ClientValidationIssue[] };
       const msg = e instanceof Error ? e.message : 'No se pudo publicar la conversación.';
-      setValidationMessages([{ severity: 'error', message: msg }]);
+      const issues =
+        Array.isArray(errWithIssues?.issues) && errWithIssues.issues.length > 0
+          ? errWithIssues.issues
+          : [{ severity: 'error', message: msg }];
+      setValidationMessages(issues);
+      setPublishModalIssues(issues);
+      setPublishModalError(msg);
       onError(msg);
     } finally {
       setBusy(false);
@@ -1919,16 +2119,27 @@ export function FlowAndRulesDesigner({
           </section>
 
           {validationMessages.length > 0 && (
-            <div className="bg-[#FFF0E3] border border-[#F2D7BF] rounded-[12px] p-4 space-y-1">
+            <div className="bg-[#FFF0E3] border border-[#F2D7BF] rounded-[12px] p-4 space-y-2">
               <div className="text-sm font-semibold text-[#8C542C]">
                 Revisá estos puntos en tu conversación
               </div>
               {validationMessages.map((m, idx) => (
                 <div
                   key={idx}
-                  className={`text-sm ${m.severity === 'error' ? 'text-red-700 font-medium' : 'text-[#8C542C]'}`}
+                  className={`flex flex-wrap items-center justify-between gap-2 text-sm ${
+                    m.severity === 'error' ? 'text-red-700 font-medium' : 'text-[#8C542C]'
+                  }`}
                 >
-                  • {m.message}
+                  <span>• {m.message}</span>
+                  {m.stepId && steps.some((s) => s.id === m.stepId) && (
+                    <button
+                      type="button"
+                      onClick={() => setSelectedStepId(m.stepId!)}
+                      className="text-xs font-semibold text-[#116B70] underline hover:no-underline shrink-0"
+                    >
+                      Ir a la pregunta
+                    </button>
+                  )}
                 </div>
               ))}
             </div>
@@ -1948,6 +2159,9 @@ export function FlowAndRulesDesigner({
                 {steps.map((step, index) => {
                   const isSelected = step.id === selectedStepId;
                   const readableTitle = getStepTitle(step, index);
+                  const stepHasBlocker = validateClientFlowSteps(steps).some(
+                    (issue) => issue.severity === 'error' && issue.stepId === step.id
+                  );
                   return (
                     <div
                       key={step.id}
@@ -1960,8 +2174,15 @@ export function FlowAndRulesDesigner({
                     >
                       <div className="flex items-start justify-between gap-2">
                         <div className="min-w-0">
-                          <div className="text-sm font-semibold text-[#25364A]">
-                            {String(index + 1).padStart(2, '0')} · {readableTitle}
+                          <div className="text-sm font-semibold text-[#25364A] flex items-center gap-1.5 flex-wrap">
+                            <span>
+                              {String(index + 1).padStart(2, '0')} · {readableTitle}
+                            </span>
+                            {stepHasBlocker && (
+                              <span className="inline-flex items-center px-1.5 py-0.5 text-[10px] font-semibold bg-amber-100 text-amber-800 rounded">
+                                Falta completar
+                              </span>
+                            )}
                           </div>
                           <div className="text-xs text-[#5A6877] mt-0.5 line-clamp-2">
                             {step.prompt}
@@ -2049,9 +2270,18 @@ export function FlowAndRulesDesigner({
                       </label>
                       <select
                         value={selectedStep.type}
-                        onChange={(e) =>
-                          updateStep(selectedStep.id, { type: e.target.value as StepType })
-                        }
+                        onChange={(e) => {
+                          const nextType = e.target.value as StepType;
+                          if (isTerminalStepType(nextType)) {
+                            updateStep(selectedStep.id, {
+                              type: nextType,
+                              nextStepId: null,
+                              required: false,
+                            });
+                          } else {
+                            updateStep(selectedStep.id, { type: nextType });
+                          }
+                        }}
                         className="w-full min-h-[44px] text-[15px] border border-[#DCE3E8] rounded-[9px] px-3.5 py-2.5 bg-white"
                       >
                         {Object.entries(STEP_TYPE_LABELS).map(([k, label]) => (
@@ -2251,40 +2481,90 @@ export function FlowAndRulesDesigner({
                     </div>
                   )}
 
-                  <div className="border-t border-[#EDF0F2] pt-4 flex flex-wrap items-center justify-between gap-4">
-                    <label className="inline-flex items-center gap-2.5 text-sm text-[#25364A] cursor-pointer min-h-[40px]">
-                      <input
-                        type="checkbox"
-                        checked={selectedStep.required}
-                        onChange={(e) =>
-                          updateStep(selectedStep.id, { required: e.target.checked })
-                        }
-                        className="w-4 h-4 accent-[#167D83]"
-                      />
-                      <span>Respuesta obligatoria</span>
-                    </label>
+                  <div className="border-t border-[#EDF0F2] pt-4 space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-4">
+                      {isTerminalStepType(selectedStep.type) ? (
+                        <div className="text-xs text-[#116B70] bg-[#EAF5F2] border border-[#D4EAE4] rounded-[8px] px-3 py-2">
+                          Este paso es de tipo <strong>{STEP_TYPE_LABELS[selectedStep.type]}</strong>: envía el mensaje y finaliza la conversación automáticamente.
+                        </div>
+                      ) : (
+                        <label className="inline-flex items-center gap-2.5 text-sm text-[#25364A] cursor-pointer min-h-[40px]">
+                          <input
+                            type="checkbox"
+                            checked={selectedStep.required}
+                            onChange={(e) =>
+                              updateStep(selectedStep.id, { required: e.target.checked })
+                            }
+                            className="w-4 h-4 accent-[#167D83]"
+                          />
+                          <span>Respuesta obligatoria</span>
+                        </label>
+                      )}
 
-                    <div className="flex items-center gap-2">
-                      <label className="text-sm text-[#5A6877]">Después sigue:</label>
-                      <select
-                        value={selectedStep.nextStepId ?? ''}
-                        onChange={(e) =>
-                          updateStep(selectedStep.id, {
-                            nextStepId: e.target.value ? e.target.value : null,
-                          })
-                        }
-                        className="text-sm border border-[#DCE3E8] rounded-[9px] px-3 py-2 min-h-[40px] bg-white"
-                      >
-                        <option value="">Finalizar conversación</option>
-                        {steps
-                          .filter((s) => s.id !== selectedStep.id)
-                          .map((s, i) => (
-                            <option key={s.id} value={s.id}>
-                              {getStepTitle(s, i)}
+                      <div className="flex items-center gap-2">
+                        <label className="text-sm text-[#5A6877]">Después sigue:</label>
+                        {isTerminalStepType(selectedStep.type) ? (
+                          <select
+                            disabled
+                            value=""
+                            aria-label="Destino del paso terminal"
+                            className="text-sm border border-[#DCE3E8] rounded-[9px] px-3 py-2 min-h-[40px] bg-[#F7F8FA] text-[#5A6877]"
+                          >
+                            <option value="">Finalizar conversación (paso terminal)</option>
+                          </select>
+                        ) : (
+                          <select
+                            value={selectedStep.nextStepId ?? ''}
+                            onChange={(e) =>
+                              updateStep(selectedStep.id, {
+                                nextStepId: e.target.value ? e.target.value : null,
+                              })
+                            }
+                            className="text-sm border border-[#DCE3E8] rounded-[9px] px-3 py-2 min-h-[40px] bg-white"
+                          >
+                            <option value="">
+                              {(selectedStep.options ?? []).some((o) => Boolean(o.nextStepId))
+                                ? 'Según destino de cada opción'
+                                : 'Sin paso siguiente (elegí destino)'}
                             </option>
-                          ))}
-                      </select>
+                            {steps
+                              .filter((s) => s.id !== selectedStep.id)
+                              .map((s, i) => (
+                                <option key={s.id} value={s.id}>
+                                  {getStepTitle(s, i)}
+                                </option>
+                              ))}
+                          </select>
+                        )}
+                      </div>
                     </div>
+
+                    {!isTerminalStepType(selectedStep.type) &&
+                      !selectedStep.nextStepId &&
+                      !(selectedStep.options ?? []).some((o) => Boolean(o.nextStepId)) && (
+                        <div className="p-3 bg-[#FFF0E3] border border-[#F2D7BF] rounded-[10px] text-xs text-[#8C542C] flex flex-wrap items-center justify-between gap-2.5">
+                          <div>
+                            <strong>Falta definir cómo continúa o cierra este paso:</strong> «
+                            {getStepTitle(selectedStep, selectedStepIndex)}» es de tipo{' '}
+                            <strong>{STEP_TYPE_LABELS[selectedStep.type]}</strong> y espera una
+                            respuesta del cliente, pero no tiene un paso siguiente asignado.
+                            Desmarcar «Respuesta obligatoria» no convierte el paso en cierre.
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              updateStep(selectedStep.id, {
+                                type: 'cierre',
+                                nextStepId: null,
+                                required: false,
+                              })
+                            }
+                            className="px-3 py-1.5 text-xs font-semibold text-white bg-[#167D83] rounded-[8px] hover:bg-[#116B70] shrink-0"
+                          >
+                            Cambiar a «Despedida» (finalizar aquí)
+                          </button>
+                        </div>
+                      )}
                   </div>
 
                   <div className="border-t border-[#EDF0F2] pt-4 flex flex-wrap items-center justify-between gap-3">
@@ -2299,7 +2579,11 @@ export function FlowAndRulesDesigner({
                     <button
                       type="button"
                       disabled={busy}
-                      onClick={() => setPublishConfirmModal('flow')}
+                      onClick={() => {
+                        setPublishModalError(null);
+                        setPublishModalIssues([]);
+                        setPublishConfirmModal('flow');
+                      }}
                       className="min-h-[44px] px-5 py-2 text-sm font-semibold text-white bg-[#167D83] rounded-[10px] hover:bg-[#116B70]"
                     >
                       Publicar conversación
@@ -3370,9 +3654,21 @@ export function FlowAndRulesDesigner({
         const linkedMenuOptions = (business.products ?? []).filter(
           (p) => p.active && p.targetType !== 'handoff' && resolveProductFlowKey(p) === effectiveFlowKey
         );
+        const clientStepErrors = validateClientFlowSteps(steps).filter(
+          (i) => i.severity === 'error'
+        );
+        const displayedIssues =
+          publishModalIssues.filter((i) => i.severity === 'error').length > 0
+            ? publishModalIssues.filter((i) => i.severity === 'error')
+            : clientStepErrors;
+        const closeFlowModal = () => {
+          setPublishModalError(null);
+          setPublishModalIssues([]);
+          setPublishConfirmModal(null);
+        };
         return (
           <div className="fixed inset-0 z-50 bg-[#1B2531]/45 flex items-center justify-center p-4">
-            <div className="bg-white border border-[#E2E7EB] rounded-[14px] max-w-xl w-full p-6 space-y-4">
+            <div className="bg-white border border-[#E2E7EB] rounded-[14px] max-w-xl w-full p-6 space-y-4 max-h-[90vh] overflow-y-auto">
               <div className="flex items-start justify-between gap-3">
                 <div>
                   <h3 className="text-lg font-semibold text-[#25364A]">
@@ -3384,7 +3680,8 @@ export function FlowAndRulesDesigner({
                 </div>
                 <button
                   type="button"
-                  onClick={() => setPublishConfirmModal(null)}
+                  disabled={busy}
+                  onClick={closeFlowModal}
                   className="p-1.5 text-[#5A6877] hover:text-[#25364A]"
                 >
                   <X className="w-5 h-5" />
@@ -3414,7 +3711,7 @@ export function FlowAndRulesDesigner({
                   <span className="font-semibold text-[#25364A]">Opciones del menú vinculadas:</span>{' '}
                   {linkedMenuOptions.length > 0
                     ? linkedMenuOptions.map((o) => o.optionLabel || o.name).join(', ')
-                    : 'Ninguna opción activa del menú publicado apunta hoy a esta conversación'}
+                    : 'Ninguna opción activa del menú publicado apunta hoy a esta conversación (podés vincularla luego en «Saludo y menú»)'}
                 </div>
               </div>
 
@@ -3422,18 +3719,58 @@ export function FlowAndRulesDesigner({
                 <strong>Alcance:</strong> v{nextVersionNumber} aplicará a chats nuevos. Los chats abiertos en curso conservarán su versión fijada hasta que alguien los reinicie desde Atención.
               </div>
 
+              {(displayedIssues.length > 0 || publishModalError) && (
+                <div className="p-3.5 bg-red-50 border border-red-200 rounded-[10px] text-xs text-red-900 space-y-2">
+                  <div className="font-semibold">
+                    Publicación bloqueada — corregí estos puntos antes de publicar:
+                  </div>
+                  {displayedIssues.length > 0 ? (
+                    <div className="space-y-2">
+                      {displayedIssues.map((issue, idx) => (
+                        <div
+                          key={`${issue.code ?? 'err'}_${issue.stepId ?? idx}`}
+                          className="p-2.5 bg-white border border-red-200 rounded-[8px] space-y-1.5"
+                        >
+                          {issue.stepTitle && (
+                            <div className="font-semibold text-[#25364A]">
+                              Pregunta afectada: {issue.stepTitle}
+                            </div>
+                          )}
+                          <div className="text-red-800">{issue.message}</div>
+                          {issue.stepId && steps.some((s) => s.id === issue.stepId) && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const targetId = issue.stepId!;
+                                closeFlowModal();
+                                setSelectedStepId(targetId);
+                              }}
+                              className="inline-flex items-center px-2.5 py-1 text-[11px] font-semibold text-[#116B70] bg-[#EAF5F2] border border-[#D4EAE4] rounded-[6px] hover:bg-[#DCEFE9]"
+                            >
+                              Ir a editar esta pregunta
+                            </button>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="text-red-800">{publishModalError}</div>
+                  )}
+                </div>
+              )}
+
               <div className="flex flex-wrap justify-end gap-2.5 pt-2">
                 <button
                   type="button"
                   disabled={busy}
-                  onClick={() => setPublishConfirmModal(null)}
+                  onClick={closeFlowModal}
                   className="min-h-[42px] px-4 py-2 text-sm font-medium text-[#25364A] bg-white border border-[#DCE3E8] rounded-[9px] hover:bg-[#F7F8FA]"
                 >
                   Cancelar
                 </button>
                 <button
                   type="button"
-                  disabled={busy || steps.length === 0}
+                  disabled={busy || steps.length === 0 || clientStepErrors.length > 0}
                   onClick={handleConfirmPublishFlow}
                   className="inline-flex items-center gap-1.5 min-h-[42px] px-4 py-2 text-sm font-semibold text-white bg-[#167D83] rounded-[9px] hover:bg-[#116B70] disabled:opacity-45"
                 >

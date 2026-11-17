@@ -127,8 +127,10 @@ import {
   assertTenantScope,
   createBackupSnapshot,
   getStorageBackendInfo,
+  readFlowConfigSlice,
   readStore,
   restoreBackupSnapshot,
+  withFlowConfigTransaction,
   withStoreTransaction,
 } from './modules/persistence.ts';
 import { getEnv, getRequestId, isWorkerRuntime } from './runtimeContext.ts';
@@ -1133,7 +1135,7 @@ webApp.post('/api/flows/conversations', async (c) => {
       name?: string;
       flowKey?: string;
     };
-    const created = await withStoreTransaction((store) => {
+    const created = await withFlowConfigTransaction(businessId, (store) => {
       const ctx = resolveActorContext(store, userId, businessId);
       assertPermission(ctx, 'editFlows');
       return createFlowConversation(store, businessId, userId, {
@@ -1157,7 +1159,7 @@ webApp.post('/api/flows/draft', async (c) => {
       humanHandoffConfig?: Partial<HumanHandoffConfig>;
       flowKey?: string;
     };
-    const result = await withStoreTransaction((store) => {
+    const result = await withFlowConfigTransaction(businessId, (store) => {
       const ctx = resolveActorContext(store, userId, businessId);
       assertPermission(ctx, 'editFlows');
       const draft = saveFlowDraft(
@@ -1281,7 +1283,7 @@ async function buildRuntimeProductionSummaryInput(
 webApp.get('/api/assistant/production-summary', async (c) => {
   try {
     const { userId, businessId } = getActorContext(c);
-    const store = await readStore();
+    const store = await readFlowConfigSlice(businessId);
     resolveActorContext(store, userId, businessId);
     const runtimeInput = await buildRuntimeProductionSummaryInput(
       store,
@@ -1299,7 +1301,7 @@ webApp.post('/api/flows/publish', async (c) => {
   try {
     const { userId, businessId } = getActorContext(c);
     const body = (await c.req.json().catch(() => ({}))) as { flowKey?: string };
-    const result = await withStoreTransaction((store) => {
+    const result = await withFlowConfigTransaction(businessId, (store) => {
       const ctx = resolveActorContext(store, userId, businessId);
       assertPermission(ctx, 'activateVersions');
       return publishFlowDraft(
@@ -1309,7 +1311,7 @@ webApp.post('/api/flows/publish', async (c) => {
         typeof body.flowKey === 'string' ? body.flowKey : undefined
       );
     });
-    const verifiedStore = await readStore();
+    const verifiedStore = await readFlowConfigSlice(businessId);
     const persisted = verifiedStore.flowVersions.find(
       (f) => f.id === result.published.id && f.businessId === businessId && f.status === 'publicada'
     );
@@ -1339,7 +1341,7 @@ webApp.post('/api/entry-menu/draft', async (c) => {
       entryConfig: BusinessEntryConfig;
       products: BusinessProduct[];
     };
-    const entryDraft = await withStoreTransaction((store) => {
+    const entryDraft = await withFlowConfigTransaction(businessId, (store) => {
       const ctx = resolveActorContext(store, userId, businessId);
       assertPermission(ctx, 'editFlows');
       return saveEntryMenuDraft(store, businessId, userId, {
@@ -1360,7 +1362,7 @@ webApp.post('/api/entry-menu/publish', async (c) => {
       entryConfig?: BusinessEntryConfig;
       products?: BusinessProduct[];
     };
-    const updated = await withStoreTransaction((store) => {
+    const updated = await withFlowConfigTransaction(businessId, (store) => {
       const ctx = resolveActorContext(store, userId, businessId);
       assertPermission(ctx, 'activateVersions');
       return publishEntryMenu(
@@ -1372,7 +1374,7 @@ webApp.post('/api/entry-menu/publish', async (c) => {
           : undefined
       );
     });
-    const verifiedStore = await readStore();
+    const verifiedStore = await readFlowConfigSlice(businessId);
     const persistedBiz = verifiedStore.businesses.find((b) => b.id === businessId);
     if (
       !persistedBiz ||
