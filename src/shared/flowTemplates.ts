@@ -31,6 +31,7 @@ export interface AmbiguousTemplateReference {
   locationType:
     | 'stepPrompt'
     | 'stepCorrection'
+    | 'summaryTemplate'
     | 'summaryIntro'
     | 'closureTemplate'
     | 'alreadyRegisteredTemplate'
@@ -128,6 +129,23 @@ const NON_ANSWERABLE_STEP_TYPES = new Set<StepType>([
 
 export function isAnswerableSummaryStep(step: FlowStep): boolean {
   return !NON_ANSWERABLE_STEP_TYPES.has(step.type);
+}
+
+const GENERIC_RESUMEN_PLACEHOLDERS = new Set([
+  'resumen',
+  'resumen de datos',
+  'resumen previo a confirmar',
+  'verifica tu resumen antes de confirmar',
+  'revisa tus datos',
+  'revisa tus respuestas antes de confirmar',
+]);
+
+export function isPersonalizedResumenPrompt(prompt?: string | null): boolean {
+  const trimmed = (prompt ?? '').trim();
+  if (!trimmed) return false;
+  if (extractTemplateVariables(trimmed).length > 0) return true;
+  const normalized = foldPlainLower(trimmed).replace(/[:.]+$/, '').trim();
+  return !GENERIC_RESUMEN_PLACEHOLDERS.has(normalized);
 }
 
 export function getReadableFlowStepTitle(step: FlowStep, index?: number): string {
@@ -836,33 +854,6 @@ function findCandidateStepMatchesForToken(
   return [];
 }
 
-function isBrokenManualSummaryPrompt(text: string): boolean {
-  const vars = extractTemplateVariables(text);
-  if (vars.length >= 2 && (/resumen/i.test(text) || /^[\s•\-*]+.*\{\{/m.test(text))) {
-    return true;
-  }
-  return false;
-}
-
-function stripManualSummaryBlockFromConfirmPrompt(prompt: string): string {
-  const lines = prompt.split('\n');
-  const kept = lines.filter((line) => {
-    const trimmed = line.trim();
-    if (/^[•\-*]\s*.*\{\{[a-zA-Z0-9_]+\}\}/.test(trimmed)) return false;
-    const folded = foldPlainLower(trimmed);
-    if (
-      /^(resumen|resumen de tu solicitud|revisa tus (datos|respuestas)( antes de confirmar)?)[:\s]*$/i.test(
-        folded
-      )
-    ) {
-      return false;
-    }
-    return true;
-  });
-  const joined = kept.join('\n').replace(/\n{3,}/g, '\n\n').trim();
-  return joined || '¿Confirmás que registremos tu solicitud con estos datos?';
-}
-
 function classifyConfirmationActionLabel(
   rawLabel: string,
   rawId?: string
@@ -917,15 +908,6 @@ function isIncoherentActionStep(
     .filter((r): r is NonNullable<typeof r> => r !== null);
   if (roles.includes('confirmar_si') || roles.includes('confirmar_corregir')) {
     return true;
-  }
-  if (step.type === 'texto' && isBrokenManualSummaryPrompt(step.prompt)) {
-    return true;
-  }
-  if (step.type === 'texto') {
-    const fp = foldPlainLower(step.prompt ?? '');
-    if (fp.includes('registrar solicitud') && (fp.includes('corregir') || fp.includes('elegi'))) {
-      return true;
-    }
   }
   if (idx !== undefined && allSteps) {
     const resumenIdx = allSteps.findIndex((s) => s.type === 'resumen');
@@ -987,54 +969,22 @@ export function repairExistingFlowDraft(sourceFlow: FlowVersion): FlowDraftRepai
       summaryNotes,
     };
   }
-  const preserveValidOptingTemplates = isOptingFlow && flow.businessId === 'biz_nexo';
-
-  // 1. Replace broken manual summaryTemplate or manual summary message blocks with automatic summary
-  if (flow.summaryTemplate !== undefined) {
-    const vars = extractTemplateVariables(flow.summaryTemplate);
-    const { allStepKeys, hasCanalContacto, hasContextBuilder } = buildAllKnownVariableKeys(flow.steps);
-    const hasBrokenVar = vars.some((v) => {
-      if (allStepKeys.has(v)) return false;
-      if ((v === 'etiqueta_dato_contacto' || v === 'canal_contacto_texto') && hasCanalContacto) {
-        return false;
-      }
-      if (v === 'contexto' && hasContextBuilder) return false;
-      return true;
-    });
-    if (hasBrokenVar || (!preserveValidOptingTemplates && !flow.summaryConfig)) {
-      flow.summaryTemplate = undefined;
-      replacedManualSummary = true;
-      summaryNotes.push(
-        'Se sustituyó la plantilla manual de resumen por el resumen automático de preguntas respondidas.'
-      );
-    }
-  }
-
-  const confirmStepIdx = flow.steps.findIndex((s) => s.type === 'confirmacion');
   const cierreStep = flow.steps.find((s) => s.type === 'cierre');
+  let cleanedConditionalOverrides = false;
 
-  // Convert a manual summary 'mensaje' step into automatic 'resumen' without adding duplicate steps
-  flow.steps.forEach((step, idx) => {
+  // Clean hidden per-channel prompt overrides on editable drafts while preserving validation config
+  flow.steps.forEach((step) => {
     if (
-      step.type === 'mensaje' &&
-      (isBrokenManualSummaryPrompt(step.prompt) ||
-        (/^resumen/i.test(stripLeadingStepNumber(step.title ?? '')) &&
-          confirmStepIdx >= 0 &&
-          idx < confirmStepIdx))
+      step.prompt?.trim() &&
+      step.conditionalPrompts &&
+      (step.conditionalPrompts.whatsapp || step.conditionalPrompts.email)
     ) {
-      step.type = 'resumen';
-      step.prompt = 'Resumen previo a confirmar:';
-      replacedManualSummary = true;
-      summaryNotes.push(
-        `El paso «${getReadableFlowStepTitle(step, idx)}» pasó a usar resumen automático.`
-      );
-    }
-    if (step.type === 'confirmacion' && isBrokenManualSummaryPrompt(step.prompt)) {
-      step.prompt = stripManualSummaryBlockFromConfirmPrompt(step.prompt);
-      replacedManualSummary = true;
-      summaryNotes.push(
-        'Se limpió el bloque manual de resumen dentro de Confirmación para usar el resumen automático.'
-      );
+      delete step.conditionalPrompts.whatsapp;
+      delete step.conditionalPrompts.email;
+      if (Object.keys(step.conditionalPrompts).length === 0) {
+        delete step.conditionalPrompts;
+      }
+      cleanedConditionalOverrides = true;
     }
   });
 
@@ -1146,7 +1096,6 @@ export function repairExistingFlowDraft(sourceFlow: FlowVersion): FlowDraftRepai
       if (!primaryInc.title?.trim() || /^pregunta\s*\d+$/i.test(primaryInc.title.trim())) {
         primaryInc.title = 'Confirmación';
       }
-      primaryInc.prompt = stripManualSummaryBlockFromConfirmPrompt(primaryInc.prompt);
       primaryInc.required = true;
       primaryInc.options = buildExplicitConfirmOptionsFromItems(rawActionItems);
       primaryInc.quickReplies = undefined;
@@ -1261,10 +1210,17 @@ export function repairExistingFlowDraft(sourceFlow: FlowVersion): FlowDraftRepai
     }
   }
 
-  // 2. Unify closureTemplate into existing cierre step without duplicating
-  if (!preserveValidOptingTemplates && cierreStep && flow.closureTemplate?.trim()) {
-    cierreStep.prompt = flow.closureTemplate;
+  // 2. Unify closure into existing cierre step without silently overwriting customized visible Despedida
+  if (cierreStep && (flow.closureTemplate?.trim() || flow.referenceTemplate?.trim())) {
+    const visiblePrompt = cierreStep.prompt?.trim() ?? '';
+    if (!visiblePrompt || visiblePrompt === 'Cierre base') {
+      if (flow.closureTemplate?.trim()) {
+        cierreStep.prompt = flow.closureTemplate;
+      }
+    }
     flow.closureTemplate = undefined;
+    flow.referenceTemplate = undefined;
+    flow.closureUsesInlineReference = true;
     if (flow.hideInternalCategorizationInClosure === undefined) {
       flow.hideInternalCategorizationInClosure = true;
     }
@@ -1346,6 +1302,14 @@ export function repairExistingFlowDraft(sourceFlow: FlowVersion): FlowDraftRepai
     }
   });
 
+  if (flow.summaryTemplate) {
+    flow.summaryTemplate = repairString({
+      text: flow.summaryTemplate,
+      locationType: 'summaryTemplate',
+      contextLabel: 'Plantilla de resumen',
+      allowReference: false,
+    });
+  }
   if (flow.summaryConfig?.introPrompt) {
     flow.summaryConfig.introPrompt = repairString({
       text: flow.summaryConfig.introPrompt,
@@ -1391,7 +1355,8 @@ export function repairExistingFlowDraft(sourceFlow: FlowVersion): FlowDraftRepai
       repairedCount > 0 ||
       replacedManualSummary ||
       unifiedClosureIntoCierreStep ||
-      repairedIncoherentActionStep,
+      repairedIncoherentActionStep ||
+      cleanedConditionalOverrides,
     repairedCount,
     replacedManualSummary,
     unifiedClosureIntoCierreStep,

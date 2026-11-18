@@ -324,7 +324,7 @@ test('Reparación y ejecución de Pregunta 11 incoherente (sin confirmacion prev
         id: 'step_resumen',
         title: 'Resumen',
         type: 'resumen',
-        prompt: 'Resumen manual viejo',
+        prompt: 'Resumen de datos:',
         required: false,
         nextStepId: 'step_p11',
       },
@@ -362,7 +362,10 @@ test('Reparación y ejecución de Pregunta 11 incoherente (sin confirmacion prev
   assert.equal(p11Fixed.type, 'confirmacion');
   assert.equal(p11Fixed.quickReplies, undefined);
   assert.equal(p11Fixed.nextStepId, 'step_cierre');
-  assert.equal(p11Fixed.prompt, 'Elegí qué querés hacer:');
+  assert.equal(
+    p11Fixed.prompt,
+    'Revisá tus datos:\n• Nombre: {{step_nombre}}\n• Empresa: {{step_empresa}}\n\nElegí qué querés hacer:'
+  );
   assert.deepEqual(
     p11Fixed.options?.map((o) => ({ id: o.id, label: o.label })),
     [

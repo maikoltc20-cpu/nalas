@@ -515,7 +515,10 @@ test('Reparación segura de Nala existente (solo borrador): conserva v2 publicad
   assert.equal(draftAfter.steps.length, 9, 'No debe agregar pasos duplicados');
   assert.equal(draftAfter.steps.filter((s) => s.type === 'confirmacion').length, 1);
   assert.equal(draftAfter.steps.filter((s) => s.type === 'cierre').length, 1);
-  assert.equal(draftAfter.summaryTemplate, undefined);
+  assert.equal(
+    draftAfter.summaryTemplate,
+    'Resumen de tu solicitud:\n• Nombre: {{step_nombre}}\n• Empresa: {{step_empresa}}\n• Necesidad: {{step_necesidad}}'
+  );
   assert.equal(draftAfter.closureTemplate, undefined);
   assert.equal(draftAfter.hideInternalCategorizationInClosure, true);
   assert.equal(draftAfter.showReferenceInClosure, true);

@@ -37,6 +37,7 @@ import {
   extractTemplateVariables,
   formatTemplateTokensReadable,
   isAnswerableSummaryStep,
+  isPersonalizedResumenPrompt,
   previewSummaryInEditor,
   renderAutomaticSummary,
   repairExistingFlowDraft,
@@ -452,6 +453,9 @@ export function FlowAndRulesDesigner({
   const [summaryConfigCustomized, setSummaryConfigCustomized] = useState<boolean>(() =>
     Boolean(draftFlow?.summaryConfig)
   );
+  const [summaryTemplate, setSummaryTemplate] = useState<string>(
+    () => draftFlow?.summaryTemplate ?? ''
+  );
   const [closureTemplate, setClosureTemplate] = useState<string>(
     () => draftFlow?.closureTemplate ?? ''
   );
@@ -568,7 +572,7 @@ export function FlowAndRulesDesigner({
   }, [business.id]);
 
   const draftSignature = draftFlow
-    ? `${effectiveFlowKey}:${draftFlow.id}:${draftFlow.status}:${draftFlow.name}:${draftFlow.versionNumber}:${JSON.stringify(draftFlow.steps)}:${JSON.stringify(draftFlow.outOfScriptRules)}:${JSON.stringify(draftFlow.humanHandoffConfig ?? null)}:${JSON.stringify(draftFlow.summaryConfig ?? null)}:${draftFlow.closureTemplate ?? ''}:${draftFlow.referenceTemplate ?? ''}:${draftFlow.alreadyRegisteredTemplate ?? ''}:${draftFlow.cancelMessage ?? ''}:${draftFlow.showReferenceInClosure ?? true}:${draftFlow.closureUsesInlineReference ?? ''}`
+    ? `${effectiveFlowKey}:${draftFlow.id}:${draftFlow.status}:${draftFlow.name}:${draftFlow.versionNumber}:${JSON.stringify(draftFlow.steps)}:${JSON.stringify(draftFlow.outOfScriptRules)}:${JSON.stringify(draftFlow.humanHandoffConfig ?? null)}:${JSON.stringify(draftFlow.summaryConfig ?? null)}:${draftFlow.summaryTemplate ?? ''}:${draftFlow.closureTemplate ?? ''}:${draftFlow.referenceTemplate ?? ''}:${draftFlow.alreadyRegisteredTemplate ?? ''}:${draftFlow.cancelMessage ?? ''}:${draftFlow.showReferenceInClosure ?? true}:${draftFlow.closureUsesInlineReference ?? ''}`
     : `${effectiveFlowKey}:empty`;
 
   const entrySignature = JSON.stringify({
@@ -594,6 +598,7 @@ export function FlowAndRulesDesigner({
       setHumanHandoffConfig(resolveHumanHandoffConfig(source.humanHandoffConfig));
       setSummaryConfig(resolveSummaryConfigForEditor(source.steps, source.summaryConfig));
       setSummaryConfigCustomized(Boolean(source.summaryConfig));
+      setSummaryTemplate(source.summaryTemplate ?? '');
       setSummaryTemplateCleared(
         Boolean(repairRes?.replacedManualSummary && draftFlow.summaryTemplate && !source.summaryTemplate)
       );
@@ -661,7 +666,37 @@ export function FlowAndRulesDesigner({
 
   function updateStep(stepId: string, patch: Partial<FlowStep>) {
     setDraftDirty(true);
-    setSteps((prev) => prev.map((s) => (s.id === stepId ? { ...s, ...patch } : s)));
+    let editedPersonalizedResumen = false;
+    setSteps((prev) =>
+      prev.map((s) => {
+        if (s.id !== stepId) return s;
+        const next: FlowStep = { ...s, ...patch };
+        if (patch.prompt !== undefined) {
+          if (next.correctionPrompt) {
+            delete next.correctionPrompt;
+          }
+          if (next.conditionalPrompts) {
+            const cp = { ...next.conditionalPrompts };
+            delete cp.whatsapp;
+            delete cp.email;
+            if (Object.keys(cp).length === 0) {
+              delete next.conditionalPrompts;
+            } else {
+              next.conditionalPrompts = cp;
+            }
+          }
+          if (next.type === 'resumen' && isPersonalizedResumenPrompt(patch.prompt)) {
+            editedPersonalizedResumen = true;
+          }
+        }
+        return next;
+      })
+    );
+    if (editedPersonalizedResumen) {
+      setSummaryConfigCustomized(false);
+      setSummaryTemplate('');
+      setSummaryTemplateCleared(Boolean(draftFlow?.summaryTemplate));
+    }
   }
 
   function addCustomQuestion() {
@@ -800,38 +835,58 @@ export function FlowAndRulesDesigner({
   }
 
   function buildFlowDraftPayload() {
-    const resolvedSumCfg = summaryConfigCustomized
-      ? resolveSummaryConfigForEditor(steps, summaryConfig)
-      : draftFlow?.summaryConfig
-        ? null
-        : undefined;
+    const sanitizedSteps = steps.map((step) => {
+      const clean = structuredClone(step);
+      if (clean.prompt?.trim() && clean.conditionalPrompts) {
+        delete clean.conditionalPrompts.whatsapp;
+        delete clean.conditionalPrompts.email;
+        if (Object.keys(clean.conditionalPrompts).length === 0) {
+          delete clean.conditionalPrompts;
+        }
+      }
+      return clean;
+    });
+
+    const resumenStep = sanitizedSteps.find((s) => s.type === 'resumen');
+    const hasPersonalizedResumen = Boolean(
+      resumenStep && isPersonalizedResumenPrompt(resumenStep.prompt)
+    );
+    const resolvedSumCfg =
+      !hasPersonalizedResumen && summaryConfigCustomized
+        ? resolveSummaryConfigForEditor(sanitizedSteps, summaryConfig)
+        : draftFlow?.summaryConfig
+          ? null
+          : undefined;
     const textOrNull = (val: string, existing?: string): string | null | undefined => {
       if (val.trim()) return val;
       return existing ? null : undefined;
     };
-    const isNonOpting = effectiveFlowKey !== 'opting';
-    const currentCierreStep = steps.find((s) => s.type === 'cierre');
-    const draftCierreStep = draftFlow?.steps.find((s) => s.type === 'cierre');
-    const optingCierreEdited =
-      !isNonOpting &&
-      Boolean(currentCierreStep) &&
-      (extractTemplateVariables(currentCierreStep?.prompt).includes('referencia') ||
-        (draftCierreStep !== undefined && currentCierreStep?.prompt !== draftCierreStep.prompt));
-    const useInlineRefMode = isNonOpting || optingCierreEdited || Boolean(draftFlow?.closureUsesInlineReference);
+    const currentCierreStep = sanitizedSteps.find(
+      (s) => s.type === 'cierre' && s.prompt?.trim()
+    );
+    const useInlineRefMode =
+      Boolean(currentCierreStep) || Boolean(draftFlow?.closureUsesInlineReference);
     const hasInlineRef =
-      steps.some(
+      sanitizedSteps.some(
         (s) => s.type === 'cierre' && extractTemplateVariables(s.prompt).includes('referencia')
       ) || (!useInlineRefMode && extractTemplateVariables(closureTemplate).includes('referencia'));
 
+    const nextSummaryTemplate =
+      hasPersonalizedResumen || summaryConfigCustomized || summaryTemplateCleared
+        ? draftFlow?.summaryTemplate
+          ? null
+          : undefined
+        : textOrNull(summaryTemplate, draftFlow?.summaryTemplate);
+
     return {
-      steps,
+      steps: sanitizedSteps,
       outOfScriptRules: oosRules,
       humanHandoffConfig,
       name: flowName.trim() || draftFlow?.name,
       flowKey: effectiveFlowKey,
       summaryConfig: resolvedSumCfg,
-      summaryTemplate: summaryTemplateCleared ? null : undefined,
-      closureTemplate: optingCierreEdited
+      summaryTemplate: nextSummaryTemplate,
+      closureTemplate: currentCierreStep
         ? draftFlow?.closureTemplate
           ? null
           : undefined
@@ -884,6 +939,11 @@ export function FlowAndRulesDesigner({
       }
       return;
     }
+    if (ambig.locationType === 'summaryTemplate') {
+      setDraftDirty(true);
+      setSummaryTemplate((prev) => prev.replace(tokenRegex, replacement));
+      return;
+    }
     if (ambig.locationType === 'summaryIntro') {
       mutateSummaryConfig((prev) => ({
         ...prev,
@@ -928,6 +988,7 @@ export function FlowAndRulesDesigner({
       setHumanHandoffConfig(resolveHumanHandoffConfig(fv.humanHandoffConfig));
       setSummaryConfig(resolveSummaryConfigForEditor(fv.steps, fv.summaryConfig));
       setSummaryConfigCustomized(Boolean(fv.summaryConfig));
+      setSummaryTemplate(fv.summaryTemplate ?? '');
       setSummaryTemplateCleared(
         Boolean(repairRes?.replacedManualSummary && rawFv.summaryTemplate && !fv.summaryTemplate)
       );
@@ -950,6 +1011,7 @@ export function FlowAndRulesDesigner({
       setHumanHandoffConfig(resolveHumanHandoffConfig(undefined));
       setSummaryConfig(resolveSummaryConfigForEditor([], undefined));
       setSummaryConfigCustomized(false);
+      setSummaryTemplate('');
       setSummaryTemplateCleared(false);
       setClosureTemplate('');
       setReferenceTemplate('');
@@ -996,6 +1058,7 @@ export function FlowAndRulesDesigner({
       setHumanHandoffConfig(resolveHumanHandoffConfig(created.humanHandoffConfig));
       setSummaryConfig(resolveSummaryConfigForEditor(created.steps, created.summaryConfig));
       setSummaryConfigCustomized(Boolean(created.summaryConfig));
+      setSummaryTemplate(created.summaryTemplate ?? '');
       setClosureTemplate(created.closureTemplate ?? '');
       setReferenceTemplate(created.referenceTemplate ?? '');
       setAlreadyRegisteredTemplate(created.alreadyRegisteredTemplate ?? '');
@@ -1603,14 +1666,35 @@ export function FlowAndRulesDesigner({
     draftDiffersFromPublishedFlow;
 
   const displayedSummaryConfig = resolveSummaryConfigForEditor(steps, summaryConfig);
+  const editorResumenStep = steps.find((s) => s.type === 'resumen');
+  const hasPersonalizedEditorResumen = Boolean(
+    editorResumenStep && isPersonalizedResumenPrompt(editorResumenStep.prompt)
+  );
+  const editorHasCierrePrompt = steps.some((s) => s.type === 'cierre' && s.prompt?.trim());
+  const activeEditorSummaryTemplate =
+    hasPersonalizedEditorResumen || summaryConfigCustomized || summaryTemplateCleared
+      ? undefined
+      : summaryTemplate.trim()
+        ? summaryTemplate
+        : undefined;
+  const activeEditorClosureTemplate = editorHasCierrePrompt
+    ? undefined
+    : closureTemplate.trim()
+      ? closureTemplate
+      : undefined;
+
   const liveTemplateIssues = validateFlowTemplates({
     steps,
-    summaryConfig: summaryConfigCustomized ? displayedSummaryConfig : undefined,
-    summaryTemplate:
-      summaryConfigCustomized || summaryTemplateCleared ? undefined : draftFlow?.summaryTemplate,
-    closureTemplate: closureTemplate.trim() ? closureTemplate : undefined,
+    summaryConfig:
+      !hasPersonalizedEditorResumen && summaryConfigCustomized
+        ? displayedSummaryConfig
+        : undefined,
+    summaryTemplate: activeEditorSummaryTemplate,
+    closureTemplate: activeEditorClosureTemplate,
     referenceTemplate:
-      effectiveFlowKey === 'opting' && referenceTemplate.trim() ? referenceTemplate : undefined,
+      !editorHasCierrePrompt && effectiveFlowKey === 'opting' && referenceTemplate.trim()
+        ? referenceTemplate
+        : undefined,
     alreadyRegisteredTemplate: alreadyRegisteredTemplate.trim()
       ? alreadyRegisteredTemplate
       : undefined,
@@ -1623,12 +1707,12 @@ export function FlowAndRulesDesigner({
       ? repairExistingFlowDraft({
           ...draftFlow,
           steps,
-          summaryConfig: summaryConfigCustomized ? displayedSummaryConfig : undefined,
-          summaryTemplate:
-            summaryConfigCustomized || summaryTemplateCleared
-              ? undefined
-              : draftFlow.summaryTemplate,
-          closureTemplate: closureTemplate.trim() ? closureTemplate : undefined,
+          summaryConfig:
+            !hasPersonalizedEditorResumen && summaryConfigCustomized
+              ? displayedSummaryConfig
+              : undefined,
+          summaryTemplate: activeEditorSummaryTemplate,
+          closureTemplate: activeEditorClosureTemplate,
           alreadyRegisteredTemplate: alreadyRegisteredTemplate.trim()
             ? alreadyRegisteredTemplate
             : undefined,
@@ -3003,9 +3087,11 @@ export function FlowAndRulesDesigner({
                             Resumen previo a confirmar
                           </div>
                           <p className="text-xs text-[#5A6877]">
-                            {summaryConfigCustomized
-                              ? 'Resumen personalizado activo. Podés elegir qué preguntas mostrar, su etiqueta y orden.'
-                              : 'Sin ajustes, el resumen incluye automáticamente todas las preguntas respondidas en orden.'}
+                            {hasPersonalizedEditorResumen
+                              ? 'El paso «Resumen» usa actualmente su mensaje personalizado.'
+                              : summaryConfigCustomized
+                                ? 'Resumen personalizado activo. Podés elegir qué preguntas mostrar, su etiqueta y orden.'
+                                : 'Sin ajustes, el resumen incluye automáticamente todas las preguntas respondidas en orden.'}
                           </p>
                         </div>
                         <button
@@ -4211,69 +4297,93 @@ export function FlowAndRulesDesigner({
                         ))}
                       </div>
 
-                      {(conv.latestPublished.summaryConfig ||
-                        conv.latestPublished.summaryTemplate ||
-                        conv.latestPublished.closureTemplate ||
-                        (!conv.latestPublished.closureUsesInlineReference &&
-                          (conv.latestPublished.referenceTemplate ||
-                            conv.latestPublished.showReferenceInClosure === false))) && (
-                        <div className="text-xs bg-[#F7F8FA] border border-[#E2E7EB] rounded-[8px] p-3 space-y-1.5">
-                          <div className="font-semibold text-[#25364A]">
-                            Resumen y cierre publicados
-                          </div>
-                          {conv.latestPublished.summaryConfig && (
-                            <div className="space-y-0.5 text-[#5A6877]">
-                              {conv.latestPublished.summaryConfig.introPrompt && (
-                                <div>
-                                  <span className="font-medium text-[#25364A]">Introducción:</span>{' '}
-                                  {formatTemplateTokensReadable(
-                                    conv.latestPublished.summaryConfig.introPrompt,
-                                    conv.latestPublished.steps,
-                                    { allowReference: false }
-                                  )}
-                                </div>
-                              )}
-                              <div>
-                                <span className="font-medium text-[#25364A]">Campos incluidos:</span>{' '}
-                                {conv.latestPublished.summaryConfig.fields
-                                  .filter((f) => f.enabled)
-                                  .sort((a, b) => a.order - b.order)
-                                  .map((f) => f.label)
-                                  .join(' · ') || 'Ninguno'}
-                              </div>
+                      {(() => {
+                        const pub = conv.latestPublished;
+                        const pubResumenStep = pub.steps.find((s) => s.type === 'resumen');
+                        const hasPersonalizedPubResumen = Boolean(
+                          pubResumenStep && isPersonalizedResumenPrompt(pubResumenStep.prompt)
+                        );
+                        const pubCierreStep = pub.steps.find((s) => s.type === 'cierre');
+                        const effectivePubClosure = pub.closureUsesInlineReference
+                          ? (pubCierreStep?.prompt?.trim() ? pubCierreStep.prompt : pub.closureTemplate)
+                          : (pub.closureTemplate || pubCierreStep?.prompt);
+
+                        if (
+                          !hasPersonalizedPubResumen &&
+                          !pub.summaryConfig &&
+                          !pub.summaryTemplate &&
+                          !effectivePubClosure &&
+                          pub.closureUsesInlineReference
+                        ) {
+                          return null;
+                        }
+
+                        return (
+                          <div className="text-xs bg-[#F7F8FA] border border-[#E2E7EB] rounded-[8px] p-3 space-y-1.5">
+                            <div className="font-semibold text-[#25364A]">
+                              Resumen y cierre publicados
                             </div>
-                          )}
-                          {!conv.latestPublished.summaryConfig &&
-                            conv.latestPublished.summaryTemplate && (
+                            {hasPersonalizedPubResumen && pubResumenStep ? (
                               <div className="text-[#5A6877] whitespace-pre-wrap">
                                 <span className="font-medium text-[#25364A]">Resumen configurado:</span>{' '}
                                 {formatTemplateTokensReadable(
-                                  conv.latestPublished.summaryTemplate,
-                                  conv.latestPublished.steps,
+                                  pubResumenStep.prompt,
+                                  pub.steps,
                                   { allowReference: false }
                                 )}
                               </div>
+                            ) : pub.summaryConfig ? (
+                              <div className="space-y-0.5 text-[#5A6877]">
+                                {pub.summaryConfig.introPrompt && (
+                                  <div>
+                                    <span className="font-medium text-[#25364A]">Introducción:</span>{' '}
+                                    {formatTemplateTokensReadable(
+                                      pub.summaryConfig.introPrompt,
+                                      pub.steps,
+                                      { allowReference: false }
+                                    )}
+                                  </div>
+                                )}
+                                <div>
+                                  <span className="font-medium text-[#25364A]">Campos incluidos:</span>{' '}
+                                  {pub.summaryConfig.fields
+                                    .filter((f) => f.enabled)
+                                    .sort((a, b) => a.order - b.order)
+                                    .map((f) => f.label)
+                                    .join(' · ') || 'Ninguno'}
+                                </div>
+                              </div>
+                            ) : pub.summaryTemplate ? (
+                              <div className="text-[#5A6877] whitespace-pre-wrap">
+                                <span className="font-medium text-[#25364A]">Resumen configurado:</span>{' '}
+                                {formatTemplateTokensReadable(
+                                  pub.summaryTemplate,
+                                  pub.steps,
+                                  { allowReference: false }
+                                )}
+                              </div>
+                            ) : null}
+                            {effectivePubClosure && (
+                              <div className="text-[#5A6877] whitespace-pre-wrap">
+                                <span className="font-medium text-[#25364A]">Mensaje de cierre:</span>{' '}
+                                {formatTemplateTokensReadable(
+                                  effectivePubClosure,
+                                  pub.steps,
+                                  { allowReference: true }
+                                )}
+                              </div>
                             )}
-                          {conv.latestPublished.closureTemplate && (
-                            <div className="text-[#5A6877] whitespace-pre-wrap">
-                              <span className="font-medium text-[#25364A]">Mensaje de cierre:</span>{' '}
-                              {formatTemplateTokensReadable(
-                                conv.latestPublished.closureTemplate,
-                                conv.latestPublished.steps,
-                                { allowReference: true }
-                              )}
-                            </div>
-                          )}
-                          {!conv.latestPublished.closureUsesInlineReference && (
-                            <div className="text-[#5A6877]">
-                              <span className="font-medium text-[#25364A]">Mostrar número de solicitud al cliente:</span>{' '}
-                              {conv.latestPublished.showReferenceInClosure === false
-                                ? 'Oculto internamente (se registra igual)'
-                                : 'Visible para el cliente'}
-                            </div>
-                          )}
-                        </div>
-                      )}
+                            {!pub.closureUsesInlineReference && (
+                              <div className="text-[#5A6877]">
+                                <span className="font-medium text-[#25364A]">Mostrar número de solicitud al cliente:</span>{' '}
+                                {pub.showReferenceInClosure === false
+                                  ? 'Oculto internamente (se registra igual)'
+                                  : 'Visible para el cliente'}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })()}
 
                       {conv.latestPublished.outOfScriptRules.length > 0 && (
                         <div className="text-xs space-y-1">

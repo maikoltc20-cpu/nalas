@@ -1,6 +1,7 @@
 import {
   buildAllKnownVariableKeys,
   extractTemplateVariables,
+  isPersonalizedResumenPrompt,
   validateFlowTemplates,
 } from '../../shared/flowTemplates.ts';
 import {
@@ -692,6 +693,13 @@ function stripHiddenStepPrompts(steps: FlowStep[]): FlowStep[] {
   return steps.map((step) => {
     const clean = structuredClone(step);
     delete clean.entryPrompt;
+    if (clean.prompt?.trim() && clean.conditionalPrompts) {
+      delete clean.conditionalPrompts.whatsapp;
+      delete clean.conditionalPrompts.email;
+      if (Object.keys(clean.conditionalPrompts).length === 0) {
+        delete clean.conditionalPrompts;
+      }
+    }
     return clean;
   });
 }
@@ -789,6 +797,25 @@ export function saveFlowDraft(
       });
       return compatible ? tpl : undefined;
     };
+    const cierreStepWithPrompt = cleanedSteps.find(
+      (s) => s.type === 'cierre' && s.prompt?.trim()
+    );
+    const hasPersonalizedResumenStep = cleanedSteps.some(
+      (s) => s.type === 'resumen' && isPersonalizedResumenPrompt(s.prompt)
+    );
+    const inheritClosureAllowed =
+      templateOverrides?.closureTemplate !== undefined || !cierreStepWithPrompt;
+    const effectiveClosureUsesInline =
+      templateOverrides?.closureUsesInlineReference !== undefined
+        ? templateOverrides.closureUsesInlineReference === null
+          ? undefined
+          : Boolean(templateOverrides.closureUsesInlineReference)
+        : templateOverrides?.referenceTemplate?.trim()
+          ? false
+          : cierreStepWithPrompt && templateOverrides?.closureTemplate === undefined
+            ? true
+            : sameKeyActive?.closureUsesInlineReference;
+
     draft = {
       id: `flow_${businessId}_${resolvedFlowKey}_draft_${Date.now()}`,
       businessId,
@@ -801,15 +828,19 @@ export function saveFlowDraft(
       summaryConfig: baseSummaryConfig,
       summaryTemplate: resolveOptionalTextOverride(
         templateOverrides?.summaryTemplate,
-        isInheritedTemplateCompatible(sameKeyActive?.summaryTemplate, false)
+        hasPersonalizedResumenStep
+          ? undefined
+          : isInheritedTemplateCompatible(sameKeyActive?.summaryTemplate, false)
       ),
       closureTemplate: resolveOptionalTextOverride(
         templateOverrides?.closureTemplate,
-        isInheritedTemplateCompatible(sameKeyActive?.closureTemplate, true)
+        inheritClosureAllowed
+          ? isInheritedTemplateCompatible(sameKeyActive?.closureTemplate, true)
+          : undefined
       ),
       referenceTemplate: resolveOptionalTextOverride(
         templateOverrides?.referenceTemplate,
-        sameKeyActive?.referenceTemplate
+        effectiveClosureUsesInline ? undefined : sameKeyActive?.referenceTemplate
       ),
       alreadyRegisteredTemplate: resolveOptionalTextOverride(
         templateOverrides?.alreadyRegisteredTemplate,
@@ -824,15 +855,10 @@ export function saveFlowDraft(
           ? templateOverrides.showReferenceInClosure === null
             ? undefined
             : Boolean(templateOverrides.showReferenceInClosure)
-          : sameKeyActive?.showReferenceInClosure,
-      closureUsesInlineReference:
-        templateOverrides?.closureUsesInlineReference !== undefined
-          ? templateOverrides.closureUsesInlineReference === null
-            ? undefined
-            : Boolean(templateOverrides.closureUsesInlineReference)
-          : templateOverrides?.referenceTemplate?.trim()
-            ? false
-            : sameKeyActive?.closureUsesInlineReference,
+          : effectiveClosureUsesInline && cierreStepWithPrompt
+            ? extractTemplateVariables(cierreStepWithPrompt.prompt).includes('referencia')
+            : sameKeyActive?.showReferenceInClosure,
+      closureUsesInlineReference: effectiveClosureUsesInline,
       handoffMessage: sameKeyActive?.handoffMessage,
       handoffNoContactMessage: sameKeyActive?.handoffNoContactMessage,
       outOfScriptPrompt: sameKeyActive?.outOfScriptPrompt,

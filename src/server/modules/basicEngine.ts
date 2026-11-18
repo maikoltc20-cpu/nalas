@@ -2,6 +2,7 @@ import {
   formatAnswerDisplayValue,
   getReadableFlowStepTitle,
   isAnswerableSummaryStep,
+  isPersonalizedResumenPrompt,
   isSkippedOptionalAnswer,
   renderAutomaticSummary,
   renderSummaryFromConfig,
@@ -186,6 +187,10 @@ function buildSummaryText(
   flow: FlowVersion,
   session: Session
 ): string {
+  const resumenStep = flow.steps.find((s) => s.type === 'resumen');
+  if (resumenStep && isPersonalizedResumenPrompt(resumenStep.prompt)) {
+    return interpolateTemplate(resumenStep.prompt, session);
+  }
   if (flow.summaryConfig) {
     return renderSummaryFromConfig({
       summaryConfig: flow.summaryConfig,
@@ -194,22 +199,8 @@ function buildSummaryText(
       interpolate: (tpl) => interpolateTemplate(tpl, session),
     });
   }
-  if (flow.summaryTemplate) {
-    const rendered = interpolateTemplate(flow.summaryTemplate, session);
-    const extraLines: string[] = [];
-    for (const step of flow.steps) {
-      const ans = session.answers[step.id];
-      if (!ans || isSkippedOptionalAnswer(ans)) continue;
-      const keyById = `{{${step.id}}}`;
-      const keyByField = step.targetField ? `{{${step.targetField}}}` : '';
-      const alreadyIncluded =
-        flow.summaryTemplate.includes(keyById) ||
-        (keyByField ? flow.summaryTemplate.includes(keyByField) : false);
-      if (!alreadyIncluded) {
-        extraLines.push(`• ${step.title ?? step.prompt}: ${formatAnswerDisplayValue(ans)}`);
-      }
-    }
-    return extraLines.length > 0 ? `${rendered}\n${extraLines.join('\n')}` : rendered;
+  if (flow.summaryTemplate?.trim()) {
+    return interpolateTemplate(flow.summaryTemplate, session);
   }
   return renderAutomaticSummary({
     steps: flow.steps,
@@ -1071,7 +1062,10 @@ function advanceFromStep(
 
     session.currentStepId = nextStep.id;
     session.updatedAt = new Date().toISOString();
-    replyChunks.push(getEffectiveStepPrompt(nextStep, session));
+    const stepPromptText = getEffectiveStepPrompt(nextStep, session);
+    if (stepPromptText.trim() || replyChunks.length === 0) {
+      replyChunks.push(stepPromptText);
+    }
     return {
       replyText: replyChunks.join('\n\n'),
       options: getStepOptions(nextStep),
@@ -1145,7 +1139,8 @@ export function runBasicEngine(params: {
       return targetFlow.showReferenceInClosure !== false;
     }
     const cierre = targetFlow.steps.find((s) => s.type === 'cierre');
-    const rawTpl = targetFlow.closureTemplate || cierre?.prompt || '';
+    const cierrePrompt = cierre?.prompt?.trim() ? cierre.prompt : '';
+    const rawTpl = cierrePrompt || targetFlow.closureTemplate || '';
     return rawTpl.includes('{{referencia}}');
   };
 
@@ -1892,8 +1887,10 @@ export function runBasicEngine(params: {
       session.currentStepId = cierreStep?.id ?? null;
       session.updatedAt = now;
 
-      const rawClosureTemplate =
-        flow.closureTemplate || cierreStep?.prompt || 'Solicitud confirmada correctamente.';
+      const cierreStepPrompt = cierreStep?.prompt?.trim() ? cierreStep.prompt : '';
+      const rawClosureTemplate = flow.closureUsesInlineReference
+        ? cierreStepPrompt || flow.closureTemplate || 'Solicitud confirmada correctamente.'
+        : flow.closureTemplate || cierreStepPrompt || 'Solicitud confirmada correctamente.';
       const closureAlreadyContainsRef = rawClosureTemplate.includes('{{referencia}}');
 
       if (flow.closureUsesInlineReference) {
