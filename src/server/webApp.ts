@@ -128,11 +128,16 @@ import {
   assertTenantScope,
   createBackupSnapshot,
   getStorageBackendInfo,
+  readAuthSessionSnapshot,
+  readBootstrapSlice,
+  readDevOwnerUserInPersistence,
   readFlowConfigSlice,
   readStore,
   restoreBackupSnapshot,
+  userExistsInPersistence,
   withConversationRestartTransaction,
   withFlowConfigTransaction,
+  withFlowRetireTransaction,
   withStoreTransaction,
 } from './modules/persistence.ts';
 import { getEnv, getRequestId, isWorkerRuntime } from './runtimeContext.ts';
@@ -166,14 +171,55 @@ function isHttpsRequest(req: Request, headerGetter: (name: string) => string | u
   }
 }
 
+function isTransientPgError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const pgCode = (err as { code?: string }).code;
+  if (pgCode) {
+    if (
+      pgCode === '57014' || // statement_timeout / query_canceled
+      pgCode === '55P03' || // lock_not_available / lock_timeout
+      pgCode === 'DB_CONNECTION_ERROR' ||
+      pgCode === 'DB_NOT_INITIALIZED' ||
+      pgCode === 'MISSING_DATABASE_URL' ||
+      pgCode === 'INVALID_DATABASE_URL' ||
+      pgCode.startsWith('08') || // connection exceptions
+      pgCode.startsWith('53') || // insufficient resources / too many connections
+      pgCode.startsWith('57P') // operator intervention / cannot connect now
+    ) {
+      return true;
+    }
+  }
+  const msg = err instanceof Error ? err.message : String(err);
+  return /timeout|lock timeout|canceling statement|connection|pooler|econnreset|econnrefused|etimedout|terminating connection|too many clients|websocket/i.test(
+    msg
+  );
+}
+
 function errorResponse(err: unknown): Response {
-  const status = (err as { statusCode?: number })?.statusCode ?? 400;
+  const errObj = err as {
+    statusCode?: number;
+    code?: string;
+    issues?: unknown;
+    alreadyRetired?: boolean;
+    retiredFlow?: unknown;
+  };
+  const transient = isTransientPgError(err);
+  const status = errObj?.statusCode ?? (transient ? 503 : 400);
   const message = err instanceof Error ? err.message : 'Error interno del servidor';
-  const issues = (err as { issues?: unknown })?.issues;
-  return new Response(JSON.stringify({ error: message, issues }), {
-    status,
-    headers: { 'Content-Type': 'application/json; charset=utf-8' },
-  });
+  const code = errObj?.code ?? (transient ? 'DB_UNAVAILABLE' : undefined);
+  return new Response(
+    JSON.stringify({
+      error: message,
+      code,
+      issues: errObj?.issues,
+      alreadyRetired: errObj?.alreadyRetired,
+      retiredFlow: errObj?.retiredFlow,
+    }),
+    {
+      status,
+      headers: { 'Content-Type': 'application/json; charset=utf-8' },
+    }
+  );
 }
 
 function assertPlatformAdmin(store: Awaited<ReturnType<typeof readStore>>, userId: string) {
@@ -286,8 +332,7 @@ webApp.get('/api/auth/session', async (c) => {
   const productionMode = isProductionAccessMode();
   if (isLocalDevPreviewBypassEnabled()) {
     try {
-      const store = await readStore();
-      const devOwner = resolveLocalDevOwnerUser(store);
+      const devOwner = await readDevOwnerUserInPersistence();
       return c.json({
         authenticated: Boolean(devOwner),
         user: devOwner,
@@ -335,8 +380,65 @@ webApp.get('/api/auth/session', async (c) => {
     }
   }
   try {
-    const initStatus = await getDatabaseInitStatus();
-    if (!initStatus.initialized) {
+    const secretDiag = await diagnoseSessionSigningSecret();
+    if (!secretDiag.ok) {
+      if (secretDiag.code === 'DB_UNINITIALIZED') {
+        return c.json({
+          authenticated: false,
+          user: null,
+          initialized: false,
+          productionMode,
+          dbError: null,
+          authIssue: {
+            code: 'DB_UNINITIALIZED',
+            title: 'Base de datos pendiente de preparación inicial',
+            message: productionMode
+              ? 'La base de datos PostgreSQL todavía no tiene sus tablas iniciales creadas. Completá la preparación inicial de la base antes de ingresar.'
+              : 'PostgreSQL respondió correctamente, pero las tablas iniciales de Nala todavía no fueron creadas.',
+            actionLabel: productionMode ? 'Reintentar' : 'Inicializar base de datos',
+          },
+          googleLoginEnabled: false,
+          googleIssue: null,
+          googleLinked: false,
+          demoQuickLoginEnabled: false,
+          demoUsers: [],
+          storage,
+        });
+      }
+      const isConnErr = secretDiag.code === 'DB_CONNECTION_ERROR';
+      return c.json(
+        {
+          authenticated: false,
+          user: null,
+          initialized: true,
+          productionMode,
+          dbError: isConnErr ? secretDiag.message : null,
+          authIssue: {
+            code: secretDiag.code,
+            title: isConnErr
+              ? 'Error de conexión con la base de datos PostgreSQL'
+              : 'Acceso bloqueado por error al persistir la sesión segura',
+            message: secretDiag.message,
+            actionLabel: 'Reintentar',
+          },
+          googleLoginEnabled: false,
+          googleIssue: null,
+          googleLinked: false,
+          demoQuickLoginEnabled: false,
+          demoUsers: [],
+          storage,
+        },
+        { status: isConnErr ? 503 : 200 }
+      );
+    }
+
+    const demoQuickLoginEnabled = !productionMode && isDemoQuickLoginEnabled();
+    const userId = await resolveAuthenticatedUserFromCookieHeader(c.req.header('cookie'));
+    const snapshot = await readAuthSessionSnapshot({
+      userId,
+      includeAllUsers: demoQuickLoginEnabled,
+    });
+    if (!snapshot.initialized) {
       return c.json({
         authenticated: false,
         user: null,
@@ -360,42 +462,8 @@ webApp.get('/api/auth/session', async (c) => {
       });
     }
 
-    const secretDiag = await diagnoseSessionSigningSecret();
-    if (!secretDiag.ok) {
-      const isConnErr = secretDiag.code === 'DB_CONNECTION_ERROR';
-      return c.json({
-        authenticated: false,
-        user: null,
-        initialized: secretDiag.code !== 'DB_UNINITIALIZED',
-        productionMode,
-        dbError: isConnErr ? secretDiag.message : null,
-        authIssue: {
-          code: secretDiag.code,
-          title: isConnErr
-            ? 'Error de conexión con la base de datos PostgreSQL'
-            : secretDiag.code === 'DB_UNINITIALIZED'
-              ? 'Base de datos pendiente de preparación inicial'
-              : 'Acceso bloqueado por error al persistir la sesión segura',
-          message: secretDiag.message,
-          actionLabel: 'Reintentar',
-        },
-        googleLoginEnabled: false,
-        googleIssue: null,
-        googleLinked: false,
-        demoQuickLoginEnabled: false,
-        demoUsers: [],
-        storage,
-      });
-    }
-
     const googleReadiness = checkGoogleOAuthReadiness(c.req.raw);
-    const userId = await resolveAuthenticatedUserFromCookieHeader(c.req.header('cookie'));
-    const store = await readStore();
-    const user = userId ? store.users.find((u) => u.id === userId) ?? null : null;
-    const googleLinked = Boolean(
-      user && store.userIdentities?.some((i) => i.userId === user.id && i.provider === 'google')
-    );
-    const demoQuickLoginEnabled = !productionMode && isDemoQuickLoginEnabled();
+    const user = userId ? snapshot.users.find((u) => u.id === userId) ?? null : null;
     return c.json({
       authenticated: Boolean(user),
       user,
@@ -405,10 +473,10 @@ webApp.get('/api/auth/session', async (c) => {
       authIssue: null,
       googleLoginEnabled: googleReadiness.ready,
       googleIssue: googleReadiness.issue,
-      googleLinked,
+      googleLinked: Boolean(user && snapshot.googleLinked),
       demoQuickLoginEnabled,
       demoUsers: demoQuickLoginEnabled
-        ? store.users.map((u) => ({
+        ? snapshot.users.map((u) => ({
             id: u.id,
             name: u.name,
             email: u.email,
@@ -420,25 +488,29 @@ webApp.get('/api/auth/session', async (c) => {
   } catch (err) {
     const message =
       err instanceof Error ? err.message : 'Error verificando la conexión con la base de datos.';
-    return c.json({
-      authenticated: false,
-      user: null,
-      initialized: false,
-      productionMode,
-      dbError: message,
-      authIssue: {
+    return c.json(
+      {
+        authenticated: false,
+        user: null,
+        initialized: false,
+        productionMode,
         code: 'DB_CONNECTION_ERROR',
-        title: 'Error de conexión con la base de datos PostgreSQL',
-        message,
-        actionLabel: 'Reintentar conexión',
+        dbError: message,
+        authIssue: {
+          code: 'DB_CONNECTION_ERROR',
+          title: 'Error de conexión con la base de datos PostgreSQL',
+          message,
+          actionLabel: 'Reintentar conexión',
+        },
+        googleLoginEnabled: false,
+        googleIssue: null,
+        googleLinked: false,
+        demoQuickLoginEnabled: false,
+        demoUsers: [],
+        storage,
       },
-      googleLoginEnabled: false,
-      googleIssue: null,
-      googleLinked: false,
-      demoQuickLoginEnabled: false,
-      demoUsers: [],
-      storage,
-    });
+      { status: 503 }
+    );
   }
 });
 
@@ -660,8 +732,7 @@ webApp.use('/api/*', async (c, next) => {
   }
   try {
     if (isLocalDevPreviewBypassEnabled()) {
-      const store = await readStore();
-      const devOwner = resolveLocalDevOwnerUser(store);
+      const devOwner = await readDevOwnerUserInPersistence();
       if (!devOwner) {
         return c.json({ error: 'Usuario propietario de prueba no disponible.' }, { status: 500 });
       }
@@ -685,8 +756,7 @@ webApp.use('/api/*', async (c, next) => {
         { status: 401 }
       );
     }
-    const store = await readStore();
-    const exists = store.users.some((u) => u.id === uid);
+    const exists = await userExistsInPersistence(uid);
     if (!exists) {
       const https = isHttpsRequest(c.req.raw, (n) => c.req.header(n));
       c.header('Set-Cookie', buildClearSessionCookieHeader(https));
@@ -741,17 +811,15 @@ webApp.post('/api/auth/change-password', async (c) => {
 webApp.get('/api/bootstrap', async (c) => {
   try {
     const { userId, businessId } = getActorContext(c);
-    let store = await readStore();
-    if (store.channelConnections.some(isErroneousProdWhatsAppConnection)) {
-      await withStoreTransaction((tx) => {
-        sanitizeErroneousProdWhatsAppBinding(tx, userId);
-      });
-      store = await readStore();
-    }
-    repairExistingAgentContacts(store);
     const environment = (c.req.query('environment') === 'produccion'
       ? 'produccion'
       : 'prueba') as Environment;
+    const store = await readBootstrapSlice({
+      userId,
+      businessId,
+      environment,
+      demoQuickLoginEnabled: isDemoQuickLoginEnabled(),
+    });
 
     const currentUser = store.users.find((u) => u.id === userId) ?? store.users[0];
     let accessError: string | null = null;
@@ -1414,7 +1482,7 @@ webApp.post('/api/flows/:flowVersionId/rollback', async (c) => {
   try {
     const { userId, businessId } = getActorContext(c);
     const flowVersionId = c.req.param('flowVersionId');
-    const biz = await withStoreTransaction((store) => {
+    const biz = await withFlowConfigTransaction(businessId, (store) => {
       const ctx = resolveActorContext(store, userId, businessId);
       assertPermission(ctx, 'activateVersions');
       return rollbackFlowVersion(store, businessId, userId, flowVersionId);
@@ -1430,7 +1498,13 @@ webApp.post('/api/flows/:flowVersionId/retire', async (c) => {
     const { userId, businessId } = getActorContext(c);
     const flowVersionId = c.req.param('flowVersionId');
     const body = (await c.req.json().catch(() => ({}))) as { reason?: string };
-    const result = await withStoreTransaction((store) => {
+    const {
+      result,
+      retiredFlow,
+      verifiedStore,
+      unpausedAffectedCount,
+      timings,
+    } = await withFlowRetireTransaction(businessId, flowVersionId, userId, (store) => {
       const ctx = resolveActorContext(store, userId, businessId);
       assertPermission(ctx, 'activateVersions');
       return retireFlowVersion(
@@ -1441,12 +1515,10 @@ webApp.post('/api/flows/:flowVersionId/retire', async (c) => {
         typeof body.reason === 'string' ? body.reason : undefined
       );
     });
-    const verifiedStore = await readStore();
-    const persistedRetired = verifiedStore.flowVersions.find(
-      (f) => f.id === flowVersionId && f.businessId === businessId && f.status === 'retirada'
-    );
-    if (!persistedRetired) {
-      throw new Error('No se pudo verificar el retiro de la versión en el servidor.');
+    if (unpausedAffectedCount > 0) {
+      throw new Error(
+        `Verificación post-retiro detectó ${unpausedAffectedCount} conversación(es) abierta(s) sin pausar.`
+      );
     }
     const runtimeInput = await buildRuntimeProductionSummaryInput(
       verifiedStore,
@@ -1458,9 +1530,22 @@ webApp.post('/api/flows/:flowVersionId/retire', async (c) => {
       businessId,
       runtimeInput
     );
+    console.info(
+      '[retire-flow]',
+      JSON.stringify({
+        requestId: getRequestId(),
+        businessId,
+        flowVersionId,
+        affectedConversations: result.affectedConversationIds.length,
+        pausedOutboxCount: result.pausedOutboxCount,
+        timings,
+      })
+    );
     return c.json({
       ...result,
-      retiredFlow: persistedRetired,
+      retiredFlow,
+      verified: true,
+      timings,
       verifiedSummary,
     });
   } catch (err) {
@@ -1472,7 +1557,7 @@ webApp.post('/api/rulesets/draft', async (c) => {
   try {
     const { userId, businessId } = getActorContext(c);
     const body = (await c.req.json()) as Partial<RulesetVersion>;
-    const result = await withStoreTransaction((store) => {
+    const result = await withFlowConfigTransaction(businessId, (store) => {
       const ctx = resolveActorContext(store, userId, businessId);
       assertPermission(ctx, 'editFlows');
       return saveRulesetDraft(store, businessId, userId, body);
@@ -1487,7 +1572,7 @@ webApp.post('/api/rulesets/publish', async (c) => {
   try {
     const { userId, businessId } = getActorContext(c);
     const body = (await c.req.json()) as Partial<RulesetVersion>;
-    const published = await withStoreTransaction((store) => {
+    const published = await withFlowConfigTransaction(businessId, (store) => {
       const ctx = resolveActorContext(store, userId, businessId);
       assertPermission(ctx, 'activateVersions');
       return publishRuleset(store, businessId, userId, body);

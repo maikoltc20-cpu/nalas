@@ -1,7 +1,13 @@
-import { useCallback, useEffect, useState } from 'react';
-import { Lock, LogOut, Menu, ShieldAlert, X } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { AlertTriangle, Lock, LogOut, Menu, RefreshCw, ShieldAlert, X } from 'lucide-react';
 import type { Environment } from './shared/types';
-import { type AuthSessionResponse, type BootstrapResponse, nalasApi } from './client/api';
+import {
+  type AuthSessionResponse,
+  type BootstrapResponse,
+  isExplicitUnauthenticatedError,
+  isTransientApiError,
+  nalasApi,
+} from './client/api';
 import { AdminNalasWorkspace } from './client/components/AdminNalasWorkspace';
 import { BusinessOverview } from './client/components/BusinessOverview';
 import { FlowAndRulesDesigner } from './client/components/FlowAndRulesDesigner';
@@ -52,19 +58,89 @@ export default function App() {
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [noticeMsg, setNoticeMsg] = useState<string | null>(null);
 
+  const [connectionUnavailable, setConnectionUnavailable] = useState<boolean>(false);
+  const [connectionDetail, setConnectionDetail] = useState<string | null>(null);
+  const [connectionRetryAttempt, setConnectionRetryAttempt] = useState<number>(0);
+  const [connectionRetryExhausted, setConnectionRetryExhausted] = useState<boolean>(false);
+  const [manualRetrying, setManualRetrying] = useState<boolean>(false);
+
+  const authSessionRef = useRef<AuthSessionResponse | null>(authSession);
+  authSessionRef.current = authSession;
+
+  const RETRY_DELAYS_MS = [1500, 3000, 6000] as const;
+
   const activeUserId = authSession?.user?.id ?? '';
   const ctx = { userId: activeUserId, businessId, environment };
 
-  const loadSession = useCallback(async () => {
+  const markConnectionUnavailable = useCallback((detail?: string | null) => {
+    setConnectionUnavailable(true);
+    if (detail) setConnectionDetail(detail);
+    setConnectionRetryAttempt(0);
+    setConnectionRetryExhausted(false);
+  }, []);
+
+  const clearConnectionUnavailable = useCallback(() => {
+    setConnectionUnavailable(false);
+    setConnectionDetail(null);
+    setConnectionRetryAttempt(0);
+    setConnectionRetryExhausted(false);
+  }, []);
+
+  const handleConnectionIssue = useCallback(
+    (err: unknown) => {
+      if (isExplicitUnauthenticatedError(err)) {
+        clearConnectionUnavailable();
+        setAuthSession((prev) => (prev ? { ...prev, authenticated: false, user: null } : prev));
+        setData(null);
+        return;
+      }
+      if (isTransientApiError(err)) {
+        const msg = err instanceof Error ? err.message : 'No pudimos conectar con el servidor.';
+        markConnectionUnavailable(msg);
+      }
+    },
+    [clearConnectionUnavailable, markConnectionUnavailable]
+  );
+
+  const loadSession = useCallback(async (): Promise<AuthSessionResponse | null> => {
     try {
       const session = await nalasApi.getAuthSession();
+      const issueCode = session.authIssue?.code;
+      const isTransientSessionIssue =
+        !session.authenticated &&
+        (issueCode === 'DB_CONNECTION_ERROR' ||
+          (Boolean(authSessionRef.current?.authenticated) && issueCode === 'SESSION_STORAGE_ERROR'));
+
+      if (isTransientSessionIssue) {
+        markConnectionUnavailable(
+          session.authIssue?.message || session.dbError || 'No pudimos conectar con la base de datos.'
+        );
+        return null;
+      }
+
+      clearConnectionUnavailable();
       setAuthSession(session);
+      if (!session.authenticated) {
+        setData(null);
+      }
+      return session;
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : 'Error al verificar sesión.');
+      if (isExplicitUnauthenticatedError(err)) {
+        clearConnectionUnavailable();
+        setAuthSession((prev) => (prev ? { ...prev, authenticated: false, user: null } : prev));
+        setData(null);
+        return null;
+      }
+      if (isTransientApiError(err) || err instanceof Error) {
+        const msg = err instanceof Error ? err.message : 'Error al verificar sesión.';
+        markConnectionUnavailable(msg);
+        return null;
+      }
+      return null;
     } finally {
       setAuthLoading(false);
     }
-  }, []);
+  }, [clearConnectionUnavailable, markConnectionUnavailable]);
 
   const isPrivacyRoute = isPrivacyPolicyRoute();
 
@@ -119,24 +195,123 @@ export default function App() {
         environment,
       });
       setData(res);
+      clearConnectionUnavailable();
     } catch (err) {
-      const status = (err as { status?: number })?.status;
-      if (status === 401) {
+      if (isExplicitUnauthenticatedError(err)) {
+        clearConnectionUnavailable();
         setAuthSession((prev) => (prev ? { ...prev, authenticated: false, user: null } : prev));
         setData(null);
+      } else if (isTransientApiError(err)) {
+        markConnectionUnavailable(
+          err instanceof Error ? err.message : 'Error al conectar con el servidor Nala.'
+        );
       } else {
         setErrorMsg(err instanceof Error ? err.message : 'Error al conectar con el servidor Nala.');
       }
     } finally {
       setLoading(false);
     }
-  }, [authSession?.authenticated, authSession?.user?.id, businessId, environment]);
+  }, [
+    authSession?.authenticated,
+    authSession?.user?.id,
+    businessId,
+    environment,
+    clearConnectionUnavailable,
+    markConnectionUnavailable,
+  ]);
 
   useEffect(() => {
     if (authSession?.authenticated) {
       loadBootstrap();
     }
   }, [authSession?.authenticated, loadBootstrap]);
+
+  const retryConnectivityOnce = useCallback(async () => {
+    try {
+      const session = await nalasApi.getAuthSession();
+      const issueCode = session.authIssue?.code;
+      const isTransientSessionIssue =
+        !session.authenticated &&
+        (issueCode === 'DB_CONNECTION_ERROR' ||
+          (Boolean(authSessionRef.current?.authenticated) && issueCode === 'SESSION_STORAGE_ERROR'));
+
+      if (isTransientSessionIssue) {
+        setConnectionDetail(
+          session.authIssue?.message || session.dbError || 'No pudimos conectar con la base de datos.'
+        );
+        return false;
+      }
+
+      if (!session.authenticated) {
+        clearConnectionUnavailable();
+        setAuthSession(session);
+        setData(null);
+        return true;
+      }
+
+      setAuthSession(session);
+      if (session.user) {
+        const res = await nalasApi.bootstrap({
+          userId: session.user.id,
+          businessId,
+          environment,
+        });
+        setData(res);
+      }
+      clearConnectionUnavailable();
+      return true;
+    } catch (err) {
+      if (isExplicitUnauthenticatedError(err)) {
+        clearConnectionUnavailable();
+        setAuthSession((prev) => (prev ? { ...prev, authenticated: false, user: null } : prev));
+        setData(null);
+        return true;
+      }
+      if (err instanceof Error) {
+        setConnectionDetail(err.message);
+      }
+      return false;
+    }
+  }, [businessId, environment, clearConnectionUnavailable]);
+
+  useEffect(() => {
+    if (!connectionUnavailable || connectionRetryExhausted) return;
+    if (connectionRetryAttempt >= RETRY_DELAYS_MS.length) {
+      setConnectionRetryExhausted(true);
+      return;
+    }
+    const delayMs = RETRY_DELAYS_MS[connectionRetryAttempt];
+    const timer = setTimeout(() => {
+      void (async () => {
+        const recovered = await retryConnectivityOnce();
+        if (!recovered) {
+          setConnectionRetryAttempt((prev) => {
+            const next = prev + 1;
+            if (next >= RETRY_DELAYS_MS.length) {
+              setConnectionRetryExhausted(true);
+            }
+            return next;
+          });
+        }
+      })();
+    }, delayMs);
+    return () => clearTimeout(timer);
+  }, [connectionUnavailable, connectionRetryAttempt, connectionRetryExhausted, retryConnectivityOnce]);
+
+  async function handleManualConnectivityRetry() {
+    setManualRetrying(true);
+    setConnectionRetryAttempt(0);
+    setConnectionRetryExhausted(false);
+    try {
+      const recovered = await retryConnectivityOnce();
+      if (!recovered) {
+        setConnectionRetryAttempt(0);
+        setConnectionRetryExhausted(false);
+      }
+    } finally {
+      setManualRetrying(false);
+    }
+  }
 
   async function handleLoginSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -229,6 +404,49 @@ export default function App() {
     return (
       <div className="min-h-screen flex items-center justify-center bg-[#F7F8FA] text-sm text-[#5A6877]">
         Verificando sesión en Nala...
+      </div>
+    );
+  }
+
+  if (connectionUnavailable && (!authSession?.authenticated || !authSession.user)) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-[#F7F8FA] px-4 py-10">
+        <div className="w-full max-w-md bg-white border border-[#E2E7EB] rounded-[13px] p-7 space-y-5">
+          <div className="flex items-start gap-3">
+            <AlertTriangle className="w-5 h-5 text-[#8C542C] shrink-0 mt-0.5" />
+            <div className="space-y-1">
+              <h1
+                className="text-lg font-bold tracking-tight text-[#25364A]"
+                style={{ fontFamily: 'var(--font-display)' }}
+              >
+                {connectionRetryExhausted
+                  ? 'No pudimos conectar con Nala'
+                  : 'No pudimos conectar. Reintentando…'}
+              </h1>
+              <p className="text-sm text-[#5A6877]">
+                {connectionRetryExhausted
+                  ? 'El servidor o la base de datos devolvieron una indisponibilidad temporal. No cerramos tu sesión.'
+                  : `Reintento automático ${Math.min(connectionRetryAttempt + 1, RETRY_DELAYS_MS.length)} de ${RETRY_DELAYS_MS.length} en curso…`}
+              </p>
+            </div>
+          </div>
+
+          {connectionDetail && (
+            <div className="p-3 bg-[#FFF0E3] border border-[#F2D7BF] rounded-md text-xs text-[#8C542C] break-words">
+              {connectionDetail}
+            </div>
+          )}
+
+          <button
+            type="button"
+            disabled={manualRetrying}
+            onClick={handleManualConnectivityRetry}
+            className="w-full py-2.5 px-4 text-sm font-medium text-white bg-[#167D83] rounded-md hover:bg-[#116B70] transition-colors disabled:opacity-50 inline-flex items-center justify-center gap-2"
+          >
+            <RefreshCw className={`w-4 h-4 ${manualRetrying ? 'animate-spin' : ''}`} />
+            <span>{manualRetrying ? 'Reintentando...' : 'Reintentar ahora'}</span>
+          </button>
+        </div>
       </div>
     );
   }
@@ -663,6 +881,9 @@ export default function App() {
             ) : (
               <span className="font-semibold text-[#25364A]">Nala</span>
             )}
+            {loading && data && (
+              <span className="text-xs text-[#5A6877] whitespace-nowrap">Actualizando…</span>
+            )}
           </div>
 
           <div className="flex flex-wrap items-center gap-2.5">
@@ -729,6 +950,39 @@ export default function App() {
         {/* Main Content Container */}
         <main className="flex-1 px-4 sm:px-6 lg:px-9 py-7">
           <div className="max-w-[1380px] mx-auto space-y-6">
+            {connectionUnavailable && (
+              <div
+                role="status"
+                className="flex flex-wrap items-center justify-between gap-3 p-4 bg-[#FFF0E3] border border-[#F2D7BF] rounded-[10px] text-sm text-[#8C542C]"
+              >
+                <div className="flex items-start gap-2.5 min-w-0">
+                  <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+                  <div className="space-y-0.5 min-w-0">
+                    <div className="font-semibold">
+                      {connectionRetryExhausted
+                        ? 'No pudimos conectar con el servidor. Tus cambios sin guardar se conservan.'
+                        : 'No pudimos conectar. Reintentando…'}
+                    </div>
+                    <div className="text-xs">
+                      {connectionRetryExhausted
+                        ? 'Las acciones protegidas permanecen pausadas hasta recuperar conexión; no cerramos tu sesión ni descartamos tus cambios.'
+                        : `Conservamos tu sesión y tus cambios sin guardar mientras reintentamos (${Math.min(connectionRetryAttempt + 1, RETRY_DELAYS_MS.length)}/${RETRY_DELAYS_MS.length}).`}
+                      {connectionDetail ? ` Detalle: ${connectionDetail}` : ''}
+                    </div>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  disabled={manualRetrying}
+                  onClick={handleManualConnectivityRetry}
+                  className="inline-flex items-center gap-1.5 min-h-[38px] px-3.5 py-1.5 text-xs font-semibold text-[#8C542C] bg-white border border-[#E5C1A0] rounded-[8px] hover:bg-[#FFF8F1] disabled:opacity-50 shrink-0"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${manualRetrying ? 'animate-spin' : ''}`} />
+                  <span>{manualRetrying ? 'Reintentando...' : 'Reintentar ahora'}</span>
+                </button>
+              </div>
+            )}
+
             {errorMsg && (
               <div className="flex items-center justify-between gap-4 p-4 bg-red-50 border border-red-200 rounded-[10px] text-sm text-red-800">
                 <span>{errorMsg}</span>
@@ -757,9 +1011,11 @@ export default function App() {
               </div>
             )}
 
-            {loading || !data ? (
+            {!data ? (
               <div className="bg-white border border-[#E2E7EB] rounded-[13px] p-10 text-sm text-[#5A6877]">
-                Cargando espacio de Nala...
+                {connectionUnavailable
+                  ? 'Esperando conexión con el servidor para cargar el espacio de Nala...'
+                  : 'Cargando espacio de Nala...'}
               </div>
             ) : tab === 'admin' ? (
               <AdminNalasWorkspace
@@ -810,6 +1066,9 @@ export default function App() {
                     data={data}
                     business={activeBusiness}
                     ctx={ctx}
+                    connectionUnavailable={connectionUnavailable}
+                    onConnectionIssue={handleConnectionIssue}
+                    onConnectionRecovered={clearConnectionUnavailable}
                     onRefresh={loadBootstrap}
                     onError={setErrorMsg}
                     onNotice={setNoticeMsg}

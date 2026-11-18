@@ -1336,8 +1336,16 @@ export function retireFlowVersion(
     throw err;
   }
   if (target.status === 'retirada') {
-    const err = new Error(`La versión v${target.versionNumber} de "${target.name}" ya fue retirada.`);
-    (err as Error & { statusCode?: number }).statusCode = 400;
+    const err = new Error(`La versión v${target.versionNumber} de "${target.name}" ya fue retirada.`) as Error & {
+      statusCode?: number;
+      code?: string;
+      alreadyRetired?: boolean;
+      retiredFlow?: FlowVersion;
+    };
+    err.statusCode = 409;
+    err.code = 'ALREADY_RETIRED';
+    err.alreadyRetired = true;
+    err.retiredFlow = structuredClone(target);
     throw err;
   }
 
@@ -1860,6 +1868,8 @@ export function getAssistantProductionSummary(
         : null,
       hasDraft: Boolean(draftVersion),
       draftVersionNumber: draftVersion?.versionNumber ?? null,
+      publishedVersionIds: versions.filter((v) => v.status === 'publicada').map((v) => v.id),
+      retiredVersionIds: retiredVersions.map((v) => v.id),
       linkedMenuOptions,
       openChatsCount,
       outdatedOpenChatsCount,

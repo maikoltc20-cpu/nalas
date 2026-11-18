@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   AlertTriangle,
   ArrowDown,
@@ -11,6 +11,7 @@ import {
   Play,
   Plus,
   Radio,
+  RefreshCw,
   RotateCcw,
   Save,
   Trash2,
@@ -46,8 +47,11 @@ import {
 import { resolveHumanHandoffConfig } from '../../shared/humanHandoff';
 import {
   type ApiContext,
+  type ApiError,
   type BootstrapResponse,
   type ClientValidationIssue,
+  isExplicitUnauthenticatedError,
+  isTransientApiError,
   nalasApi,
 } from '../api';
 import { TemplateTokenEditor } from './TemplateTokenEditor';
@@ -71,6 +75,9 @@ interface Props {
   data: BootstrapResponse;
   business: Business;
   ctx: ApiContext;
+  connectionUnavailable?: boolean;
+  onConnectionIssue?: (err: unknown) => void;
+  onConnectionRecovered?: () => void;
   onRefresh: () => Promise<void>;
   onError: (msg: string) => void;
   onNotice: (msg: string) => void;
@@ -293,6 +300,9 @@ export function FlowAndRulesDesigner({
   data,
   business,
   ctx,
+  connectionUnavailable = false,
+  onConnectionIssue,
+  onConnectionRecovered,
   onRefresh,
   onError,
   onNotice,
@@ -378,6 +388,11 @@ export function FlowAndRulesDesigner({
   const [publishConfirmModal, setPublishConfirmModal] = useState<'entry' | 'flow' | null>(null);
   const [retireTargetFlow, setRetireTargetFlow] = useState<FlowVersion | null>(null);
   const [retireReason, setRetireReason] = useState('');
+  const [retireBusy, setRetireBusy] = useState(false);
+  const [retireError, setRetireError] = useState<string | null>(null);
+  const [retireUncertain, setRetireUncertain] = useState(false);
+  const retireSubmitGuardRef = useRef(false);
+  const prevConnectionUnavailableRef = useRef(connectionUnavailable);
 
   const activeGroup =
     flowGroups.find((g) => g.flowKey === selectedFlowKey) ??
@@ -507,13 +522,27 @@ export function FlowAndRulesDesigner({
     try {
       const summary = await nalasApi.getProductionSummary(ctx);
       setProductionSummary(summary);
+      if (connectionUnavailable) {
+        onConnectionRecovered?.();
+      }
       return summary;
-    } catch {
+    } catch (e) {
+      if (isExplicitUnauthenticatedError(e) || isTransientApiError(e)) {
+        onConnectionIssue?.(e);
+      }
       return null;
     } finally {
       setLoadingProduction(false);
     }
   }
+
+  useEffect(() => {
+    const wasUnavailable = prevConnectionUnavailableRef.current;
+    prevConnectionUnavailableRef.current = connectionUnavailable;
+    if (wasUnavailable && !connectionUnavailable) {
+      void reloadProductionSummary();
+    }
+  }, [connectionUnavailable]);
 
   useEffect(() => {
     setSelectedFlowKey(defaultFlowKey);
@@ -531,6 +560,10 @@ export function FlowAndRulesDesigner({
     setPublishModalIssues([]);
     setRetireTargetFlow(null);
     setRetireReason('');
+    setRetireBusy(false);
+    setRetireError(null);
+    setRetireUncertain(false);
+    retireSubmitGuardRef.current = false;
     void reloadProductionSummary();
   }, [business.id]);
 
@@ -725,7 +758,23 @@ export function FlowAndRulesDesigner({
     }
   }
 
+  function guardOfflineMutation(setLocalError?: (msg: string) => void): boolean {
+    if (!connectionUnavailable) return false;
+    const msg =
+      'Sin conexión verificada con el servidor. Conservamos tus cambios sin guardar; recuperá la conexión antes de guardar, publicar o retirar.';
+    setLocalError?.(msg);
+    onError(msg);
+    return true;
+  }
+
+  function forwardConnectivityIfNeeded(err: unknown) {
+    if (isExplicitUnauthenticatedError(err) || isTransientApiError(err)) {
+      onConnectionIssue?.(err);
+    }
+  }
+
   async function handleSaveRulesetDraft() {
+    if (guardOfflineMutation((m) => setRulesValidationError(m))) return;
     setBusy(true);
     setRulesValidationError(null);
     try {
@@ -741,6 +790,7 @@ export function FlowAndRulesDesigner({
         'Criterios guardados en borrador. Tocá «Publicar criterios» para aplicarlos a nuevas conversaciones.'
       );
     } catch (e) {
+      forwardConnectivityIfNeeded(e);
       const msg = e instanceof Error ? e.message : 'No se pudieron guardar los criterios.';
       setRulesValidationError(msg);
       onError(msg);
@@ -925,6 +975,7 @@ export function FlowAndRulesDesigner({
   }
 
   async function executeCreateConversation(cleanName: string) {
+    if (guardOfflineMutation()) return;
     setBusy(true);
     try {
       const created = await nalasApi.createConversation(ctx, { name: cleanName });
@@ -956,6 +1007,7 @@ export function FlowAndRulesDesigner({
         `Conversación «${created.name}» creada en borrador. Editala y publicala cuando esté lista.`
       );
     } catch (e) {
+      forwardConnectivityIfNeeded(e);
       onError(e instanceof Error ? e.message : 'No se pudo crear la conversación.');
     } finally {
       setBusy(false);
@@ -1056,6 +1108,7 @@ export function FlowAndRulesDesigner({
   }
 
   async function handleSaveEntryDraft() {
+    if (guardOfflineMutation((m) => setEntryError(m))) return;
     setBusy(true);
     setEntryError(null);
     try {
@@ -1070,6 +1123,7 @@ export function FlowAndRulesDesigner({
         'Borrador de saludo y menú guardado. WhatsApp sigue usando la versión publicada hasta que la publiques.'
       );
     } catch (e) {
+      forwardConnectivityIfNeeded(e);
       const msg = e instanceof Error ? e.message : 'No se pudo guardar el borrador del menú.';
       setEntryError(msg);
       onError(msg);
@@ -1110,6 +1164,7 @@ export function FlowAndRulesDesigner({
   }
 
   async function handleConfirmPublishEntryMenu() {
+    if (guardOfflineMutation((m) => setEntryError(m))) return;
     setBusy(true);
     setEntryError(null);
     try {
@@ -1134,6 +1189,7 @@ export function FlowAndRulesDesigner({
         'Saludo y menú publicados y verificados en el servidor. Aplica a chats nuevos; los chats ya iniciados conservan su versión.'
       );
     } catch (e) {
+      forwardConnectivityIfNeeded(e);
       const msg = e instanceof Error ? e.message : 'No se pudo publicar el saludo y menú.';
       setEntryError(msg);
       onError(msg);
@@ -1149,6 +1205,7 @@ export function FlowAndRulesDesigner({
     }
 
     if (subTab === 'reglas') {
+      if (guardOfflineMutation((m) => setRulesValidationError(m))) return;
       setBusy(true);
       setRulesValidationError(null);
       try {
@@ -1170,6 +1227,7 @@ export function FlowAndRulesDesigner({
           'Criterios guardados en borrador. Tocá «Publicar criterios» para aplicarlos a nuevas conversaciones.'
         );
       } catch (e) {
+        forwardConnectivityIfNeeded(e);
         const msg = e instanceof Error ? e.message : 'No se pudieron guardar los criterios.';
         setRulesValidationError(msg);
         onError(msg);
@@ -1179,6 +1237,7 @@ export function FlowAndRulesDesigner({
       return;
     }
 
+    if (guardOfflineMutation()) return;
     setBusy(true);
     try {
       const res = await nalasApi.saveFlowDraft(ctx, buildFlowDraftPayload());
@@ -1188,6 +1247,7 @@ export function FlowAndRulesDesigner({
       await reloadProductionSummary();
       onNotice('Cambios guardados en el borrador de esta conversación. Tus conversaciones publicadas siguen intactas.');
     } catch (e) {
+      forwardConnectivityIfNeeded(e);
       onError(e instanceof Error ? e.message : 'No se pudieron guardar los cambios.');
     } finally {
       setBusy(false);
@@ -1231,6 +1291,7 @@ export function FlowAndRulesDesigner({
   }
 
   async function handleConfirmPublishFlow() {
+    if (guardOfflineMutation((m) => setPublishModalError(m))) return;
     setBusy(true);
     setPublishModalError(null);
     setPublishModalIssues([]);
@@ -1273,6 +1334,7 @@ export function FlowAndRulesDesigner({
         `Conversación «${res.published.name}» publicada y verificada (v${res.published.versionNumber}) para nuevas personas. Los chats ya iniciados conservan su versión.`
       );
     } catch (e) {
+      forwardConnectivityIfNeeded(e);
       const errWithIssues = e as Error & { issues?: ClientValidationIssue[] };
       const msg = e instanceof Error ? e.message : 'No se pudo publicar la conversación.';
       const issues =
@@ -1289,6 +1351,7 @@ export function FlowAndRulesDesigner({
   }
 
   async function handleRollback(flowVersionId: string) {
+    if (guardOfflineMutation()) return;
     setBusy(true);
     try {
       await nalasApi.rollbackFlow(ctx, flowVersionId);
@@ -1296,37 +1359,148 @@ export function FlowAndRulesDesigner({
       await reloadProductionSummary();
       onNotice('Conversación anterior restaurada para nuevas sesiones.');
     } catch (e) {
+      forwardConnectivityIfNeeded(e);
       onError(e instanceof Error ? e.message : 'No se pudo restaurar la versión.');
     } finally {
       setBusy(false);
     }
   }
 
+  function inspectRetireStateFromSummary(
+    summary: ProductionSummary,
+    targetFlow: FlowVersion
+  ): 'retired' | 'still_published' | 'unknown' {
+    const targetKey = getClientFlowKey(targetFlow);
+    const conv = summary.conversations.find((c) => c.flowKey === targetKey);
+    if (!conv) return 'unknown';
+
+    const inPublishedIds = Array.isArray(conv.publishedVersionIds)
+      ? conv.publishedVersionIds.includes(targetFlow.id)
+      : false;
+    const isLatestPublished = conv.latestPublished?.id === targetFlow.id;
+    const inRetiredIds = Array.isArray(conv.retiredVersionIds)
+      ? conv.retiredVersionIds.includes(targetFlow.id)
+      : false;
+    const isLatestRetired = conv.latestRetired?.id === targetFlow.id;
+
+    if ((inRetiredIds || isLatestRetired) && !inPublishedIds && !isLatestPublished) {
+      return 'retired';
+    }
+    if (inPublishedIds || isLatestPublished) {
+      return 'still_published';
+    }
+    return 'unknown';
+  }
+
+  async function verifyRetireStatusBeforeRetry(
+    targetFlow: FlowVersion
+  ): Promise<'retired' | 'still_published' | 'unknown'> {
+    setRetireBusy(true);
+    try {
+      const summary = await nalasApi.getProductionSummary(ctx);
+      setProductionSummary(summary);
+      onConnectionRecovered?.();
+      const state = inspectRetireStateFromSummary(summary, targetFlow);
+      if (state === 'retired') {
+        setRetireUncertain(false);
+        setRetireError(null);
+        setRetireTargetFlow(null);
+        setRetireReason('');
+        await onRefresh();
+        onNotice(
+          `Edición v${targetFlow.versionNumber} verificada como retirada de producción.`
+        );
+        return 'retired';
+      }
+      if (state === 'still_published') {
+        setRetireUncertain(false);
+        setRetireError(
+          `Confirmamos que la edición v${targetFlow.versionNumber} sigue publicada en producción. Podés reintentar el retiro de forma segura.`
+        );
+        return 'still_published';
+      }
+      setRetireUncertain(true);
+      setRetireError(
+        'El servidor no pudo confirmar de forma concluyente si el retiro se completó. Verificá nuevamente antes de reintentar.'
+      );
+      return 'unknown';
+    } catch (verifyErr) {
+      forwardConnectivityIfNeeded(verifyErr);
+      setRetireUncertain(true);
+      setRetireError(
+        'No pudimos consultar el estado real en el servidor para confirmar si el retiro se aplicó. Verificá el estado antes de reintentar.'
+      );
+      return 'unknown';
+    } finally {
+      setRetireBusy(false);
+    }
+  }
+
   async function handleConfirmRetireFlow() {
-    if (!retireTargetFlow) return;
-    setBusy(true);
+    if (!retireTargetFlow || retireBusy || retireUncertain || connectionUnavailable) return;
+    if (retireSubmitGuardRef.current) return;
+    retireSubmitGuardRef.current = true;
+    const targetFlow = retireTargetFlow;
+    setRetireBusy(true);
+    setRetireError(null);
     try {
       const res = await nalasApi.retireFlowVersion(
         ctx,
-        retireTargetFlow.id,
+        targetFlow.id,
         retireReason.trim() || undefined
       );
-      const verified = await nalasApi.getProductionSummary(ctx);
+      const verified = res.verifiedSummary ?? (await nalasApi.getProductionSummary(ctx));
       setProductionSummary(verified);
+      const confirmedState = inspectRetireStateFromSummary(verified, targetFlow);
+      if (res.retiredFlow?.status !== 'retirada' || confirmedState !== 'retired') {
+        setRetireUncertain(true);
+        setRetireError(
+          'El servidor respondió, pero la verificación posterior no confirmó el retiro completo. Verificá el estado antes de reintentar.'
+        );
+        return;
+      }
+      setRetireUncertain(false);
+      setRetireError(null);
       setRetireTargetFlow(null);
       setRetireReason('');
       await onRefresh();
       onNotice(
-        `Versión v${res.retiredFlow.versionNumber} retirada de producción. Chats abiertos pausados para revisión: ${res.affectedConversationIds.length}.`
+        `Versión v${res.retiredFlow.versionNumber} retirada y verificada en producción. Chats abiertos pausados para revisión: ${res.affectedConversationIds.length}.`
       );
     } catch (e) {
-      onError(e instanceof Error ? e.message : 'No se pudo retirar la versión.');
+      const apiErr = e as ApiError;
+      if (isExplicitUnauthenticatedError(e)) {
+        forwardConnectivityIfNeeded(e);
+        return;
+      }
+      if (apiErr?.alreadyRetired || apiErr?.code === 'ALREADY_RETIRED') {
+        const state = await verifyRetireStatusBeforeRetry(targetFlow);
+        if (state !== 'retired') {
+          setRetireError(
+            'La edición ya figuraba retirada en el servidor, pero no pudimos confirmar la vista actualizada. Verificá el estado.'
+          );
+        }
+        return;
+      }
+      if (isTransientApiError(e)) {
+        forwardConnectivityIfNeeded(e);
+        setRetireUncertain(true);
+        setRetireError(
+          `${e instanceof Error ? e.message : 'La operación no recibió confirmación clara del servidor.'} Verificando el estado real en producción…`
+        );
+        await verifyRetireStatusBeforeRetry(targetFlow);
+        return;
+      }
+      const msg = e instanceof Error ? e.message : 'No se pudo retirar la versión.';
+      setRetireError(msg);
     } finally {
-      setBusy(false);
+      retireSubmitGuardRef.current = false;
+      setRetireBusy(false);
     }
   }
 
   async function handlePublishRuleset() {
+    if (guardOfflineMutation((m) => setRulesValidationError(m))) return;
     setBusy(true);
     setRulesValidationError(null);
     try {
@@ -1341,6 +1515,7 @@ export function FlowAndRulesDesigner({
       await reloadProductionSummary();
       onNotice(`Criterios publicados (v${pub.versionNumber}). Las oportunidades pasadas conservan su estado.`);
     } catch (e) {
+      forwardConnectivityIfNeeded(e);
       const msg = e instanceof Error ? e.message : 'No se pudieron publicar los criterios.';
       setRulesValidationError(msg);
       onError(msg);
@@ -1502,9 +1677,9 @@ export function FlowAndRulesDesigner({
           </button>
           <button
             type="button"
-            disabled={busy}
+            disabled={busy || retireBusy || connectionUnavailable}
             onClick={handleSaveDraft}
-            className="inline-flex items-center gap-1.5 min-h-[44px] px-5 py-2 text-sm font-semibold text-white bg-[#167D83] rounded-[10px] hover:bg-[#116B70] whitespace-nowrap"
+            className="inline-flex items-center gap-1.5 min-h-[44px] px-5 py-2 text-sm font-semibold text-white bg-[#167D83] rounded-[10px] hover:bg-[#116B70] disabled:opacity-45 whitespace-nowrap"
           >
             <Save className="w-4 h-4" />
             <span>{busy ? 'Guardando...' : 'Guardar cambios'}</span>
@@ -2176,26 +2351,26 @@ export function FlowAndRulesDesigner({
               <div className="flex flex-wrap items-center gap-2.5">
                 <button
                   type="button"
-                  disabled={busy}
+                  disabled={busy || retireBusy || connectionUnavailable}
                   onClick={handleSaveEntryDraft}
-                  className="min-h-[44px] px-4 py-2 text-sm font-medium text-[#25364A] bg-white border border-[#DCE3E8] rounded-[10px] hover:bg-[#F7F8FA]"
+                  className="min-h-[44px] px-4 py-2 text-sm font-medium text-[#25364A] bg-white border border-[#DCE3E8] rounded-[10px] hover:bg-[#F7F8FA] disabled:opacity-45"
                 >
                   Guardar borrador del menú
                 </button>
                 <button
                   type="button"
-                  disabled={busy}
+                  disabled={busy || retireBusy || connectionUnavailable}
                   onClick={handleTestEntryDraft}
-                  className="min-h-[44px] px-4 py-2 text-sm font-medium text-[#25364A] bg-white border border-[#DCE3E8] rounded-[10px] hover:bg-[#F7F8FA]"
+                  className="min-h-[44px] px-4 py-2 text-sm font-medium text-[#25364A] bg-white border border-[#DCE3E8] rounded-[10px] hover:bg-[#F7F8FA] disabled:opacity-45"
                 >
                   Probar menú (borrador)
                 </button>
               </div>
               <button
                 type="button"
-                disabled={busy}
+                disabled={busy || retireBusy || connectionUnavailable}
                 onClick={() => setPublishConfirmModal('entry')}
-                className="min-h-[44px] px-5 py-2 text-sm font-semibold text-white bg-[#167D83] rounded-[10px] hover:bg-[#116B70]"
+                className="min-h-[44px] px-5 py-2 text-sm font-semibold text-white bg-[#167D83] rounded-[10px] hover:bg-[#116B70] disabled:opacity-45"
               >
                 Publicar saludo y menú
               </button>
@@ -3111,13 +3286,13 @@ export function FlowAndRulesDesigner({
                     </button>
                     <button
                       type="button"
-                      disabled={busy}
+                      disabled={busy || retireBusy || connectionUnavailable}
                       onClick={() => {
                         setPublishModalError(null);
                         setPublishModalIssues([]);
                         setPublishConfirmModal('flow');
                       }}
-                      className="min-h-[44px] px-5 py-2 text-sm font-semibold text-white bg-[#167D83] rounded-[10px] hover:bg-[#116B70]"
+                      className="min-h-[44px] px-5 py-2 text-sm font-semibold text-white bg-[#167D83] rounded-[10px] hover:bg-[#116B70] disabled:opacity-45"
                     >
                       Publicar conversación
                     </button>
@@ -3421,9 +3596,9 @@ export function FlowAndRulesDesigner({
                                 ) : (
                                   <button
                                     type="button"
-                                    disabled={busy}
+                                    disabled={busy || retireBusy || connectionUnavailable}
                                     onClick={() => handleRollback(fv.id)}
-                                    className="inline-flex items-center gap-1.5 min-h-[38px] px-3 py-1.5 text-xs font-medium text-[#116B70] bg-[#EAF5F2] border border-[#D4EAE4] rounded-[8px] hover:bg-[#DCEFE9] whitespace-nowrap"
+                                    className="inline-flex items-center gap-1.5 min-h-[38px] px-3 py-1.5 text-xs font-medium text-[#116B70] bg-[#EAF5F2] border border-[#D4EAE4] rounded-[8px] hover:bg-[#DCEFE9] disabled:opacity-45 whitespace-nowrap"
                                   >
                                     <RotateCcw className="w-3.5 h-3.5" />
                                     <span>Volver a esta edición</span>
@@ -3431,12 +3606,15 @@ export function FlowAndRulesDesigner({
                                 )}
                                 <button
                                   type="button"
-                                  disabled={busy}
+                                  disabled={busy || retireBusy || connectionUnavailable}
                                   onClick={() => {
                                     setRetireTargetFlow(fv);
                                     setRetireReason('');
+                                    setRetireError(null);
+                                    setRetireUncertain(false);
+                                    retireSubmitGuardRef.current = false;
                                   }}
-                                  className="inline-flex items-center gap-1.5 min-h-[38px] px-3 py-1.5 text-xs font-medium text-red-700 bg-white border border-red-200 rounded-[8px] hover:bg-red-50 whitespace-nowrap"
+                                  className="inline-flex items-center gap-1.5 min-h-[38px] px-3 py-1.5 text-xs font-medium text-red-700 bg-white border border-red-200 rounded-[8px] hover:bg-red-50 disabled:opacity-45 whitespace-nowrap"
                                 >
                                   <Ban className="w-3.5 h-3.5" />
                                   <span>Retirar de producción</span>
@@ -4428,11 +4606,16 @@ export function FlowAndRulesDesigner({
 
       {/* Modal 4: Confirm retire live version */}
       {retireTargetFlow && (
-        <div className="fixed inset-0 z-50 bg-[#1B2531]/45 flex items-center justify-center p-4">
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="retire-modal-title"
+          className="fixed inset-0 z-50 bg-[#1B2531]/45 flex items-center justify-center p-4"
+        >
           <div className="bg-white border border-[#E2E7EB] rounded-[14px] max-w-xl w-full p-6 space-y-4">
             <div className="flex items-start justify-between gap-3">
               <div>
-                <h3 className="text-lg font-semibold text-[#25364A]">
+                <h3 id="retire-modal-title" className="text-lg font-semibold text-[#25364A]">
                   Retirar edición v{retireTargetFlow.versionNumber} de producción
                 </h3>
                 <p className="text-xs text-[#5A6877] mt-0.5">
@@ -4441,8 +4624,14 @@ export function FlowAndRulesDesigner({
               </div>
               <button
                 type="button"
-                onClick={() => setRetireTargetFlow(null)}
-                className="p-1.5 text-[#5A6877] hover:text-[#25364A]"
+                aria-label="Cerrar modal de retiro"
+                disabled={retireBusy}
+                onClick={() => {
+                  setRetireTargetFlow(null);
+                  setRetireError(null);
+                  setRetireUncertain(false);
+                }}
+                className="p-1.5 text-[#5A6877] hover:text-[#25364A] disabled:opacity-45"
               >
                 <X className="w-5 h-5" />
               </button>
@@ -4467,30 +4656,59 @@ export function FlowAndRulesDesigner({
               </label>
               <input
                 type="text"
+                disabled={retireBusy}
                 value={retireReason}
                 onChange={(e) => setRetireReason(e.target.value)}
                 placeholder="Ej: Flujo desactualizado o contenido por corregir"
-                className="w-full min-h-[40px] text-sm border border-[#DCE3E8] rounded-[8px] px-3 py-1.5"
+                className="w-full min-h-[40px] text-sm border border-[#DCE3E8] rounded-[8px] px-3 py-1.5 disabled:bg-[#F7F8FA]"
               />
             </div>
+
+            {retireError && (
+              <div
+                role="alert"
+                className="p-3.5 bg-red-50 border border-red-200 rounded-[10px] text-xs text-red-900 space-y-2.5"
+              >
+                <div className="font-semibold flex items-center gap-1.5">
+                  <AlertTriangle className="w-4 h-4 shrink-0" />
+                  <span>{retireUncertain ? 'Estado de retiro sin confirmar' : 'No se completó el retiro'}</span>
+                </div>
+                <div className="leading-relaxed">{retireError}</div>
+                {retireUncertain && (
+                  <button
+                    type="button"
+                    disabled={retireBusy}
+                    onClick={() => void verifyRetireStatusBeforeRetry(retireTargetFlow)}
+                    className="inline-flex items-center gap-1.5 min-h-[36px] px-3 py-1.5 text-xs font-semibold text-[#25364A] bg-white border border-red-200 rounded-[8px] hover:bg-red-100/50 disabled:opacity-45"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${retireBusy ? 'animate-spin' : ''}`} />
+                    <span>{retireBusy ? 'Verificando estado...' : 'Verificar estado antes de reintentar'}</span>
+                  </button>
+                )}
+              </div>
+            )}
 
             <div className="flex flex-wrap justify-end gap-2.5 pt-2">
               <button
                 type="button"
-                disabled={busy}
-                onClick={() => setRetireTargetFlow(null)}
-                className="min-h-[42px] px-4 py-2 text-sm font-medium text-[#25364A] bg-white border border-[#DCE3E8] rounded-[9px] hover:bg-[#F7F8FA]"
+                disabled={retireBusy}
+                onClick={() => {
+                  setRetireTargetFlow(null);
+                  setRetireError(null);
+                  setRetireUncertain(false);
+                }}
+                className="min-h-[42px] px-4 py-2 text-sm font-medium text-[#25364A] bg-white border border-[#DCE3E8] rounded-[9px] hover:bg-[#F7F8FA] disabled:opacity-45"
               >
                 Cancelar
               </button>
               <button
                 type="button"
-                disabled={busy}
-                onClick={handleConfirmRetireFlow}
+                disabled={retireBusy || retireUncertain || connectionUnavailable}
+                onClick={() => void handleConfirmRetireFlow()}
                 className="inline-flex items-center gap-1.5 min-h-[42px] px-4 py-2 text-sm font-semibold text-white bg-red-700 rounded-[9px] hover:bg-red-800 disabled:opacity-45"
               >
                 <Ban className="w-4 h-4" />
-                <span>{busy ? 'Retirando...' : `Retirar v${retireTargetFlow.versionNumber}`}</span>
+                <span>{retireBusy ? 'Retirando...' : `Retirar v${retireTargetFlow.versionNumber}`}</span>
               </button>
             </div>
           </div>

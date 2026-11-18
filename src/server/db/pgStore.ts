@@ -100,6 +100,25 @@ export async function withPgClient<T>(fn: (client: PoolClient) => Promise<T>): P
   });
 }
 
+export async function withPgClientTimed<T>(
+  fn: (client: PgQueryClient, connectWaitMs: number) => Promise<T>,
+  injectedClient?: PgQueryClient
+): Promise<T> {
+  if (injectedClient) {
+    return fn(injectedClient, 0);
+  }
+  return withPgPool(async (p) => {
+    const connectStart = Date.now();
+    const client = await p.connect();
+    const connectWaitMs = Date.now() - connectStart;
+    try {
+      return await fn(client, connectWaitMs);
+    } finally {
+      client.release();
+    }
+  });
+}
+
 export async function withPgDirectClient<T>(fn: (client: PgQueryClient) => Promise<T>): Promise<T> {
   if (isWorkerRuntime()) {
     const connectionString = validateDatabaseUrl(getEnv('DATABASE_URL'));
@@ -3991,6 +4010,968 @@ export async function readConversationRestartVerificationPg(
     conversation: convRes.rows[0] ? mapPgConversationRow(convRes.rows[0]) : null,
     session: sesRes.rows[0] ? mapPgSessionRow(sesRes.rows[0]) : null,
     openTaskCount: Number(taskCountRes.rows[0]?.open_count ?? 0),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Focused PostgreSQL slices for auth/session, panel middleware, bootstrap,
+// and flow version retirement (zero full-store scans or global locks)
+// ---------------------------------------------------------------------------
+
+export async function readPgAuthSessionSnapshot(
+  client: PgQueryClient,
+  params: {
+    userId?: string | null;
+    includeAllUsers: boolean;
+  }
+): Promise<{
+  initialized: boolean;
+  users: User[];
+  googleLinked: boolean;
+}> {
+  const tblRes = await client.query<{ tbl: string | null }>(
+    `SELECT to_regclass('public.nalas_businesses') AS tbl`
+  );
+  if (!tblRes.rows[0]?.tbl) {
+    return { initialized: false, users: [], googleLinked: false };
+  }
+
+  const anyBiz = await client.query('SELECT 1 FROM nalas_businesses LIMIT 1');
+  if ((anyBiz.rowCount ?? 0) === 0) {
+    return { initialized: false, users: [], googleLinked: false };
+  }
+
+  let users: User[] = [];
+  if (params.includeAllUsers) {
+    const usersRes = await client.query<{
+      id: string;
+      name: string;
+      email: string;
+      is_platform_admin: boolean;
+    }>('SELECT id, name, email, is_platform_admin FROM nalas_users ORDER BY id ASC');
+    users = usersRes.rows.map((r) => ({
+      id: r.id,
+      name: r.name,
+      email: r.email,
+      isPlatformAdmin: Boolean(r.is_platform_admin),
+    }));
+  } else if (params.userId) {
+    const usersRes = await client.query<{
+      id: string;
+      name: string;
+      email: string;
+      is_platform_admin: boolean;
+    }>('SELECT id, name, email, is_platform_admin FROM nalas_users WHERE id = $1 LIMIT 1', [
+      params.userId,
+    ]);
+    users = usersRes.rows.map((r) => ({
+      id: r.id,
+      name: r.name,
+      email: r.email,
+      isPlatformAdmin: Boolean(r.is_platform_admin),
+    }));
+  }
+
+  let googleLinked = false;
+  if (params.userId && users.some((u) => u.id === params.userId)) {
+    const identTbl = await client.query<{ tbl: string | null }>(
+      `SELECT to_regclass('public.nalas_user_identities') AS tbl`
+    );
+    if (identTbl.rows[0]?.tbl) {
+      const linkRes = await client.query(
+        `SELECT 1 FROM nalas_user_identities WHERE user_id = $1 AND provider = 'google' LIMIT 1`,
+        [params.userId]
+      );
+      googleLinked = (linkRes.rowCount ?? 0) > 0;
+    }
+  }
+
+  return { initialized: true, users, googleLinked };
+}
+
+export async function readPgDevOwnerUser(client: PgQueryClient): Promise<User | null> {
+  const res = await client.query<{
+    id: string;
+    name: string;
+    email: string;
+    is_platform_admin: boolean;
+  }>(
+    `SELECT id, name, email, is_platform_admin
+     FROM nalas_users
+     WHERE id = 'user_michael' OR is_platform_admin = TRUE
+     ORDER BY CASE WHEN id = 'user_michael' THEN 0 ELSE 1 END, id ASC
+     LIMIT 2`
+  );
+  if ((res.rowCount ?? 0) > 0) {
+    const r = res.rows[0];
+    return {
+      id: r.id,
+      name: r.name,
+      email: r.email,
+      isPlatformAdmin: Boolean(r.is_platform_admin),
+    };
+  }
+  const fallbackRes = await client.query<{
+    id: string;
+    name: string;
+    email: string;
+    is_platform_admin: boolean;
+  }>('SELECT id, name, email, is_platform_admin FROM nalas_users ORDER BY id ASC LIMIT 1');
+  const first = fallbackRes.rows[0];
+  return first
+    ? {
+        id: first.id,
+        name: first.name,
+        email: first.email,
+        isPlatformAdmin: Boolean(first.is_platform_admin),
+      }
+    : null;
+}
+
+export async function userExistsPg(client: PgQueryClient, userId: string): Promise<boolean> {
+  const res = await client.query('SELECT 1 FROM nalas_users WHERE id = $1 LIMIT 1', [userId]);
+  return (res.rowCount ?? 0) > 0;
+}
+
+export async function loadBootstrapSlicePg(
+  client: PgQueryClient,
+  params: {
+    userId: string;
+    businessId: string;
+    environment: Environment;
+    demoQuickLoginEnabled: boolean;
+  }
+): Promise<NalasStore | null> {
+  const { userId, businessId, environment, demoQuickLoginEnabled } = params;
+
+  const [bizRes, actorUserRes, countersRes] = await Promise.all([
+    client.query('SELECT * FROM nalas_businesses ORDER BY created_at ASC'),
+    client.query<{
+      id: string;
+      name: string;
+      email: string;
+      is_platform_admin: boolean;
+    }>('SELECT id, name, email, is_platform_admin FROM nalas_users WHERE id = $1 LIMIT 1', [userId]),
+    client.query("SELECT * FROM nalas_platform_counters WHERE id = 'global'"),
+  ]);
+
+  if (bizRes.rowCount === 0) {
+    return null;
+  }
+
+  const actorRow = actorUserRes.rows[0];
+  const isAdmin = Boolean(actorRow?.is_platform_admin);
+  const needsAllHeaderRows = isAdmin || demoQuickLoginEnabled;
+
+  const [
+    allUsersRes,
+    memRes,
+    grantsRes,
+    backupsRes,
+    asstRes,
+    connRes,
+    flowRes,
+    rulesRes,
+    policyRes,
+    contactsRes,
+    convsRes,
+    msgsRes,
+    sessionsRes,
+    leadsRes,
+    oppsRes,
+    tasksRes,
+    actionsRes,
+    outboxRes,
+    auditRes,
+  ] = await Promise.all([
+    needsAllHeaderRows
+      ? client.query('SELECT id, name, email, is_platform_admin FROM nalas_users ORDER BY id ASC')
+      : Promise.resolve({ rows: actorUserRes.rows }),
+    needsAllHeaderRows
+      ? client.query('SELECT * FROM nalas_memberships ORDER BY created_at ASC')
+      : client.query(
+          'SELECT * FROM nalas_memberships WHERE business_id = $1 OR user_id = $2 ORDER BY created_at ASC',
+          [businessId, userId]
+        ),
+    needsAllHeaderRows
+      ? client.query('SELECT * FROM nalas_support_grants ORDER BY created_at DESC')
+      : client.query(
+          'SELECT * FROM nalas_support_grants WHERE business_id = $1 ORDER BY created_at DESC',
+          [businessId]
+        ),
+    isAdmin
+      ? client.query('SELECT id, label, created_at FROM nalas_backups ORDER BY created_at DESC LIMIT 20')
+      : Promise.resolve({ rows: [] as Array<Record<string, any>> }),
+    client.query('SELECT * FROM nalas_assistants WHERE business_id = $1 ORDER BY created_at ASC', [
+      businessId,
+    ]),
+    client.query('SELECT * FROM nalas_channel_connections WHERE business_id = $1 ORDER BY id ASC', [
+      businessId,
+    ]),
+    client.query(
+      'SELECT * FROM nalas_flow_versions WHERE business_id = $1 ORDER BY version_number ASC',
+      [businessId]
+    ),
+    client.query(
+      'SELECT * FROM nalas_ruleset_versions WHERE business_id = $1 ORDER BY version_number ASC',
+      [businessId]
+    ),
+    client.query(
+      'SELECT * FROM nalas_pro_policy_versions WHERE business_id = $1 ORDER BY version_number ASC',
+      [businessId]
+    ),
+    client.query(
+      'SELECT * FROM nalas_contacts WHERE business_id = $1 AND environment = $2 ORDER BY created_at ASC',
+      [businessId, environment]
+    ),
+    client.query(
+      'SELECT * FROM nalas_conversations WHERE business_id = $1 AND environment = $2 ORDER BY updated_at DESC',
+      [businessId, environment]
+    ),
+    client.query(
+      'SELECT * FROM nalas_messages WHERE business_id = $1 AND environment = $2 ORDER BY created_at ASC',
+      [businessId, environment]
+    ),
+    client.query(
+      'SELECT * FROM nalas_sessions WHERE business_id = $1 AND environment = $2 ORDER BY created_at ASC',
+      [businessId, environment]
+    ),
+    client.query(
+      'SELECT * FROM nalas_leads WHERE business_id = $1 AND environment = $2 ORDER BY created_at ASC',
+      [businessId, environment]
+    ),
+    client.query(
+      'SELECT * FROM nalas_opportunities WHERE business_id = $1 AND environment = $2 ORDER BY created_at DESC',
+      [businessId, environment]
+    ),
+    client.query(
+      'SELECT * FROM nalas_tasks WHERE business_id = $1 AND environment = $2 ORDER BY created_at DESC',
+      [businessId, environment]
+    ),
+    client.query(
+      'SELECT * FROM nalas_action_attempts WHERE business_id = $1 AND environment = $2 ORDER BY created_at DESC',
+      [businessId, environment]
+    ),
+    client.query(
+      'SELECT * FROM nalas_outbox_events WHERE business_id = $1 AND environment = $2 ORDER BY created_at DESC',
+      [businessId, environment]
+    ),
+    client.query(
+      'SELECT * FROM nalas_audit_events WHERE business_id = $1 ORDER BY created_at DESC LIMIT 60',
+      [businessId]
+    ),
+  ]);
+
+  const businesses: Business[] = bizRes.rows.map((r) => {
+    const { entryConfig, entryDraft } = unpackPgEntryConfig(r.entry_config);
+    return {
+      id: r.id,
+      slug: r.slug,
+      name: r.name,
+      currency: r.currency,
+      currencyDecimals: r.currency_decimals,
+      timezone: r.timezone,
+      language: r.language,
+      contactFormat: r.contact_format,
+      defaultReferencePrefix: r.default_reference_prefix ?? undefined,
+      products: r.products ?? undefined,
+      entryConfig,
+      entryDraft,
+      subscription: r.subscription,
+      activeFlowVersionId: r.active_flow_version_id,
+      activeRulesetVersionId: r.active_ruleset_version_id,
+      activeProPolicyVersionId: r.active_pro_policy_version_id,
+      createdAt: toIsoPg(r.created_at)!,
+    };
+  });
+
+  const users: User[] = allUsersRes.rows.map((r) => ({
+    id: r.id,
+    name: r.name,
+    email: r.email,
+    isPlatformAdmin: Boolean(r.is_platform_admin),
+  }));
+
+  const memberships: Membership[] = memRes.rows.map((r) => ({
+    id: r.id,
+    userId: r.user_id,
+    businessId: r.business_id,
+    role: r.role,
+    createdAt: toIsoPg(r.created_at)!,
+  }));
+
+  const supportGrants: SupportGrant[] = grantsRes.rows.map((r) => ({
+    id: r.id,
+    supportUserId: r.support_user_id,
+    businessId: r.business_id,
+    reason: r.reason,
+    grantedByUserId: r.granted_by_user_id,
+    expiresAt: toIsoPg(r.expires_at)!,
+    active: Boolean(r.active),
+    createdAt: toIsoPg(r.created_at)!,
+  }));
+
+  const assistants: Assistant[] = asstRes.rows.map((r) => ({
+    id: r.id,
+    businessId: r.business_id,
+    name: r.name,
+    purpose: r.purpose,
+    language: r.language,
+    activeMode: r.active_mode,
+    adapterType: r.adapter_type,
+    createdAt: toIsoPg(r.created_at)!,
+  }));
+
+  const channelConnections: ChannelConnection[] = connRes.rows.map((r) => ({
+    id: r.id,
+    businessId: r.business_id,
+    assistantId: r.assistant_id,
+    environment: r.environment,
+    channelType: r.channel_type,
+    displayName: r.display_name,
+    destinationAddress: r.destination_address,
+    supportsButtons: Boolean(r.supports_buttons),
+    maxButtons: r.max_buttons,
+    adapterId: r.adapter_id,
+    implementationStatus: r.implementation_status,
+    status: r.status,
+  }));
+
+  const flowVersions: FlowVersion[] = flowRes.rows.map((r) => {
+    const t = r.templates || {};
+    return {
+      id: r.id,
+      businessId: r.business_id,
+      versionNumber: r.version_number,
+      name: r.name,
+      status: r.status,
+      steps: r.steps,
+      outOfScriptRules: r.out_of_script_rules,
+      ...t,
+      createdAt: toIsoPg(r.created_at)!,
+      publishedAt: toIsoPg(r.published_at),
+    };
+  });
+
+  const rulesetVersions: RulesetVersion[] = rulesRes.rows.map((r) => ({
+    id: r.id,
+    businessId: r.business_id,
+    versionNumber: r.version_number,
+    name: r.name,
+    status: r.status,
+    priorityStrategy: r.priority_strategy,
+    tagStrategy: r.tag_strategy,
+    defaultPriority: r.default_priority,
+    defaultReason: r.default_reason,
+    rules: r.rules,
+    createdAt: toIsoPg(r.created_at)!,
+    publishedAt: toIsoPg(r.published_at),
+  }));
+
+  const proPolicyVersions: ProPolicyVersion[] = policyRes.rows.map((r) => ({
+    id: r.id,
+    businessId: r.business_id,
+    versionNumber: r.version_number,
+    status: r.status,
+    ...(r.policy_data || {}),
+    createdAt: toIsoPg(r.created_at)!,
+    publishedAt: toIsoPg(r.published_at),
+  }));
+
+  const contacts: Contact[] = contactsRes.rows.map((r) => ({
+    id: r.id,
+    businessId: r.business_id,
+    environment: r.environment,
+    fullName: r.full_name ?? undefined,
+    phone: r.phone ?? undefined,
+    email: r.email ?? undefined,
+    company: r.company ?? undefined,
+    createdAt: toIsoPg(r.created_at)!,
+    updatedAt: toIsoPg(r.updated_at)!,
+  }));
+
+  const conversations: Conversation[] = convsRes.rows.map(mapPgConversationRow);
+
+  const messages: Message[] = msgsRes.rows.map((r) => ({
+    id: r.id,
+    businessId: r.business_id,
+    environment: r.environment,
+    conversationId: r.conversation_id,
+    sender: r.sender,
+    text: r.text,
+    options: r.options ?? undefined,
+    renderedChannelText: r.rendered_channel_text ?? undefined,
+    deliveryStatus: r.delivery_status,
+    providerEventId: r.provider_event_id ?? undefined,
+    idempotencyKey: r.idempotency_key ?? undefined,
+    createdAt: toIsoPg(r.created_at)!,
+  }));
+
+  const sessions: Session[] = sessionsRes.rows.map(mapPgSessionRow);
+
+  const leads: Lead[] = leadsRes.rows.map((r) => ({
+    id: r.id,
+    commercialReference: r.commercial_reference ?? undefined,
+    businessId: r.business_id,
+    environment: r.environment,
+    conversationId: r.conversation_id,
+    sessionId: r.session_id,
+    contactId: r.contact_id,
+    productId: r.product_id ?? undefined,
+    productName: r.product_name ?? undefined,
+    captureStatus: r.capture_status,
+    commercialStatus: r.commercial_status,
+    categorization: r.categorization,
+    answers: r.answers,
+    flowVersionId: r.flow_version_id,
+    flowVersionNumber: r.flow_version_number,
+    idempotencyKey: r.idempotency_key,
+    createdAt: toIsoPg(r.created_at)!,
+  }));
+
+  const opportunities: Opportunity[] = oppsRes.rows.map((r) => ({
+    id: r.id,
+    businessId: r.business_id,
+    environment: r.environment,
+    contactId: r.contact_id,
+    leadId: r.lead_id ?? undefined,
+    leadCommercialReference: r.lead_commercial_reference ?? undefined,
+    productId: r.product_id ?? undefined,
+    productName: r.product_name ?? undefined,
+    conversationId: r.conversation_id,
+    title: r.title,
+    amountMinor: Number(r.amount_minor),
+    currency: r.currency,
+    commercialStatus: r.commercial_status,
+    origin: r.origin ?? undefined,
+    nextFollowUp: r.next_follow_up ?? undefined,
+    closingEvidence: r.closing_evidence ?? undefined,
+    createdAt: toIsoPg(r.created_at)!,
+    updatedAt: toIsoPg(r.updated_at)!,
+  }));
+
+  const tasks: Task[] = tasksRes.rows.map((r) => ({
+    id: r.id,
+    businessId: r.business_id,
+    environment: r.environment,
+    conversationId: r.conversation_id,
+    contactId: r.contact_id,
+    productId: r.product_id ?? undefined,
+    productName: r.product_name ?? undefined,
+    title: r.title,
+    contextSummary: r.context_summary,
+    hasUsableContact: Boolean(r.has_usable_contact),
+    contactWarning: r.contact_warning ?? undefined,
+    assignedUserId: r.assigned_user_id ?? undefined,
+    status: r.status,
+    createdAt: toIsoPg(r.created_at)!,
+    updatedAt: toIsoPg(r.updated_at)!,
+  }));
+
+  const actionAttempts: ActionAttempt[] = actionsRes.rows.map((r) => ({
+    id: r.id,
+    businessId: r.business_id,
+    environment: r.environment,
+    conversationId: r.conversation_id,
+    actionType: r.action_type,
+    idempotencyKey: r.idempotency_key,
+    proposedBy: r.proposed_by,
+    params: r.params,
+    policyDecision: r.policy_decision,
+    policyReason: r.policy_reason,
+    status: r.status,
+    externalReference: r.external_reference ?? undefined,
+    adapterUsed: r.adapter_used,
+    createdAt: toIsoPg(r.created_at)!,
+  }));
+
+  const outboxEvents: OutboxEvent[] = outboxRes.rows.map(mapPgOutboxRow);
+
+  const auditEvents: AuditEvent[] = auditRes.rows.map((r) => ({
+    id: r.id,
+    businessId: r.business_id,
+    environment: r.environment ?? undefined,
+    actorUserId: r.actor_user_id,
+    module: r.module,
+    action: r.action,
+    detail: r.detail,
+    correlationId: r.correlation_id ?? undefined,
+    createdAt: toIsoPg(r.created_at)!,
+  }));
+
+  const backups = backupsRes.rows.map((r) => ({
+    id: r.id,
+    label: r.label,
+    createdAt: toIsoPg(r.created_at)!,
+    snapshotJson: '',
+  }));
+
+  const counterRow = countersRes.rows[0];
+  const counters = {
+    basicaAiCallsTotal: Number(counterRow?.basica_ai_calls_total ?? 0),
+    proAiCallsTotal: Number(counterRow?.pro_ai_calls_total ?? 0),
+  };
+
+  const storeSlice: NalasStore = {
+    businesses,
+    users,
+    userCredentials: [],
+    userIdentities: [],
+    memberships,
+    supportGrants,
+    assistants,
+    channelConnections,
+    flowVersions,
+    rulesetVersions,
+    proPolicyVersions,
+    contacts,
+    channelIdentities: [],
+    conversations,
+    messages,
+    sessions,
+    leads,
+    opportunities,
+    tasks,
+    actionAttempts,
+    outboxEvents,
+    auditEvents,
+    processedInboundEvents: [],
+    referenceSequences: [],
+    backups,
+    counters,
+  };
+  reconcileStableProductFlowKeys(storeSlice);
+  return storeSlice;
+}
+
+export async function loadFlowRetireSlicePg(
+  client: PgQueryClient,
+  params: {
+    businessId: string;
+    flowVersionId: string;
+    actorUserId: string;
+  }
+): Promise<{ store: NalasStore | null; queriesExecuted: number }> {
+  const { businessId, flowVersionId, actorUserId } = params;
+  let queriesExecuted = 1;
+  const bizRes = await client.query('SELECT * FROM nalas_businesses WHERE id = $1 LIMIT 1', [
+    businessId,
+  ]);
+  if (bizRes.rowCount === 0) {
+    queriesExecuted += 1;
+    const anyBiz = await client.query('SELECT 1 FROM nalas_businesses LIMIT 1');
+    if (anyBiz.rowCount === 0) {
+      return { store: null, queriesExecuted };
+    }
+  }
+
+  queriesExecuted += 5;
+  const [usersRes, memRes, grantsRes, flowRes, convsRes] = await Promise.all([
+    client.query('SELECT id, name, email, is_platform_admin FROM nalas_users WHERE id = $1 LIMIT 1', [
+      actorUserId,
+    ]),
+    client.query(
+      'SELECT * FROM nalas_memberships WHERE business_id = $1 AND user_id = $2 ORDER BY created_at ASC',
+      [businessId, actorUserId]
+    ),
+    client.query(
+      'SELECT * FROM nalas_support_grants WHERE business_id = $1 AND support_user_id = $2 ORDER BY created_at DESC',
+      [businessId, actorUserId]
+    ),
+    client.query(
+      `SELECT * FROM nalas_flow_versions
+       WHERE business_id = $1
+       ORDER BY version_number ASC
+       FOR UPDATE`,
+      [businessId]
+    ),
+    client.query(
+      `SELECT * FROM nalas_conversations
+       WHERE business_id = $1
+         AND status = 'abierta'
+         AND (
+           pinned_flow_version_id = $2
+           OR id IN (
+             SELECT conversation_id FROM nalas_sessions
+             WHERE business_id = $1 AND pinned_flow_version_id = $2
+           )
+         )
+       ORDER BY updated_at DESC
+       FOR UPDATE`,
+      [businessId, flowVersionId]
+    ),
+  ]);
+
+  const affectedConvIds = convsRes.rows.map((r) => String(r.id)).filter(Boolean);
+  const contactIds = Array.from(
+    new Set(convsRes.rows.map((r) => String(r.contact_id ?? '')).filter(Boolean))
+  );
+
+  let sessionsRes: { rows: Array<Record<string, any>> } = { rows: [] };
+  let outboxRes: { rows: Array<Record<string, any>> } = { rows: [] };
+  let tasksRes: { rows: Array<Record<string, any>> } = { rows: [] };
+  let contactsRes: { rows: Array<Record<string, any>> } = { rows: [] };
+
+  if (affectedConvIds.length > 0) {
+    queriesExecuted += 3 + (contactIds.length > 0 ? 1 : 0);
+    [sessionsRes, outboxRes, tasksRes, contactsRes] = await Promise.all([
+      client.query(
+        `SELECT * FROM nalas_sessions
+         WHERE business_id = $1 AND conversation_id = ANY($2::text[])
+         FOR UPDATE`,
+        [businessId, affectedConvIds]
+      ),
+      client.query(
+        `SELECT * FROM nalas_outbox_events
+         WHERE business_id = $1
+           AND conversation_id = ANY($2::text[])
+           AND delivery_status IN ('pendiente', 'fallido')
+         FOR UPDATE`,
+        [businessId, affectedConvIds]
+      ),
+      client.query(
+        `SELECT * FROM nalas_tasks
+         WHERE business_id = $1
+           AND conversation_id = ANY($2::text[])
+           AND status <> 'resuelta'`,
+        [businessId, affectedConvIds]
+      ),
+      contactIds.length > 0
+        ? client.query(
+            `SELECT * FROM nalas_contacts
+             WHERE business_id = $1 AND id = ANY($2::text[])`,
+            [businessId, contactIds]
+          )
+        : Promise.resolve({ rows: [] as Array<Record<string, any>> }),
+    ]);
+  }
+
+  const businesses: Business[] = bizRes.rows.map((r) => {
+    const { entryConfig, entryDraft } = unpackPgEntryConfig(r.entry_config);
+    return {
+      id: r.id,
+      slug: r.slug,
+      name: r.name,
+      currency: r.currency,
+      currencyDecimals: r.currency_decimals,
+      timezone: r.timezone,
+      language: r.language,
+      contactFormat: r.contact_format,
+      defaultReferencePrefix: r.default_reference_prefix ?? undefined,
+      products: r.products ?? undefined,
+      entryConfig,
+      entryDraft,
+      subscription: r.subscription,
+      activeFlowVersionId: r.active_flow_version_id,
+      activeRulesetVersionId: r.active_ruleset_version_id,
+      activeProPolicyVersionId: r.active_pro_policy_version_id,
+      createdAt: toIsoPg(r.created_at)!,
+    };
+  });
+
+  const users: User[] = usersRes.rows.map((r) => ({
+    id: r.id,
+    name: r.name,
+    email: r.email,
+    isPlatformAdmin: Boolean(r.is_platform_admin),
+  }));
+
+  const memberships: Membership[] = memRes.rows.map((r) => ({
+    id: r.id,
+    userId: r.user_id,
+    businessId: r.business_id,
+    role: r.role,
+    createdAt: toIsoPg(r.created_at)!,
+  }));
+
+  const supportGrants: SupportGrant[] = grantsRes.rows.map((r) => ({
+    id: r.id,
+    supportUserId: r.support_user_id,
+    businessId: r.business_id,
+    reason: r.reason,
+    grantedByUserId: r.granted_by_user_id,
+    expiresAt: toIsoPg(r.expires_at)!,
+    active: Boolean(r.active),
+    createdAt: toIsoPg(r.created_at)!,
+  }));
+
+  const flowVersions: FlowVersion[] = flowRes.rows.map((r) => {
+    const t = r.templates || {};
+    return {
+      id: r.id,
+      businessId: r.business_id,
+      versionNumber: r.version_number,
+      name: r.name,
+      status: r.status,
+      steps: r.steps,
+      outOfScriptRules: r.out_of_script_rules,
+      ...t,
+      createdAt: toIsoPg(r.created_at)!,
+      publishedAt: toIsoPg(r.published_at),
+    };
+  });
+
+  const conversations: Conversation[] = convsRes.rows.map(mapPgConversationRow);
+  const sessions: Session[] = sessionsRes.rows.map(mapPgSessionRow);
+  const outboxEvents: OutboxEvent[] = outboxRes.rows.map(mapPgOutboxRow);
+  const contacts: Contact[] = contactsRes.rows.map((r) => ({
+    id: r.id,
+    businessId: r.business_id,
+    environment: r.environment,
+    fullName: r.full_name ?? undefined,
+    phone: r.phone ?? undefined,
+    email: r.email ?? undefined,
+    company: r.company ?? undefined,
+    createdAt: toIsoPg(r.created_at)!,
+    updatedAt: toIsoPg(r.updated_at)!,
+  }));
+  const tasks: Task[] = tasksRes.rows.map((r) => ({
+    id: r.id,
+    businessId: r.business_id,
+    environment: r.environment,
+    conversationId: r.conversation_id,
+    contactId: r.contact_id,
+    productId: r.product_id ?? undefined,
+    productName: r.product_name ?? undefined,
+    title: r.title,
+    contextSummary: r.context_summary,
+    hasUsableContact: Boolean(r.has_usable_contact),
+    contactWarning: r.contact_warning ?? undefined,
+    assignedUserId: r.assigned_user_id ?? undefined,
+    status: r.status,
+    createdAt: toIsoPg(r.created_at)!,
+    updatedAt: toIsoPg(r.updated_at)!,
+  }));
+
+  const storeSlice: NalasStore = {
+    businesses,
+    users,
+    userCredentials: [],
+    userIdentities: [],
+    memberships,
+    supportGrants,
+    assistants: [],
+    channelConnections: [],
+    flowVersions,
+    rulesetVersions: [],
+    proPolicyVersions: [],
+    contacts,
+    channelIdentities: [],
+    conversations,
+    messages: [],
+    sessions,
+    leads: [],
+    opportunities: [],
+    tasks,
+    actionAttempts: [],
+    outboxEvents,
+    auditEvents: [],
+    processedInboundEvents: [],
+    referenceSequences: [],
+    backups: [],
+    counters: { basicaAiCallsTotal: 0, proAiCallsTotal: 0 },
+  };
+  reconcileStableProductFlowKeys(storeSlice);
+  return { store: storeSlice, queriesExecuted };
+}
+
+export async function persistFlowRetireSlicePg(
+  client: PgQueryClient,
+  beforeStore: NalasStore,
+  afterStore: NalasStore
+): Promise<{ queriesExecuted: number }> {
+  let queriesExecuted = 0;
+  const writes: Promise<unknown>[] = [];
+
+  const beforeFlowMap = new Map(beforeStore.flowVersions.map((f) => [f.id, JSON.stringify(f)]));
+  for (const f of afterStore.flowVersions) {
+    if (beforeFlowMap.get(f.id) === JSON.stringify(f)) continue;
+    const templates = {
+      flowKey: f.flowKey,
+      summaryConfig: f.summaryConfig,
+      summaryTemplate: f.summaryTemplate,
+      closureTemplate: f.closureTemplate,
+      referenceTemplate: f.referenceTemplate,
+      alreadyRegisteredTemplate: f.alreadyRegisteredTemplate,
+      cancelMessage: f.cancelMessage,
+      showReferenceInClosure: f.showReferenceInClosure,
+      closureUsesInlineReference: f.closureUsesInlineReference,
+      handoffMessage: f.handoffMessage,
+      handoffNoContactMessage: f.handoffNoContactMessage,
+      outOfScriptPrompt: f.outOfScriptPrompt,
+      hideInternalCategorizationInClosure: f.hideInternalCategorizationInClosure,
+      humanHandoffConfig: f.humanHandoffConfig,
+      publishedByUserId: f.publishedByUserId,
+      publishedByName: f.publishedByName,
+      retiredAt: f.retiredAt,
+      retiredByUserId: f.retiredByUserId,
+      retiredByName: f.retiredByName,
+      retiredReason: f.retiredReason,
+    };
+    queriesExecuted += 1;
+    writes.push(
+      client.query(
+        `UPDATE nalas_flow_versions
+         SET status = $3,
+             templates = $4
+         WHERE id = $1 AND business_id = $2`,
+        [f.id, f.businessId, f.status, JSON.stringify(templates)]
+      )
+    );
+  }
+
+  const beforeConvMap = new Map(beforeStore.conversations.map((c) => [c.id, JSON.stringify(c)]));
+  for (const cv of afterStore.conversations) {
+    if (beforeConvMap.get(cv.id) === JSON.stringify(cv)) continue;
+    queriesExecuted += 1;
+    writes.push(
+      client.query(
+        `UPDATE nalas_conversations
+         SET control = $3,
+             updated_at = $4
+         WHERE id = $1 AND business_id = $2`,
+        [cv.id, cv.businessId, cv.control, cv.updatedAt]
+      )
+    );
+  }
+
+  const beforeSesMap = new Map(beforeStore.sessions.map((s) => [s.id, JSON.stringify(s)]));
+  for (const s of afterStore.sessions) {
+    if (beforeSesMap.get(s.id) === JSON.stringify(s)) continue;
+    queriesExecuted += 1;
+    writes.push(
+      client.query(
+        `UPDATE nalas_sessions
+         SET flags = $3,
+             updated_at = $4
+         WHERE id = $1 AND business_id = $2`,
+        [s.id, s.businessId, JSON.stringify(packPgSessionFlags(s)), s.updatedAt]
+      )
+    );
+  }
+
+  const beforeOutboxMap = new Map(beforeStore.outboxEvents.map((o) => [o.id, JSON.stringify(o)]));
+  for (const ob of afterStore.outboxEvents) {
+    if (beforeOutboxMap.get(ob.id) === JSON.stringify(ob)) continue;
+    queriesExecuted += 1;
+    writes.push(
+      client.query(
+        `UPDATE nalas_outbox_events
+         SET next_retry_at = $3,
+             last_error = $4,
+             updated_at = $5
+         WHERE id = $1 AND business_id = $2`,
+        [ob.id, ob.businessId, ob.nextRetryAt ?? null, ob.lastError ?? null, ob.updatedAt]
+      )
+    );
+  }
+
+  const beforeTaskIds = new Set(beforeStore.tasks.map((t) => t.id));
+  for (const t of afterStore.tasks) {
+    if (beforeTaskIds.has(t.id)) continue;
+    queriesExecuted += 1;
+    writes.push(
+      client.query(
+        `INSERT INTO nalas_tasks (
+           id, business_id, environment, conversation_id, contact_id, product_id, product_name,
+           title, context_summary, has_usable_contact, contact_warning, assigned_user_id, status, created_at, updated_at
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+         ON CONFLICT (id) DO NOTHING`,
+        [
+          t.id,
+          t.businessId,
+          t.environment,
+          t.conversationId,
+          t.contactId,
+          t.productId ?? null,
+          t.productName ?? null,
+          t.title,
+          t.contextSummary,
+          t.hasUsableContact,
+          t.contactWarning ?? null,
+          t.assignedUserId ?? null,
+          t.status,
+          t.createdAt,
+          t.updatedAt,
+        ]
+      )
+    );
+  }
+
+  const beforeAuditIds = new Set(beforeStore.auditEvents.map((a) => a.id));
+  for (const au of afterStore.auditEvents) {
+    if (beforeAuditIds.has(au.id)) continue;
+    queriesExecuted += 1;
+    writes.push(
+      client.query(
+        `INSERT INTO nalas_audit_events (
+           id, business_id, environment, actor_user_id, module, action, detail, correlation_id, created_at
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+         ON CONFLICT (id) DO NOTHING`,
+        [
+          au.id,
+          au.businessId,
+          au.environment ?? null,
+          au.actorUserId,
+          au.module,
+          au.action,
+          au.detail,
+          au.correlationId ?? null,
+          au.createdAt,
+        ]
+      )
+    );
+  }
+
+  if (writes.length > 0) {
+    await Promise.all(writes);
+  }
+  return { queriesExecuted };
+}
+
+export async function readFlowRetireVerificationPg(
+  client: PgQueryClient,
+  businessId: string,
+  flowVersionId: string
+): Promise<{ retiredFlow: FlowVersion | null; unpausedAffectedCount: number }> {
+  const [flowRes, openRes] = await Promise.all([
+    client.query('SELECT * FROM nalas_flow_versions WHERE id = $1 AND business_id = $2 LIMIT 1', [
+      flowVersionId,
+      businessId,
+    ]),
+    client.query<{ cnt: number | string }>(
+      `SELECT COUNT(*)::int AS cnt
+       FROM nalas_conversations
+       WHERE business_id = $1
+         AND status = 'abierta'
+         AND control <> 'esperando_humano'
+         AND pinned_flow_version_id = $2`,
+      [businessId, flowVersionId]
+    ),
+  ]);
+
+  const r = flowRes.rows[0];
+  const retiredFlow: FlowVersion | null = r
+    ? (() => {
+        const t = r.templates || {};
+        return {
+          id: r.id,
+          businessId: r.business_id,
+          versionNumber: r.version_number,
+          name: r.name,
+          status: r.status,
+          steps: r.steps,
+          outOfScriptRules: r.out_of_script_rules,
+          ...t,
+          createdAt: toIsoPg(r.created_at)!,
+          publishedAt: toIsoPg(r.published_at),
+        };
+      })()
+    : null;
+
+  return {
+    retiredFlow,
+    unpausedAffectedCount: Number(openRes.rows[0]?.cnt ?? 0),
   };
 }
 

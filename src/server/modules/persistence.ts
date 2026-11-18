@@ -1,21 +1,35 @@
-import type { Conversation, NalasStore, Session } from '../../shared/types.ts';
+import type { Conversation, Environment, FlowVersion, NalasStore, Session, User } from '../../shared/types.ts';
 import { repairExistingFlowDraft } from '../../shared/flowTemplates.ts';
 import {
+  type PgQueryClient,
+  insertAuditEventPg,
   isPgUndefinedTableError,
   isPostgresConfigured,
+  loadBootstrapSlicePg,
   loadConversationRestartSlicePg,
   loadFlowConfigStoreSlicePg,
+  loadFlowRetireSlicePg,
   loadStoreFromPg,
   persistConversationRestartSlicePg,
   persistFlowConfigSlicePg,
+  persistFlowRetireSlicePg,
   readConversationRestartVerificationPg,
+  readFlowRetireVerificationPg,
+  readPgAuthSessionSnapshot,
+  readPgDevOwnerUser,
   saveStoreToPg,
+  upsertChannelConnectionPg,
+  userExistsPg,
   withPgClient,
+  withPgClientTimed,
 } from '../db/pgStore.ts';
 import { getEnv, isWorkerRuntime } from '../runtimeContext.ts';
 import { repairExistingAgentContacts } from './commercial.ts';
 import { getFlowKey, reconcileStableProductFlowKeys } from './config.ts';
-import { sanitizeErroneousProdWhatsAppBinding } from './metaAssetPolicy.ts';
+import {
+  isErroneousProdWhatsAppConnection,
+  sanitizeErroneousProdWhatsAppBinding,
+} from './metaAssetPolicy.ts';
 import { createInitialStore } from './seed.ts';
 
 export const PG_ADVISORY_LOCK_ID = 78412031;
@@ -362,7 +376,9 @@ export async function withFlowConfigTransaction<T>(
   return withPgClient(async (client) => {
     try {
       await client.query('BEGIN');
-      await client.query('SELECT pg_advisory_xact_lock($1)', [PG_ADVISORY_LOCK_ID]);
+      await client.query(`SET LOCAL lock_timeout = '5000'`);
+      await client.query(`SET LOCAL statement_timeout = '10000'`);
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext('flow_cfg:' || $1))`, [businessId]);
       const current = await loadFlowConfigStoreSlicePg(client, businessId);
       if (!current) {
         throw createNotInitializedError();
@@ -380,6 +396,325 @@ export async function withFlowConfigTransaction<T>(
       throw err;
     }
   });
+}
+
+export async function readAuthSessionSnapshot(
+  params: {
+    userId?: string | null;
+    includeAllUsers: boolean;
+  },
+  injectedClient?: PgQueryClient
+): Promise<{
+  initialized: boolean;
+  users: User[];
+  googleLinked: boolean;
+}> {
+  if (!isPostgresConfigured() && !injectedClient) {
+    const store = await ensureFileStoreLoaded();
+    const users = params.includeAllUsers
+      ? structuredClone(store.users)
+      : params.userId
+        ? structuredClone(store.users.filter((u) => u.id === params.userId))
+        : [];
+    const googleLinked = Boolean(
+      params.userId &&
+        store.userIdentities?.some((i) => i.userId === params.userId && i.provider === 'google')
+    );
+    return { initialized: true, users, googleLinked };
+  }
+
+  return withPgClientTimed(async (client) => {
+    try {
+      return await readPgAuthSessionSnapshot(client, params);
+    } catch (err) {
+      if (isPgUndefinedTableError(err)) {
+        return { initialized: false, users: [], googleLinked: false };
+      }
+      throw err;
+    }
+  }, injectedClient);
+}
+
+export async function readDevOwnerUserInPersistence(
+  injectedClient?: PgQueryClient
+): Promise<User | null> {
+  if (!isPostgresConfigured() && !injectedClient) {
+    const store = await ensureFileStoreLoaded();
+    return (
+      store.users.find((u) => u.id === 'user_michael') ??
+      store.users.find((u) => u.isPlatformAdmin) ??
+      store.users[0] ??
+      null
+    );
+  }
+  return withPgClientTimed(async (client) => {
+    try {
+      return await readPgDevOwnerUser(client);
+    } catch (err) {
+      if (isPgUndefinedTableError(err)) {
+        throw createNotInitializedError();
+      }
+      throw err;
+    }
+  }, injectedClient);
+}
+
+export async function userExistsInPersistence(
+  userId: string,
+  injectedClient?: PgQueryClient
+): Promise<boolean> {
+  if (!isPostgresConfigured() && !injectedClient) {
+    const store = await ensureFileStoreLoaded();
+    return store.users.some((u) => u.id === userId);
+  }
+  return withPgClientTimed(async (client) => {
+    try {
+      return await userExistsPg(client, userId);
+    } catch (err) {
+      if (isPgUndefinedTableError(err)) {
+        throw createNotInitializedError();
+      }
+      throw err;
+    }
+  }, injectedClient);
+}
+
+export async function readBootstrapSlice(
+  params: {
+    userId: string;
+    businessId: string;
+    environment: Environment;
+    demoQuickLoginEnabled: boolean;
+  },
+  injectedClient?: PgQueryClient
+): Promise<NalasStore> {
+  if (!isPostgresConfigured() && !injectedClient) {
+    let store = await readStore();
+    if (store.channelConnections.some(isErroneousProdWhatsAppConnection)) {
+      await withStoreTransaction((tx) => {
+        sanitizeErroneousProdWhatsAppBinding(tx, params.userId);
+      });
+      store = await readStore();
+    }
+    repairExistingAgentContacts(store);
+    return store;
+  }
+
+  return withPgClientTimed(async (client) => {
+    try {
+      const loaded = await loadBootstrapSlicePg(client, params);
+      if (!loaded) {
+        throw createNotInitializedError();
+      }
+      if (loaded.channelConnections.some(isErroneousProdWhatsAppConnection)) {
+        const beforeConns = new Map(
+          loaded.channelConnections.map((cn) => [cn.id, JSON.stringify(cn)])
+        );
+        const beforeAudits = new Set(loaded.auditEvents.map((a) => a.id));
+        const changed = sanitizeErroneousProdWhatsAppBinding(loaded, params.userId);
+        if (changed) {
+          await client.query('BEGIN');
+          try {
+            for (const cn of loaded.channelConnections) {
+              if (beforeConns.get(cn.id) !== JSON.stringify(cn)) {
+                await upsertChannelConnectionPg(client, cn);
+              }
+            }
+            for (const au of loaded.auditEvents) {
+              if (!beforeAudits.has(au.id)) {
+                await insertAuditEventPg(client, au);
+              }
+            }
+            await client.query('COMMIT');
+          } catch (txErr) {
+            await client.query('ROLLBACK').catch(() => {});
+            throw txErr;
+          }
+        }
+      }
+      repairExistingAgentContacts(loaded);
+      return loaded;
+    } catch (err) {
+      if (isPgUndefinedTableError(err)) {
+        throw createNotInitializedError();
+      }
+      throw err;
+    }
+  }, injectedClient);
+}
+
+export interface FlowRetireTimings {
+  backend: 'postgres_focused' | 'local_json_dev';
+  connectWaitMs: number;
+  lockWaitMs: number;
+  readsMs: number;
+  validationAndDomainMs: number;
+  writesMs: number;
+  commitMs: number;
+  verifyReadMs: number;
+  totalMs: number;
+  queriesExecuted?: number;
+}
+
+export async function withFlowRetireTransaction<T>(
+  businessId: string,
+  flowVersionId: string,
+  actorUserId: string,
+  fn: (store: NalasStore) => Promise<T> | T,
+  injectedClient?: PgQueryClient
+): Promise<{
+  result: T;
+  retiredFlow: FlowVersion;
+  verifiedStore: NalasStore;
+  unpausedAffectedCount: number;
+  timings: FlowRetireTimings;
+}> {
+  const totalStart = Date.now();
+
+  if (isPostgresConfigured() || injectedClient) {
+    return withPgClientTimed(async (client, connectWaitMs) => {
+      try {
+        const lockStart = Date.now();
+        await client.query('BEGIN');
+        await client.query(`SET LOCAL lock_timeout = '5000'`);
+        await client.query(`SET LOCAL statement_timeout = '10000'`);
+        await client.query(`SELECT pg_advisory_xact_lock(hashtext('flow_cfg:' || $1))`, [
+          businessId,
+        ]);
+        const lockWaitMs = Date.now() - lockStart;
+
+        const readStart = Date.now();
+        const { store: current, queriesExecuted: readQueries } = await loadFlowRetireSlicePg(
+          client,
+          { businessId, flowVersionId, actorUserId }
+        );
+        if (!current) {
+          throw createNotInitializedError();
+        }
+        const readsMs = Date.now() - readStart;
+
+        const domainStart = Date.now();
+        const draft = structuredClone(current);
+        const result = await fn(draft);
+        const validationAndDomainMs = Date.now() - domainStart;
+
+        const writeStart = Date.now();
+        const { queriesExecuted: writeQueries } = await persistFlowRetireSlicePg(
+          client,
+          current,
+          draft
+        );
+        const writesMs = Date.now() - writeStart;
+
+        const commitStart = Date.now();
+        await client.query('COMMIT');
+        const commitMs = Date.now() - commitStart;
+
+        const verifyStart = Date.now();
+        const verification = await readFlowRetireVerificationPg(
+          client,
+          businessId,
+          flowVersionId
+        );
+        const verifiedStore = await loadFlowConfigStoreSlicePg(client, businessId);
+        const verifyReadMs = Date.now() - verifyStart;
+
+        if (!verification.retiredFlow || verification.retiredFlow.status !== 'retirada') {
+          throw new Error('No se pudo verificar el retiro de la versión en el servidor.');
+        }
+        if (!verifiedStore) {
+          throw createNotInitializedError();
+        }
+
+        return {
+          result,
+          retiredFlow: verification.retiredFlow,
+          verifiedStore,
+          unpausedAffectedCount: verification.unpausedAffectedCount,
+          timings: {
+            backend: 'postgres_focused',
+            connectWaitMs,
+            lockWaitMs,
+            readsMs,
+            validationAndDomainMs,
+            writesMs,
+            commitMs,
+            verifyReadMs,
+            totalMs: Date.now() - totalStart,
+            queriesExecuted: readQueries + writeQueries + 2,
+          },
+        };
+      } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        if (isPgUndefinedTableError(err)) {
+          throw createNotInitializedError();
+        }
+        throw err;
+      }
+    }, injectedClient);
+  }
+
+  let result!: T;
+  let readsMs = 0;
+  let validationAndDomainMs = 0;
+  let writesMs = 0;
+  let lockWaitMs = 0;
+
+  const queueStart = Date.now();
+  const run = async () => {
+    lockWaitMs = Date.now() - queueStart;
+    const readStart = Date.now();
+    const current = await ensureFileStoreLoaded();
+    const draft = structuredClone(current);
+    readsMs = Date.now() - readStart;
+
+    const domainStart = Date.now();
+    result = await fn(draft);
+    validationAndDomainMs = Date.now() - domainStart;
+
+    const writeStart = Date.now();
+    memoryStore = draft;
+    await persistFileAtomically(draft);
+    writesMs = Date.now() - writeStart;
+  };
+  writeQueue = writeQueue.then(run, run);
+  await writeQueue;
+
+  const verifyStart = Date.now();
+  const verifiedStore = await readStore();
+  const retiredFlow = verifiedStore.flowVersions.find(
+    (f) => f.id === flowVersionId && f.businessId === businessId && f.status === 'retirada'
+  );
+  const unpausedAffectedCount = verifiedStore.conversations.filter(
+    (cv) =>
+      cv.businessId === businessId &&
+      cv.status === 'abierta' &&
+      cv.control !== 'esperando_humano' &&
+      cv.pinnedFlowVersionId === flowVersionId
+  ).length;
+  const verifyReadMs = Date.now() - verifyStart;
+
+  if (!retiredFlow) {
+    throw new Error('No se pudo verificar el retiro de la versión en el servidor.');
+  }
+
+  return {
+    result,
+    retiredFlow,
+    verifiedStore,
+    unpausedAffectedCount,
+    timings: {
+      backend: 'local_json_dev',
+      connectWaitMs: 0,
+      lockWaitMs,
+      readsMs,
+      validationAndDomainMs,
+      writesMs,
+      commitMs: 0,
+      verifyReadMs,
+      totalMs: Date.now() - totalStart,
+    },
+  };
 }
 
 export interface ConversationRestartTimings {

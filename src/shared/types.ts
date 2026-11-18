@@ -711,6 +711,8 @@ export interface ProductionConversationSummary {
   } | null;
   hasDraft: boolean;
   draftVersionNumber: number | null;
+  publishedVersionIds?: string[];
+  retiredVersionIds?: string[];
   linkedMenuOptions: string[];
   openChatsCount: number;
   outdatedOpenChatsCount: number;

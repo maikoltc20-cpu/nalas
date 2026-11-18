@@ -123,6 +123,75 @@ export interface ApiContext {
   environment: Environment;
 }
 
+export type ApiErrorKind =
+  | 'timeout'
+  | 'network'
+  | 'unexpected_html'
+  | 'invalid_response'
+  | 'unauthenticated'
+  | 'transient_http'
+  | 'http_client';
+
+export class ApiError extends Error {
+  kind: ApiErrorKind;
+  status?: number;
+  code?: string;
+  isHtml?: boolean;
+  issues?: ClientValidationIssue[];
+  alreadyRetired?: boolean;
+  retiredFlow?: FlowVersion;
+
+  constructor(
+    message: string,
+    opts: {
+      kind: ApiErrorKind;
+      status?: number;
+      code?: string;
+      isHtml?: boolean;
+      issues?: ClientValidationIssue[];
+      alreadyRetired?: boolean;
+      retiredFlow?: FlowVersion;
+    }
+  ) {
+    super(message);
+    this.name = 'ApiError';
+    this.kind = opts.kind;
+    this.status = opts.status;
+    this.code = opts.code;
+    this.isHtml = opts.isHtml;
+    this.issues = opts.issues;
+    this.alreadyRetired = opts.alreadyRetired;
+    this.retiredFlow = opts.retiredFlow;
+  }
+}
+
+export function isExplicitUnauthenticatedError(err: unknown): boolean {
+  if (err instanceof ApiError) {
+    return err.kind === 'unauthenticated';
+  }
+  const status = (err as { status?: number })?.status;
+  const isHtml = (err as { isHtml?: boolean })?.isHtml;
+  return status === 401 && !isHtml;
+}
+
+export function isTransientApiError(err: unknown): boolean {
+  if (err instanceof ApiError) {
+    return (
+      err.kind === 'timeout' ||
+      err.kind === 'network' ||
+      err.kind === 'unexpected_html' ||
+      err.kind === 'invalid_response' ||
+      err.kind === 'transient_http'
+    );
+  }
+  if (err instanceof Error) {
+    const status = (err as { status?: number })?.status;
+    if (typeof status === 'number' && status >= 500) return true;
+    if (err.name === 'AbortError' || err.name === 'TypeError') return true;
+  }
+  return false;
+}
+
 async function apiFetch<T>(
   path: string,
   ctx?: ApiContext,
@@ -136,10 +205,11 @@ async function apiFetch<T>(
     headers['x-nalas-business-id'] = ctx.businessId;
   }
 
-  const { timeoutMs, signal: externalSignal, ...fetchInit } = init ?? {};
-  const controller = timeoutMs && !externalSignal ? new AbortController() : null;
+  const { timeoutMs: explicitTimeoutMs, signal: externalSignal, ...fetchInit } = init ?? {};
+  const timeoutMs = explicitTimeoutMs ?? 15000;
+  const controller = timeoutMs > 0 && !externalSignal ? new AbortController() : null;
   let timer: ReturnType<typeof setTimeout> | undefined;
-  if (controller && timeoutMs) {
+  if (controller && timeoutMs > 0) {
     timer = setTimeout(() => controller.abort(), timeoutMs);
   }
 
@@ -153,11 +223,15 @@ async function apiFetch<T>(
     });
   } catch (err) {
     if (err instanceof Error && err.name === 'AbortError') {
-      throw new Error(
-        'La solicitud tardó demasiado tiempo y fue cancelada para evitar espera indefinida. Intentá nuevamente.'
+      throw new ApiError(
+        'La solicitud tardó demasiado tiempo y fue cancelada para evitar espera indefinida. Intentá nuevamente.',
+        { kind: 'timeout', code: 'REQUEST_TIMEOUT' }
       );
     }
-    throw err;
+    throw new ApiError(
+      'No pudimos conectar con el servidor. Verificá tu conexión e intentá nuevamente.',
+      { kind: 'network', code: 'NETWORK_ERROR' }
+    );
   } finally {
     if (timer !== undefined) clearTimeout(timer);
   }
@@ -174,24 +248,41 @@ async function apiFetch<T>(
         contentType.toLowerCase().includes('text/html') ||
         trimmed.startsWith('<!') ||
         trimmed.startsWith('<html');
-      const err = new Error(
+      throw new ApiError(
         looksHtml
           ? `El servidor devolvió HTML inesperado en ${path} (HTTP ${res.status}, Content-Type: ${contentType || 'desconocido'}).`
-          : `Respuesta no JSON válida en ${path} (HTTP ${res.status}, Content-Type: ${contentType || 'desconocido'}).`
-      ) as Error & { status?: number };
-      err.status = res.status;
-      throw err;
+          : `Respuesta no JSON válida en ${path} (HTTP ${res.status}, Content-Type: ${contentType || 'desconocido'}).`,
+        {
+          kind: looksHtml ? 'unexpected_html' : 'invalid_response',
+          status: res.status,
+          code: looksHtml ? 'UNEXPECTED_HTML' : 'INVALID_RESPONSE',
+          isHtml: looksHtml,
+        }
+      );
     }
   }
   if (!res.ok) {
-    const err = new Error(
-      (typeof data.error === 'string' && data.error) || `Error HTTP ${res.status}`
-    ) as Error & { status?: number; issues?: ClientValidationIssue[] };
-    err.status = res.status;
-    if (Array.isArray(data.issues)) {
-      err.issues = data.issues as ClientValidationIssue[];
-    }
-    throw err;
+    const code = typeof data.code === 'string' ? data.code : undefined;
+    const isTransient =
+      res.status >= 500 ||
+      (code !== undefined && ['DB_CONNECTION_ERROR', 'DB_UNAVAILABLE', 'DB_TIMEOUT'].includes(code));
+    const kind: ApiErrorKind =
+      res.status === 401
+        ? 'unauthenticated'
+        : isTransient
+          ? 'transient_http'
+          : 'http_client';
+    throw new ApiError(
+      (typeof data.error === 'string' && data.error) || `Error HTTP ${res.status}`,
+      {
+        kind,
+        status: res.status,
+        code,
+        issues: Array.isArray(data.issues) ? (data.issues as ClientValidationIssue[]) : undefined,
+        alreadyRetired: Boolean(data.alreadyRetired),
+        retiredFlow: data.retiredFlow as FlowVersion | undefined,
+      }
+    );
   }
   return data as T;
 }
@@ -208,7 +299,7 @@ export interface ClientValidationIssue {
 
 export const nalasApi = {
   getAuthSession() {
-    return apiFetch<AuthSessionResponse>('/api/auth/session');
+    return apiFetch<AuthSessionResponse>('/api/auth/session', undefined, { timeoutMs: 12000 });
   },
   initializeSystem(payload: { adminEmail?: string; adminPassword?: string; initSecret?: string }) {
     return apiFetch<{
@@ -244,7 +335,8 @@ export const nalasApi = {
   bootstrap(ctx: ApiContext) {
     return apiFetch<BootstrapResponse>(
       `/api/bootstrap?businessId=${encodeURIComponent(ctx.businessId)}&environment=${ctx.environment}`,
-      ctx
+      ctx,
+      { timeoutMs: 15000 }
     );
   },
   createBusiness(
@@ -344,11 +436,13 @@ export const nalasApi = {
     return apiFetch<{ draft: FlowVersion; issues: ClientValidationIssue[] }>(
       '/api/flows/draft',
       ctx,
-      { method: 'POST', body: JSON.stringify(payload) }
+      { method: 'POST', body: JSON.stringify(payload), timeoutMs: 15000 }
     );
   },
   getProductionSummary(ctx: ApiContext) {
-    return apiFetch<ProductionSummary>('/api/assistant/production-summary', ctx);
+    return apiFetch<ProductionSummary>('/api/assistant/production-summary', ctx, {
+      timeoutMs: 12000,
+    });
   },
   publishFlow(ctx: ApiContext, flowKey?: string) {
     return apiFetch<{
@@ -358,6 +452,7 @@ export const nalasApi = {
     }>('/api/flows/publish', ctx, {
       method: 'POST',
       body: JSON.stringify(flowKey ? { flowKey } : {}),
+      timeoutMs: 18000,
     });
   },
   saveEntryMenuDraft(
@@ -389,10 +484,13 @@ export const nalasApi = {
       retiredFlow: FlowVersion;
       affectedConversationIds: string[];
       pausedOutboxCount: number;
+      verified?: boolean;
+      timings?: Record<string, unknown>;
       verifiedSummary?: ProductionSummary;
     }>(`/api/flows/${flowVersionId}/retire`, ctx, {
       method: 'POST',
       body: JSON.stringify(reason ? { reason } : {}),
+      timeoutMs: 18000,
     });
   },
   saveRulesetDraft(
