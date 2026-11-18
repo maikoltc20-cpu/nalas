@@ -1140,6 +1140,15 @@ export function runBasicEngine(params: {
     };
   }
 
+  const isInlineRefClosureExposingRef = (targetFlow: FlowVersion): boolean => {
+    if (!targetFlow.closureUsesInlineReference) {
+      return targetFlow.showReferenceInClosure !== false;
+    }
+    const cierre = targetFlow.steps.find((s) => s.type === 'cierre');
+    const rawTpl = targetFlow.closureTemplate || cierre?.prompt || '';
+    return rawTpl.includes('{{referencia}}');
+  };
+
   if (
     normalized === 'cancelar' ||
     normalized === 'cancelar.' ||
@@ -1153,13 +1162,15 @@ export function runBasicEngine(params: {
           l.sessionId === session.id
       );
       const ref = existingLead?.commercialReference ?? existingLead?.id ?? session.id;
+      const exposesRef = isInlineRefClosureExposingRef(flow);
+      const alreadyTemplate = exposesRef
+        ? flow.alreadyRegisteredTemplate ??
+          'Tu solicitud ya quedó registrada. Tu referencia es {{referencia}}. ¡Gracias por escribirnos!'
+        : 'Tu solicitud ya quedó registrada. ¡Gracias por escribirnos!';
       return {
-        replyText: interpolateTemplate(
-          flow.alreadyRegisteredTemplate ??
-            'Tu solicitud ya quedó registrada. Tu referencia es {{referencia}}. ¡Gracias por escribirnos!',
-          session,
-          { referencia: ref }
-        ),
+        replyText: interpolateTemplate(alreadyTemplate, session, {
+          referencia: exposesRef ? ref : '',
+        }),
         confirmedLead: existingLead,
         categorization: existingLead?.categorization,
         completedInteraction: true,
@@ -1192,13 +1203,15 @@ export function runBasicEngine(params: {
         l.sessionId === session.id
     );
     const ref = existingLead?.commercialReference ?? existingLead?.id ?? session.id;
+    const exposesRef = isInlineRefClosureExposingRef(flow);
+    const alreadyTemplate = exposesRef
+      ? flow.alreadyRegisteredTemplate ??
+        'Tu solicitud ya quedó registrada. Tu referencia es {{referencia}}. ¡Gracias por escribirnos!'
+      : 'Tu solicitud ya quedó registrada. ¡Gracias por escribirnos!';
     return {
-      replyText: interpolateTemplate(
-        flow.alreadyRegisteredTemplate ??
-          'Tu solicitud ya quedó registrada. Tu referencia es {{referencia}}. ¡Gracias por escribirnos!',
-        session,
-        { referencia: ref }
-      ),
+      replyText: interpolateTemplate(alreadyTemplate, session, {
+        referencia: exposesRef ? ref : '',
+      }),
       confirmedLead: existingLead,
       categorization: existingLead?.categorization,
       completedInteraction: true,
@@ -1682,10 +1695,23 @@ export function runBasicEngine(params: {
       };
     }
 
-    const selectedOpt = selectedOptionId
-      ? currentStep.options?.find((o) => o.id === selectedOptionId)
-      : undefined;
     const foldedInput = foldAccentsLower(inputText);
+    const matchedOptByNum =
+      /^\d+$/.test(foldedInput) && currentStep.options
+        ? currentStep.options[Number(foldedInput) - 1]
+        : undefined;
+    const matchedOptByLabel = currentStep.options?.find(
+      (o) =>
+        foldAccentsLower(o.label) === foldedInput ||
+        o.id.toLowerCase() === inputText.trim().toLowerCase()
+    );
+    const selectedOpt =
+      (selectedOptionId
+        ? currentStep.options?.find((o) => o.id === selectedOptionId)
+        : undefined) ??
+      matchedOptByNum ??
+      matchedOptByLabel;
+    const effectiveConfirmOptionId = selectedOptionId ?? selectedOpt?.id;
     const foldedSelectedLabel = selectedOpt ? foldAccentsLower(selectedOpt.label) : '';
 
     const declineLabels = new Set([
@@ -1698,19 +1724,21 @@ export function runBasicEngine(params: {
       'cancelar',
     ]);
     const isDecline =
-      selectedOptionId === 'confirmar_no' ||
-      selectedOptionId === 'cmd_cancelar' ||
+      effectiveConfirmOptionId === 'confirmar_no' ||
+      effectiveConfirmOptionId === 'cmd_cancelar' ||
       declineLabels.has(foldedInput) ||
       (foldedSelectedLabel ? declineLabels.has(foldedSelectedLabel) : false);
 
     const isCorrect =
-      selectedOptionId === 'corregir' ||
-      normalized === 'corregir' ||
-      normalized === 'corregir un dato' ||
-      normalized === 'corregir un dato.' ||
-      normalized === 'corregir respuestas' ||
-      foldedInput.startsWith('corregir') ||
-      foldedSelectedLabel.startsWith('corregir');
+      !isDecline &&
+      (effectiveConfirmOptionId === 'confirmar_corregir' ||
+        effectiveConfirmOptionId === 'corregir' ||
+        normalized === 'corregir' ||
+        normalized === 'corregir un dato' ||
+        normalized === 'corregir un dato.' ||
+        normalized === 'corregir respuestas' ||
+        foldedInput.startsWith('corregir') ||
+        foldedSelectedLabel.startsWith('corregir'));
 
     const isAffirmativeLabel = (lbl: string): boolean => {
       const f = foldAccentsLower(lbl);
@@ -1732,7 +1760,7 @@ export function runBasicEngine(params: {
     const isConfirm =
       !isDecline &&
       !isCorrect &&
-      (selectedOptionId === 'confirmar_si' ||
+      (effectiveConfirmOptionId === 'confirmar_si' ||
         (Boolean(selectedOpt) && isAffirmativeLabel(selectedOpt!.label)) ||
         normalized === 'confirmar' ||
         normalized === 'registrar solicitud' ||
@@ -1805,14 +1833,14 @@ export function runBasicEngine(params: {
     );
     if (existingLead) {
       const ref = existingLead.commercialReference ?? existingLead.id;
-      const showRefInClosure = flow.showReferenceInClosure !== false;
-      const alreadyTemplate = showRefInClosure
+      const exposesRef = isInlineRefClosureExposingRef(flow);
+      const alreadyTemplate = exposesRef
         ? flow.alreadyRegisteredTemplate ??
           'Tu solicitud ya quedó registrada. Tu referencia es {{referencia}}. ¡Gracias por escribirnos!'
         : 'Tu solicitud ya quedó registrada. ¡Gracias por escribirnos!';
       return {
         replyText: interpolateTemplate(alreadyTemplate, session, {
-          referencia: showRefInClosure ? ref : '',
+          referencia: exposesRef ? ref : '',
         }),
         confirmedLead: existingLead,
         categorization: existingLead.categorization,
@@ -1864,9 +1892,25 @@ export function runBasicEngine(params: {
       session.currentStepId = cierreStep?.id ?? null;
       session.updatedAt = now;
 
-      const showRefInClosure = flow.showReferenceInClosure !== false;
       const rawClosureTemplate =
         flow.closureTemplate || cierreStep?.prompt || 'Solicitud confirmada correctamente.';
+      const closureAlreadyContainsRef = rawClosureTemplate.includes('{{referencia}}');
+
+      if (flow.closureUsesInlineReference) {
+        const finalMsg = interpolateTemplate(rawClosureTemplate, session, {
+          referencia: closureAlreadyContainsRef ? commercialReference : '',
+        });
+        return {
+          replyText: finalMsg,
+          separateMessages: undefined,
+          confirmedLead: newLead,
+          categorization,
+          completedInteraction: true,
+          closureReason: 'solicitud_confirmada',
+        };
+      }
+
+      const showRefInClosure = flow.showReferenceInClosure !== false;
       const closureMsg = interpolateTemplate(rawClosureTemplate, session, {
         referencia: showRefInClosure ? commercialReference : '',
       });
@@ -1876,7 +1920,6 @@ export function runBasicEngine(params: {
           ? `${closureMsg}\n\nCategorización asignada: ${categorization.priority.toUpperCase()} (${categorization.reason})`
           : closureMsg;
 
-      const closureAlreadyContainsRef = rawClosureTemplate.includes('{{referencia}}');
       const effectiveRefTemplate =
         flow.referenceTemplate?.trim() ||
         (showRefInClosure && !closureAlreadyContainsRef
@@ -1884,7 +1927,7 @@ export function runBasicEngine(params: {
           : '');
 
       const separateMessages =
-        showRefInClosure && effectiveRefTemplate
+        showRefInClosure && effectiveRefTemplate && !closureAlreadyContainsRef
           ? [interpolateTemplate(effectiveRefTemplate, session, { referencia: commercialReference })]
           : undefined;
 

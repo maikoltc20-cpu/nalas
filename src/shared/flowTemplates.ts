@@ -206,7 +206,7 @@ export function listAvailableFlowVariables(
       seenKeys.add('referencia');
       options.push({
         key: 'referencia',
-        label: 'Referencia de solicitud',
+        label: 'ID Lead',
         source: 'builtin',
         sampleValue: `${prefix}_1`,
       });
@@ -526,7 +526,7 @@ export function validateFlowTemplates(
       if (!allStepKeys.has(v) && !isKnownBuiltIn(v, params.allowReference)) {
         const suggestion =
           v === 'referencia'
-            ? 'El número de solicitud solo está disponible después de confirmar (en la Despedida).'
+            ? 'El ID Lead solo está disponible después de confirmar (en la Despedida).'
             : 'Elegí la pregunta correspondiente usando «Insertar respuesta» o resolvé la referencia pendiente.';
         issues.push({
           code: 'UNKNOWN_TEMPLATE_VARIABLE',
@@ -678,8 +678,8 @@ export function resolveTemplateTokenMeta(
 ): { status: 'valid' | 'unresolved'; label: string; stepId?: string } {
   if (token === 'referencia') {
     return opts?.allowReference === false
-      ? { status: 'unresolved', label: 'Número de solicitud (solo al despedirse)' }
-      : { status: 'valid', label: 'Número de solicitud' };
+      ? { status: 'unresolved', label: 'ID Lead (solo al despedirse)' }
+      : { status: 'valid', label: 'ID Lead' };
   }
   const hasCanal = steps.some((s) => s.targetField?.trim() === 'canal_contacto');
   if (token === 'canal_contacto_texto' && hasCanal) {
@@ -849,11 +849,117 @@ function stripManualSummaryBlockFromConfirmPrompt(prompt: string): string {
   const kept = lines.filter((line) => {
     const trimmed = line.trim();
     if (/^[•\-*]\s*.*\{\{[a-zA-Z0-9_]+\}\}/.test(trimmed)) return false;
-    if (/^resumen[:\s]*$/i.test(trimmed)) return false;
+    const folded = foldPlainLower(trimmed);
+    if (
+      /^(resumen|resumen de tu solicitud|revisa tus (datos|respuestas)( antes de confirmar)?)[:\s]*$/i.test(
+        folded
+      )
+    ) {
+      return false;
+    }
     return true;
   });
-  const joined = kept.join('\n').trim();
+  const joined = kept.join('\n').replace(/\n{3,}/g, '\n\n').trim();
   return joined || '¿Confirmás que registremos tu solicitud con estos datos?';
+}
+
+function classifyConfirmationActionLabel(
+  rawLabel: string,
+  rawId?: string
+): 'confirmar_si' | 'confirmar_corregir' | 'confirmar_no' | null {
+  const id = (rawId ?? '').trim().toLowerCase();
+  if (id === 'confirmar_si') return 'confirmar_si';
+  if (id === 'confirmar_corregir' || id === 'corregir') return 'confirmar_corregir';
+  if (id === 'confirmar_no') return 'confirmar_no';
+  const f = foldPlainLower(rawLabel).replace(/[.!?]+$/g, '').trim();
+  if (!f) return null;
+  if (
+    f === 'registrar solicitud' ||
+    f.startsWith('registrar solicitud') ||
+    f === 'confirmar solicitud' ||
+    f === 'confirmar consulta' ||
+    f === 'confirmar' ||
+    f === 'si, confirmar' ||
+    f === 'enviar solicitud'
+  ) {
+    return 'confirmar_si';
+  }
+  if (
+    f === 'corregir' ||
+    f === 'corregir un dato' ||
+    f === 'corregir dato' ||
+    f === 'corregir respuestas' ||
+    f.startsWith('corregir un dato')
+  ) {
+    return 'confirmar_corregir';
+  }
+  if (f === 'ahora no' || f === 'no gracias' || f === 'cancelar' || f === 'mas tarde') {
+    return 'confirmar_no';
+  }
+  return null;
+}
+
+function isIncoherentActionStep(
+  step: FlowStep,
+  idx?: number,
+  allSteps?: FlowStep[]
+): boolean {
+  if (
+    step.type === 'confirmacion' ||
+    step.type === 'cierre' ||
+    step.type === 'derivacion_humana'
+  ) {
+    return false;
+  }
+  const items = [...(step.quickReplies ?? []), ...(step.options ?? [])];
+  const roles = items
+    .map((c) => classifyConfirmationActionLabel(c.label, c.id))
+    .filter((r): r is NonNullable<typeof r> => r !== null);
+  if (roles.includes('confirmar_si') || roles.includes('confirmar_corregir')) {
+    return true;
+  }
+  if (step.type === 'texto' && isBrokenManualSummaryPrompt(step.prompt)) {
+    return true;
+  }
+  if (step.type === 'texto') {
+    const fp = foldPlainLower(step.prompt ?? '');
+    if (fp.includes('registrar solicitud') && (fp.includes('corregir') || fp.includes('elegi'))) {
+      return true;
+    }
+  }
+  if (idx !== undefined && allSteps) {
+    const resumenIdx = allSteps.findIndex((s) => s.type === 'resumen');
+    if (resumenIdx >= 0 && idx > resumenIdx && step.nextStepId === allSteps[resumenIdx].id) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function buildExplicitConfirmOptionsFromItems(
+  items: Array<{ id: string; label: string }>
+): Array<{ id: string; label: string }> {
+  const byRole = new Map<'confirmar_si' | 'confirmar_corregir' | 'confirmar_no', string>();
+  for (const item of items) {
+    const role = classifyConfirmationActionLabel(item.label, item.id);
+    if (role && !byRole.has(role)) {
+      byRole.set(role, item.label.trim());
+    }
+  }
+  const result: Array<{ id: string; label: string }> = [
+    {
+      id: 'confirmar_si',
+      label: byRole.get('confirmar_si') || 'Confirmar solicitud',
+    },
+    {
+      id: 'confirmar_corregir',
+      label: byRole.get('confirmar_corregir') || 'Corregir un dato',
+    },
+  ];
+  if (byRole.has('confirmar_no')) {
+    result.push({ id: 'confirmar_no', label: byRole.get('confirmar_no')! });
+  }
+  return result;
 }
 
 export function repairExistingFlowDraft(sourceFlow: FlowVersion): FlowDraftRepairResult {
@@ -862,9 +968,15 @@ export function repairExistingFlowDraft(sourceFlow: FlowVersion): FlowDraftRepai
   let repairedCount = 0;
   let replacedManualSummary = false;
   let unifiedClosureIntoCierreStep = false;
+  let repairedIncoherentActionStep = false;
 
-  // Preserve Opting untouched
-  if (flow.flowKey === 'opting') {
+  const isOptingFlow =
+    flow.flowKey === 'opting' ||
+    (flow.businessId === 'biz_opting' && (!flow.flowKey || flow.flowKey === 'default'));
+
+  // Preserve published Opting and separate biz_opting demo business untouched;
+  // allow surgical repair on NEXO's Opting draft (status === 'borrador').
+  if (isOptingFlow && (flow.status !== 'borrador' || flow.businessId === 'biz_opting')) {
     return {
       flow,
       repaired: false,
@@ -875,13 +987,21 @@ export function repairExistingFlowDraft(sourceFlow: FlowVersion): FlowDraftRepai
       summaryNotes,
     };
   }
+  const preserveValidOptingTemplates = isOptingFlow && flow.businessId === 'biz_nexo';
 
   // 1. Replace broken manual summaryTemplate or manual summary message blocks with automatic summary
   if (flow.summaryTemplate !== undefined) {
     const vars = extractTemplateVariables(flow.summaryTemplate);
-    const { allStepKeys } = buildAllKnownVariableKeys(flow.steps);
-    const hasBrokenVar = vars.some((v) => !allStepKeys.has(v));
-    if (hasBrokenVar || !flow.summaryConfig) {
+    const { allStepKeys, hasCanalContacto, hasContextBuilder } = buildAllKnownVariableKeys(flow.steps);
+    const hasBrokenVar = vars.some((v) => {
+      if (allStepKeys.has(v)) return false;
+      if ((v === 'etiqueta_dato_contacto' || v === 'canal_contacto_texto') && hasCanalContacto) {
+        return false;
+      }
+      if (v === 'contexto' && hasContextBuilder) return false;
+      return true;
+    });
+    if (hasBrokenVar || (!preserveValidOptingTemplates && !flow.summaryConfig)) {
       flow.summaryTemplate = undefined;
       replacedManualSummary = true;
       summaryNotes.push(
@@ -918,6 +1038,216 @@ export function repairExistingFlowDraft(sourceFlow: FlowVersion): FlowDraftRepai
     }
   });
 
+  // 1b. Repair incoherent confirmation/summary steps (e.g. 'Pregunta 11' as texto with Registrar/Corregir quickReplies or cycle to Resumen)
+  const incoherentCandidates = flow.steps.filter((s, idx, arr) =>
+    isIncoherentActionStep(s, idx, arr)
+  );
+  if (incoherentCandidates.length > 0) {
+    const existingConfirm = flow.steps.find((s) => s.type === 'confirmacion');
+    const resumenStep = flow.steps.find((s) => s.type === 'resumen');
+    const cierreStepRef = flow.steps.find((s) => s.type === 'cierre');
+
+    if (existingConfirm) {
+      const removedIds = new Set(incoherentCandidates.map((s) => s.id));
+      const fallbackTargetId = resumenStep?.id ?? existingConfirm.id;
+      for (const s of flow.steps) {
+        if (removedIds.has(s.id)) continue;
+        if (s.nextStepId && removedIds.has(s.nextStepId)) {
+          if (s.id === existingConfirm.id) {
+            s.nextStepId = cierreStepRef?.id ?? null;
+          } else if (resumenStep && s.id === resumenStep.id) {
+            s.nextStepId = existingConfirm.id;
+          } else {
+            s.nextStepId = fallbackTargetId;
+          }
+        }
+        if (s.options) {
+          for (const opt of s.options) {
+            if (opt.nextStepId && removedIds.has(opt.nextStepId)) {
+              opt.nextStepId = fallbackTargetId;
+            }
+          }
+        }
+        if (s.quickReplies) {
+          for (const qr of s.quickReplies) {
+            if (qr.nextStepId && removedIds.has(qr.nextStepId)) {
+              qr.nextStepId = fallbackTargetId;
+            }
+          }
+        }
+      }
+      if (
+        existingConfirm.nextStepId === existingConfirm.id ||
+        (resumenStep && existingConfirm.nextStepId === resumenStep.id) ||
+        (existingConfirm.nextStepId && removedIds.has(existingConfirm.nextStepId))
+      ) {
+        existingConfirm.nextStepId = cierreStepRef?.id ?? null;
+      }
+      if (
+        resumenStep &&
+        (!resumenStep.nextStepId || removedIds.has(resumenStep.nextStepId))
+      ) {
+        resumenStep.nextStepId = existingConfirm.id;
+      }
+      const existingRoleIds = new Set(
+        (existingConfirm.options ?? [])
+          .map((o) => classifyConfirmationActionLabel(o.label, o.id))
+          .filter(Boolean)
+      );
+      if (
+        !existingRoleIds.has('confirmar_si') ||
+        !existingRoleIds.has('confirmar_corregir')
+      ) {
+        const incItems = incoherentCandidates.flatMap((inc) => [
+          ...(inc.options ?? []),
+          ...(inc.quickReplies ?? []),
+        ]);
+        existingConfirm.options = buildExplicitConfirmOptionsFromItems([
+          ...(existingConfirm.options ?? []),
+          ...incItems,
+        ]);
+      }
+      flow.steps = flow.steps.filter((s) => !removedIds.has(s.id));
+      if (resumenStep) {
+        const rIdx = flow.steps.findIndex((s) => s.id === resumenStep.id);
+        const cIdx = flow.steps.findIndex((s) => s.id === existingConfirm.id);
+        if (rIdx > cIdx && rIdx >= 0 && cIdx >= 0) {
+          const [movedResumen] = flow.steps.splice(rIdx, 1);
+          flow.steps.splice(cIdx, 0, movedResumen);
+        }
+      }
+      for (const inc of incoherentCandidates) {
+        summaryNotes.push(
+          `Se integró «${getReadableFlowStepTitle(inc)}» en «${getReadableFlowStepTitle(existingConfirm)}» para ejecutar acciones reales sin duplicados ni ciclos.`
+        );
+      }
+      repairedIncoherentActionStep = true;
+    } else {
+      const primaryInc = incoherentCandidates[incoherentCandidates.length - 1];
+      const extraRemovedIds = new Set(
+        incoherentCandidates.filter((s) => s.id !== primaryInc.id).map((s) => s.id)
+      );
+      if (extraRemovedIds.size > 0) {
+        for (const s of flow.steps) {
+          if (extraRemovedIds.has(s.id)) continue;
+          if (s.nextStepId && extraRemovedIds.has(s.nextStepId)) {
+            s.nextStepId = primaryInc.id;
+          }
+        }
+        flow.steps = flow.steps.filter((s) => !extraRemovedIds.has(s.id));
+      }
+
+      const origTitle = getReadableFlowStepTitle(primaryInc);
+      const rawActionItems = [
+        ...(primaryInc.options ?? []),
+        ...(primaryInc.quickReplies ?? []),
+      ];
+      primaryInc.type = 'confirmacion';
+      if (!primaryInc.title?.trim() || /^pregunta\s*\d+$/i.test(primaryInc.title.trim())) {
+        primaryInc.title = 'Confirmación';
+      }
+      primaryInc.prompt = stripManualSummaryBlockFromConfirmPrompt(primaryInc.prompt);
+      primaryInc.required = true;
+      primaryInc.options = buildExplicitConfirmOptionsFromItems(rawActionItems);
+      primaryInc.quickReplies = undefined;
+      if (primaryInc.targetField && primaryInc.targetField !== 'confirmacion') {
+        primaryInc.targetField = undefined;
+      }
+
+      if (resumenStep) {
+        const afterConfirmTarget =
+          cierreStepRef?.id ??
+          (resumenStep.nextStepId &&
+          resumenStep.nextStepId !== primaryInc.id &&
+          resumenStep.nextStepId !== resumenStep.id
+            ? resumenStep.nextStepId
+            : primaryInc.nextStepId &&
+                primaryInc.nextStepId !== resumenStep.id &&
+                primaryInc.nextStepId !== primaryInc.id
+              ? primaryInc.nextStepId
+              : null);
+
+        for (const s of flow.steps) {
+          if (s.id !== resumenStep.id && s.id !== primaryInc.id && s.nextStepId === primaryInc.id) {
+            s.nextStepId = resumenStep.id;
+          }
+        }
+        resumenStep.nextStepId = primaryInc.id;
+        primaryInc.nextStepId = afterConfirmTarget;
+
+        const rIdx = flow.steps.findIndex((s) => s.id === resumenStep.id);
+        const cIdx = flow.steps.findIndex((s) => s.id === primaryInc.id);
+        if (rIdx > cIdx && rIdx >= 0 && cIdx >= 0) {
+          const [movedResumen] = flow.steps.splice(rIdx, 1);
+          flow.steps.splice(cIdx, 0, movedResumen);
+        }
+      } else if (!primaryInc.nextStepId || primaryInc.nextStepId === primaryInc.id) {
+        primaryInc.nextStepId = cierreStepRef?.id ?? null;
+      }
+
+      summaryNotes.push(
+        `El paso «${origTitle}» pasó a «Confirmación» con acciones explícitas para registrar o corregir datos sin ciclos.`
+      );
+      repairedIncoherentActionStep = true;
+    }
+  }
+
+  // Also normalize confirmacion steps that still carry action quickReplies or backward cycle to Resumen
+  for (const step of flow.steps) {
+    if (step.type !== 'confirmacion') continue;
+    const resumenStep = flow.steps.find((s) => s.type === 'resumen');
+    const cierreStepRef = flow.steps.find((s) => s.type === 'cierre');
+    if (step.quickReplies && step.quickReplies.length > 0) {
+      step.options = buildExplicitConfirmOptionsFromItems([
+        ...(step.options ?? []),
+        ...step.quickReplies,
+      ]);
+      step.quickReplies = undefined;
+      repairedIncoherentActionStep = true;
+      summaryNotes.push(
+        `Se movieron las acciones de «${getReadableFlowStepTitle(step)}» a opciones explícitas de Confirmación.`
+      );
+    }
+    if (resumenStep && step.nextStepId === resumenStep.id) {
+      step.nextStepId = cierreStepRef?.id ?? null;
+      resumenStep.nextStepId = step.id;
+      repairedIncoherentActionStep = true;
+      summaryNotes.push(
+        `Se corrigió el destino de «${getReadableFlowStepTitle(step)}» para evitar volver al Resumen en ciclo.`
+      );
+    }
+  }
+
+  // Deduplicate extra resumen / confirmacion steps if present so neither is ever duplicated
+  const resumenSteps = flow.steps.filter((s) => s.type === 'resumen');
+  if (resumenSteps.length > 1) {
+    const keepResumen = resumenSteps[0];
+    const dropResumenIds = new Set(resumenSteps.slice(1).map((s) => s.id));
+    for (const s of flow.steps) {
+      if (dropResumenIds.has(s.id)) continue;
+      if (s.nextStepId && dropResumenIds.has(s.nextStepId)) {
+        s.nextStepId = keepResumen.id;
+      }
+    }
+    flow.steps = flow.steps.filter((s) => !dropResumenIds.has(s.id));
+    repairedIncoherentActionStep = true;
+    summaryNotes.push('Se eliminaron pasos duplicados de Resumen.');
+  }
+  const confirmStepsAll = flow.steps.filter((s) => s.type === 'confirmacion');
+  if (confirmStepsAll.length > 1) {
+    const keepConfirm = confirmStepsAll[0];
+    const dropConfirmIds = new Set(confirmStepsAll.slice(1).map((s) => s.id));
+    for (const s of flow.steps) {
+      if (dropConfirmIds.has(s.id)) continue;
+      if (s.nextStepId && dropConfirmIds.has(s.nextStepId)) {
+        s.nextStepId = keepConfirm.id;
+      }
+    }
+    flow.steps = flow.steps.filter((s) => !dropConfirmIds.has(s.id));
+    repairedIncoherentActionStep = true;
+    summaryNotes.push('Se eliminaron pasos duplicados de Confirmación.');
+  }
+
   // Clean stale summaryConfig fields if any stepId was removed
   if (flow.summaryConfig) {
     const validIds = new Set(flow.steps.filter(isAnswerableSummaryStep).map((s) => s.id));
@@ -932,7 +1262,7 @@ export function repairExistingFlowDraft(sourceFlow: FlowVersion): FlowDraftRepai
   }
 
   // 2. Unify closureTemplate into existing cierre step without duplicating
-  if (cierreStep && flow.closureTemplate?.trim()) {
+  if (!preserveValidOptingTemplates && cierreStep && flow.closureTemplate?.trim()) {
     cierreStep.prompt = flow.closureTemplate;
     flow.closureTemplate = undefined;
     if (flow.hideInternalCategorizationInClosure === undefined) {
@@ -1058,7 +1388,10 @@ export function repairExistingFlowDraft(sourceFlow: FlowVersion): FlowDraftRepai
   return {
     flow,
     repaired:
-      repairedCount > 0 || replacedManualSummary || unifiedClosureIntoCierreStep,
+      repairedCount > 0 ||
+      replacedManualSummary ||
+      unifiedClosureIntoCierreStep ||
+      repairedIncoherentActionStep,
     repairedCount,
     replacedManualSummary,
     unifiedClosureIntoCierreStep,

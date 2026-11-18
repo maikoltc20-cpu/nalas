@@ -133,6 +133,7 @@ export interface FlowVersion {
   alreadyRegisteredTemplate?: string;
   cancelMessage?: string;
   showReferenceInClosure?: boolean;
+  closureUsesInlineReference?: boolean;
   handoffMessage?: string;
   handoffNoContactMessage?: string;
   outOfScriptPrompt?: string;
@@ -695,6 +696,7 @@ export interface ProductionConversationSummary {
     referenceTemplate?: string;
     alreadyRegisteredTemplate?: string;
     showReferenceInClosure?: boolean;
+    closureUsesInlineReference?: boolean;
     handoffMessage?: string;
     cancelMessage?: string;
     outOfScriptPrompt?: string;

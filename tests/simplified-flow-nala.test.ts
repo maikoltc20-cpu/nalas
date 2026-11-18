@@ -53,6 +53,8 @@ test('Aceptación flujo simplificado desde cero: sin targetField ni variables t�
     assert.equal(created.steps[1].type, 'confirmacion');
     assert.equal(created.steps[2].type, 'cierre');
     assert.equal(created.summaryConfig, undefined);
+    assert.equal(created.closureUsesInlineReference, true);
+    assert.match(created.steps[2].prompt, /\{\{referencia\}\}/);
     assert.equal(created.showReferenceInClosure, true);
 
     // 2. Agregar preguntas sin targetField (texto, selección múltiple, opcional)
@@ -94,7 +96,7 @@ test('Aceptación flujo simplificado desde cero: sin targetField ni variables t�
       },
       {
         ...sCierre,
-        prompt: `¡Gracias, {{${s1Id}}}! Recibimos tu solicitud correctamente.`,
+        prompt: `¡Gracias, {{${s1Id}}}! Recibimos tu solicitud correctamente.\n\nReferencia de tu solicitud: {{referencia}}`,
       },
     ];
 
@@ -229,7 +231,12 @@ test('Aceptación flujo simplificado desde cero: sin targetField ni variables t�
       0
     );
 
-    // 4. Desactivar "Mostrar número de solicitud al cliente" -> oculta en cierre pero registra soporte_express_2
+    // 4. Quitar [ID Lead] ({{referencia}}) de la despedida -> oculta en cierre pero registra soporte_express_2 internamente
+    const customStepsWithoutRef = customSteps.map((st) =>
+      st.type === 'cierre'
+        ? { ...st, prompt: `¡Gracias, {{${s1Id}}}! Recibimos tu solicitud correctamente.` }
+        : st
+    );
     const hideRefRes = await webApp.request('http://localhost/api/flows/draft', {
       method: 'POST',
       headers: {
@@ -239,8 +246,9 @@ test('Aceptación flujo simplificado desde cero: sin targetField ni variables t�
       body: JSON.stringify({
         flowKey,
         name: 'Soporte Express',
-        steps: customSteps,
+        steps: customStepsWithoutRef,
         outOfScriptRules: [],
+        closureUsesInlineReference: true,
         showReferenceInClosure: false,
       }),
     });

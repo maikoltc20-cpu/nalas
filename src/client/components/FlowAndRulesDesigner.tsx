@@ -33,6 +33,7 @@ import type {
 } from '../../shared/types';
 import {
   buildSampleAnswersForFlow,
+  extractTemplateVariables,
   formatTemplateTokensReadable,
   isAnswerableSummaryStep,
   previewSummaryInEditor,
@@ -534,7 +535,7 @@ export function FlowAndRulesDesigner({
   }, [business.id]);
 
   const draftSignature = draftFlow
-    ? `${effectiveFlowKey}:${draftFlow.id}:${draftFlow.status}:${draftFlow.name}:${draftFlow.versionNumber}:${JSON.stringify(draftFlow.steps)}:${JSON.stringify(draftFlow.outOfScriptRules)}:${JSON.stringify(draftFlow.humanHandoffConfig ?? null)}:${JSON.stringify(draftFlow.summaryConfig ?? null)}:${draftFlow.closureTemplate ?? ''}:${draftFlow.referenceTemplate ?? ''}:${draftFlow.alreadyRegisteredTemplate ?? ''}:${draftFlow.cancelMessage ?? ''}:${draftFlow.showReferenceInClosure ?? true}`
+    ? `${effectiveFlowKey}:${draftFlow.id}:${draftFlow.status}:${draftFlow.name}:${draftFlow.versionNumber}:${JSON.stringify(draftFlow.steps)}:${JSON.stringify(draftFlow.outOfScriptRules)}:${JSON.stringify(draftFlow.humanHandoffConfig ?? null)}:${JSON.stringify(draftFlow.summaryConfig ?? null)}:${draftFlow.closureTemplate ?? ''}:${draftFlow.referenceTemplate ?? ''}:${draftFlow.alreadyRegisteredTemplate ?? ''}:${draftFlow.cancelMessage ?? ''}:${draftFlow.showReferenceInClosure ?? true}:${draftFlow.closureUsesInlineReference ?? ''}`
     : `${effectiveFlowKey}:empty`;
 
   const entrySignature = JSON.stringify({
@@ -550,7 +551,7 @@ export function FlowAndRulesDesigner({
   useEffect(() => {
     if (draftFlow && !draftDirty) {
       const repairRes =
-        getClientFlowKey(draftFlow) !== 'opting'
+        draftFlow.businessId !== 'biz_opting'
           ? repairExistingFlowDraft(draftFlow)
           : null;
       const source = repairRes && repairRes.repaired ? repairRes.flow : draftFlow;
@@ -758,6 +759,20 @@ export function FlowAndRulesDesigner({
       if (val.trim()) return val;
       return existing ? null : undefined;
     };
+    const isNonOpting = effectiveFlowKey !== 'opting';
+    const currentCierreStep = steps.find((s) => s.type === 'cierre');
+    const draftCierreStep = draftFlow?.steps.find((s) => s.type === 'cierre');
+    const optingCierreEdited =
+      !isNonOpting &&
+      Boolean(currentCierreStep) &&
+      (extractTemplateVariables(currentCierreStep?.prompt).includes('referencia') ||
+        (draftCierreStep !== undefined && currentCierreStep?.prompt !== draftCierreStep.prompt));
+    const useInlineRefMode = isNonOpting || optingCierreEdited || Boolean(draftFlow?.closureUsesInlineReference);
+    const hasInlineRef =
+      steps.some(
+        (s) => s.type === 'cierre' && extractTemplateVariables(s.prompt).includes('referencia')
+      ) || (!useInlineRefMode && extractTemplateVariables(closureTemplate).includes('referencia'));
+
     return {
       steps,
       outOfScriptRules: oosRules,
@@ -766,15 +781,26 @@ export function FlowAndRulesDesigner({
       flowKey: effectiveFlowKey,
       summaryConfig: resolvedSumCfg,
       summaryTemplate: summaryTemplateCleared ? null : undefined,
-      closureTemplate: textOrNull(closureTemplate, draftFlow?.closureTemplate),
-      referenceTemplate: textOrNull(referenceTemplate, draftFlow?.referenceTemplate),
+      closureTemplate: optingCierreEdited
+        ? draftFlow?.closureTemplate
+          ? null
+          : undefined
+        : textOrNull(closureTemplate, draftFlow?.closureTemplate),
+      referenceTemplate: useInlineRefMode
+        ? draftFlow?.referenceTemplate
+          ? null
+          : undefined
+        : textOrNull(referenceTemplate, draftFlow?.referenceTemplate),
       alreadyRegisteredTemplate: textOrNull(
         alreadyRegisteredTemplate,
         draftFlow?.alreadyRegisteredTemplate
       ),
       cancelMessage: textOrNull(cancelMessage, draftFlow?.cancelMessage),
-      showReferenceInClosure:
-        draftFlow?.showReferenceInClosure !== undefined || !showReferenceInClosure
+      hideInternalCategorizationInClosure: useInlineRefMode ? true : undefined,
+      closureUsesInlineReference: useInlineRefMode ? true : undefined,
+      showReferenceInClosure: useInlineRefMode
+        ? hasInlineRef
+        : draftFlow?.showReferenceInClosure !== undefined || !showReferenceInClosure
           ? showReferenceInClosure
           : undefined,
     };
@@ -844,7 +870,7 @@ export function FlowAndRulesDesigner({
     const rawFv = grp?.draft ?? grp?.latestPublished;
     if (rawFv) {
       const repairRes =
-        getClientFlowKey(rawFv) !== 'opting' ? repairExistingFlowDraft(rawFv) : null;
+        rawFv.businessId !== 'biz_opting' ? repairExistingFlowDraft(rawFv) : null;
       const fv = repairRes && repairRes.repaired ? repairRes.flow : rawFv;
       setFlowName(fv.name);
       setSteps(structuredClone(fv.steps));
@@ -1392,7 +1418,9 @@ export function FlowAndRulesDesigner({
           (publishedGroupFlow.alreadyRegisteredTemplate ?? '') ||
         (draftFlow.cancelMessage ?? '') !== (publishedGroupFlow.cancelMessage ?? '') ||
         (draftFlow.showReferenceInClosure ?? true) !==
-          (publishedGroupFlow.showReferenceInClosure ?? true))
+          (publishedGroupFlow.showReferenceInClosure ?? true) ||
+        Boolean(draftFlow.closureUsesInlineReference) !==
+          Boolean(publishedGroupFlow.closureUsesInlineReference))
   );
   const hasFlowDraft =
     draftDirty ||
@@ -1406,7 +1434,8 @@ export function FlowAndRulesDesigner({
     summaryTemplate:
       summaryConfigCustomized || summaryTemplateCleared ? undefined : draftFlow?.summaryTemplate,
     closureTemplate: closureTemplate.trim() ? closureTemplate : undefined,
-    referenceTemplate: referenceTemplate.trim() ? referenceTemplate : undefined,
+    referenceTemplate:
+      effectiveFlowKey === 'opting' && referenceTemplate.trim() ? referenceTemplate : undefined,
     alreadyRegisteredTemplate: alreadyRegisteredTemplate.trim()
       ? alreadyRegisteredTemplate
       : undefined,
@@ -1415,7 +1444,7 @@ export function FlowAndRulesDesigner({
   });
 
   const liveAmbiguousReferences: AmbiguousTemplateReference[] =
-    draftFlow && effectiveFlowKey !== 'opting'
+    draftFlow && draftFlow.businessId !== 'biz_opting'
       ? repairExistingFlowDraft({
           ...draftFlow,
           steps,
@@ -2682,225 +2711,114 @@ export function FlowAndRulesDesigner({
                       ))}
                   </div>
 
-                  {selectedStep.type === 'texto' && (() => {
-                    const CONTACT_KEYS = new Set(['nombre', 'telefono', 'correo', 'empresa']);
-                    const currentContactKey = CONTACT_KEYS.has(selectedStep.targetField ?? '')
-                      ? selectedStep.targetField!
-                      : '';
+                  {(() => {
+                    const isOptionBasedStep =
+                      selectedStep.type === 'seleccion_unica' ||
+                      selectedStep.type === 'seleccion_multiple' ||
+                      selectedStep.type === 'confirmacion';
+                    const hasLegacyQuickReplies =
+                      !isOptionBasedStep && (selectedStep.quickReplies?.length ?? 0) > 0;
+                    if (!isOptionBasedStep && !hasLegacyQuickReplies) return null;
+
+                    const activeItems = isOptionBasedStep
+                      ? (selectedStep.options ?? [])
+                      : (selectedStep.quickReplies ?? []);
+
                     return (
-                      <div className="p-3 bg-[#F7F8FA] border border-[#E2E7EB] rounded-[10px] flex flex-wrap items-center justify-between gap-3">
-                        <div className="min-w-0">
-                          <label
-                            htmlFor="contact-field-select"
-                            className="block text-[13px] font-semibold text-[#25364A]"
-                          >
-                            ¿Guardar también en la ficha del contacto? (opcional)
-                          </label>
-                          <p className="text-xs text-[#5A6877]">
-                            Cada respuesta se guarda automáticamente; esto solo organiza la ficha del contacto.
-                          </p>
-                        </div>
-                        <select
-                          id="contact-field-select"
-                          aria-label="¿Guardar también en la ficha del contacto?"
-                          value={currentContactKey}
-                          onChange={(e) => {
-                            const val = e.target.value;
-                            if (val === '') {
-                              if (CONTACT_KEYS.has(selectedStep.targetField ?? '')) {
-                                updateStep(selectedStep.id, { targetField: undefined });
+                      <div className="border-t border-[#EDF0F2] pt-5 space-y-3">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div>
+                            <div className="text-[13px] font-semibold text-[#25364A]">
+                              Opciones de respuesta
+                            </div>
+                            <p className="text-xs text-[#5A6877]">
+                              {isOptionBasedStep
+                                ? 'Una opción por cada respuesta que puede elegir la persona.'
+                                : 'Opciones sugeridas (el cliente también puede responder escribiendo texto libre).'}
+                            </p>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (isOptionBasedStep) {
+                                const opts = selectedStep.options ?? [];
+                                updateStep(selectedStep.id, {
+                                  options: [
+                                    ...opts,
+                                    { id: `opt_${Date.now().toString(36)}`, label: '' },
+                                  ],
+                                });
+                              } else {
+                                const qrs = selectedStep.quickReplies ?? [];
+                                updateStep(selectedStep.id, {
+                                  quickReplies: [
+                                    ...qrs,
+                                    { id: `qr_${Date.now().toString(36)}`, label: '' },
+                                  ],
+                                });
                               }
-                            } else {
-                              updateStep(selectedStep.id, { targetField: val });
-                            }
-                          }}
-                          className="min-h-[38px] text-sm border border-[#DCE3E8] rounded-[8px] px-3 py-1.5 bg-white text-[#25364A]"
-                        >
-                          <option value="">No vincular (solo guardar respuesta)</option>
-                          <option value="nombre">Nombre del cliente</option>
-                          <option value="telefono">Teléfono / WhatsApp</option>
-                          <option value="correo">Correo electrónico</option>
-                          <option value="empresa">Empresa o negocio</option>
-                        </select>
-                      </div>
-                    );
-                  })()}
-
-                  {(selectedStep.type === 'seleccion_unica' ||
-                    selectedStep.type === 'seleccion_multiple' ||
-                    selectedStep.type === 'confirmacion') && (
-                    <div className="border-t border-[#EDF0F2] pt-5 space-y-3">
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <div>
-                          <div className="text-[13px] font-semibold text-[#25364A]">
-                            Opciones de respuesta
-                          </div>
-                          <p className="text-xs text-[#5A6877]">
-                            Una opción por cada respuesta que puede elegir la persona.
-                          </p>
-                        </div>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            const opts = selectedStep.options ?? [];
-                            updateStep(selectedStep.id, {
-                              options: [
-                                ...opts,
-                                { id: `opt_${Date.now().toString(36)}`, label: '' },
-                              ],
-                            });
-                          }}
-                          className="inline-flex items-center gap-1 min-h-[40px] px-3 py-1.5 text-sm font-medium text-[#116B70] bg-[#EAF5F2] border border-[#D4EAE4] rounded-[9px] hover:bg-[#DCEFE9]"
-                        >
-                          <Plus className="w-4 h-4" />
-                          <span>Agregar respuesta</span>
-                        </button>
-                      </div>
-
-                      <div className="space-y-2.5">
-                        {(selectedStep.options ?? []).map((opt, oIdx) => (
-                          <div
-                            key={opt.id}
-                            className="flex items-center gap-2.5 p-2.5 border border-[#E2E7EB] rounded-[9px] bg-[#F7F8FA]/50"
+                            }}
+                            className="inline-flex items-center gap-1 min-h-[40px] px-3 py-1.5 text-sm font-medium text-[#116B70] bg-[#EAF5F2] border border-[#D4EAE4] rounded-[9px] hover:bg-[#DCEFE9]"
                           >
-                            <span className="text-xs font-medium text-[#5A6877] w-6 text-right">
-                              {oIdx + 1}.
-                            </span>
-                            <input
-                              type="text"
-                              value={opt.label}
-                              placeholder={`Opción ${oIdx + 1}`}
-                              onChange={(e) => {
-                                const copy = [...(selectedStep.options ?? [])];
-                                copy[oIdx] = { ...opt, label: e.target.value };
-                                updateStep(selectedStep.id, { options: copy });
-                              }}
-                              className="flex-1 min-h-[42px] text-[15px] border border-[#DCE3E8] rounded-[8px] px-3.5 py-2 bg-white"
-                            />
-                            <button
-                              type="button"
-                              aria-label="Quitar opción"
-                              onClick={() => {
-                                const copy = (selectedStep.options ?? []).filter(
-                                  (_, i) => i !== oIdx
-                                );
-                                updateStep(selectedStep.id, { options: copy });
-                              }}
-                              className="p-2 text-[#5A6877] hover:text-red-700 rounded"
-                            >
-                              <Trash2 className="w-4 h-4" />
-                            </button>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-
-                  {(selectedStep.type === 'texto' ||
-                    (selectedStep.quickReplies && selectedStep.quickReplies.length > 0)) && (
-                    <div className="border-t border-[#EDF0F2] pt-5 space-y-3">
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <div>
-                          <div className="text-[13px] font-semibold text-[#25364A]">
-                            Opciones rápidas opcionales (conserva escritura libre)
-                          </div>
-                          <p className="text-xs text-[#5A6877]">
-                            El cliente puede tocar una de estas opciones o seguir escribiendo su respuesta libremente. Los cambios quedan en borrador hasta publicar.
-                          </p>
+                            <Plus className="w-4 h-4" />
+                            <span>Agregar respuesta</span>
+                          </button>
                         </div>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            const qrs = selectedStep.quickReplies ?? [];
-                            updateStep(selectedStep.id, {
-                              quickReplies: [
-                                ...qrs,
-                                { id: `qr_${Date.now().toString(36)}`, label: '' },
-                              ],
-                            });
-                          }}
-                          className="inline-flex items-center gap-1 min-h-[40px] px-3 py-1.5 text-sm font-medium text-[#116B70] bg-[#EAF5F2] border border-[#D4EAE4] rounded-[9px] hover:bg-[#DCEFE9]"
-                        >
-                          <Plus className="w-4 h-4" />
-                          <span>Agregar opción rápida</span>
-                        </button>
-                      </div>
 
-                      {(selectedStep.quickReplies ?? []).length === 0 ? (
-                        <p className="text-xs text-[#5A6877]">
-                          Sin opciones rápidas configuradas. El cliente responderá escribiendo texto libre.
-                        </p>
-                      ) : (
                         <div className="space-y-2.5">
-                          {(selectedStep.quickReplies ?? []).map((qr, qIdx) => (
+                          {activeItems.map((item, oIdx) => (
                             <div
-                              key={qr.id}
-                              className="p-3 border border-[#E2E7EB] rounded-[9px] bg-[#F7F8FA]/50 space-y-2"
+                              key={item.id}
+                              className="flex items-center gap-2.5 p-2.5 border border-[#E2E7EB] rounded-[9px] bg-[#F7F8FA]/50"
                             >
-                              <div className="flex items-center gap-2.5">
-                                <span className="text-xs font-medium text-[#5A6877] w-6 text-right">
-                                  {qIdx + 1}.
-                                </span>
-                                <div className="flex-1 grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-                                  <div>
-                                    <label className="block text-[11px] font-medium text-[#5A6877] mb-1">
-                                      Etiqueta visible en WhatsApp
-                                    </label>
-                                    <input
-                                      type="text"
-                                      value={qr.label}
-                                      placeholder="ej: Estoy iniciando un negocio"
-                                      onChange={(e) => {
-                                        const copy = [...(selectedStep.quickReplies ?? [])];
-                                        copy[qIdx] = { ...qr, label: e.target.value };
-                                        updateStep(selectedStep.id, { quickReplies: copy });
-                                      }}
-                                      className="w-full min-h-[40px] text-sm border border-[#DCE3E8] rounded-[8px] px-3 py-2 bg-white"
-                                    />
-                                  </div>
-                                  <div>
-                                    <label className="block text-[11px] font-medium text-[#5A6877] mb-1">
-                                      Valor guardado (opcional)
-                                    </label>
-                                    <input
-                                      type="text"
-                                      value={qr.storedValue ?? ''}
-                                      placeholder="Si queda vacío guarda la etiqueta"
-                                      onChange={(e) => {
-                                        const copy = [...(selectedStep.quickReplies ?? [])];
-                                        copy[qIdx] = {
-                                          ...qr,
-                                          storedValue:
-                                            e.target.value === '' ? undefined : e.target.value,
-                                        };
-                                        updateStep(selectedStep.id, { quickReplies: copy });
-                                      }}
-                                      className="w-full min-h-[40px] text-sm border border-[#DCE3E8] rounded-[8px] px-3 py-2 bg-white"
-                                    />
-                                  </div>
-                                </div>
-                                <button
-                                  type="button"
-                                  aria-label="Quitar opción rápida"
-                                  onClick={() => {
+                              <span className="text-xs font-medium text-[#5A6877] w-6 text-right">
+                                {oIdx + 1}.
+                              </span>
+                              <input
+                                type="text"
+                                value={item.label}
+                                placeholder={`Opción ${oIdx + 1}`}
+                                onChange={(e) => {
+                                  if (isOptionBasedStep) {
+                                    const copy = [...(selectedStep.options ?? [])];
+                                    copy[oIdx] = { ...copy[oIdx], label: e.target.value };
+                                    updateStep(selectedStep.id, { options: copy });
+                                  } else {
+                                    const copy = [...(selectedStep.quickReplies ?? [])];
+                                    copy[oIdx] = { ...copy[oIdx], label: e.target.value };
+                                    updateStep(selectedStep.id, { quickReplies: copy });
+                                  }
+                                }}
+                                className="flex-1 min-h-[42px] text-[15px] border border-[#DCE3E8] rounded-[8px] px-3.5 py-2 bg-white"
+                              />
+                              <button
+                                type="button"
+                                aria-label="Quitar opción"
+                                onClick={() => {
+                                  if (isOptionBasedStep) {
+                                    const copy = (selectedStep.options ?? []).filter(
+                                      (_, i) => i !== oIdx
+                                    );
+                                    updateStep(selectedStep.id, { options: copy });
+                                  } else {
                                     const copy = (selectedStep.quickReplies ?? []).filter(
-                                      (_, i) => i !== qIdx
+                                      (_, i) => i !== oIdx
                                     );
                                     updateStep(selectedStep.id, {
                                       quickReplies: copy.length > 0 ? copy : undefined,
                                     });
-                                  }}
-                                  className="p-2 text-[#5A6877] hover:text-red-700 rounded self-end mb-0.5"
-                                >
-                                  <Trash2 className="w-4 h-4" />
-                                </button>
-                              </div>
+                                  }
+                                }}
+                                className="p-2 text-[#5A6877] hover:text-red-700 rounded"
+                              >
+                                <Trash2 className="w-4 h-4" />
+                              </button>
                             </div>
                           ))}
                         </div>
-                      )}
-                    </div>
-                  )}
+                      </div>
+                    );
+                  })()}
 
                   {selectedStep.type === 'confirmacion' && (
                     <div className="border-t border-[#EDF0F2] pt-5 space-y-3">
@@ -3093,43 +3011,6 @@ export function FlowAndRulesDesigner({
                         </div>
                       )}
 
-                      {!steps.some((s) => s.type === 'cierre') &&
-                        effectiveFlowKey !== 'opting' && (
-                          <div className="pt-2">
-                            <label className="inline-flex items-center gap-2.5 text-sm font-semibold text-[#25364A] cursor-pointer">
-                              <input
-                                type="checkbox"
-                                checked={showReferenceInClosure}
-                                onChange={(e) => {
-                                  setDraftDirty(true);
-                                  setShowReferenceInClosure(e.target.checked);
-                                }}
-                                className="w-4 h-4 accent-[#167D83]"
-                              />
-                              <span>Mostrar número de solicitud al cliente</span>
-                            </label>
-                          </div>
-                        )}
-                    </div>
-                  )}
-
-                  {selectedStep.type === 'cierre' && (
-                    <div className="border-t border-[#EDF0F2] pt-4 space-y-1.5">
-                      <label className="inline-flex items-center gap-2.5 text-sm font-semibold text-[#25364A] cursor-pointer">
-                        <input
-                          type="checkbox"
-                          checked={showReferenceInClosure}
-                          onChange={(e) => {
-                            setDraftDirty(true);
-                            setShowReferenceInClosure(e.target.checked);
-                          }}
-                          className="w-4 h-4 accent-[#167D83]"
-                        />
-                        <span>Mostrar número de solicitud al cliente</span>
-                      </label>
-                      <p className="text-xs text-[#5A6877]">
-                        Cada solicitud confirmada genera siempre un número único interno. Desmarcá esta opción si preferís guardarlo solo para tu equipo sin mostrarlo al cliente.
-                      </p>
                     </div>
                   )}
 
@@ -4155,8 +4036,9 @@ export function FlowAndRulesDesigner({
                       {(conv.latestPublished.summaryConfig ||
                         conv.latestPublished.summaryTemplate ||
                         conv.latestPublished.closureTemplate ||
-                        conv.latestPublished.referenceTemplate ||
-                        conv.latestPublished.showReferenceInClosure === false) && (
+                        (!conv.latestPublished.closureUsesInlineReference &&
+                          (conv.latestPublished.referenceTemplate ||
+                            conv.latestPublished.showReferenceInClosure === false))) && (
                         <div className="text-xs bg-[#F7F8FA] border border-[#E2E7EB] rounded-[8px] p-3 space-y-1.5">
                           <div className="font-semibold text-[#25364A]">
                             Resumen y cierre publicados
@@ -4204,12 +4086,14 @@ export function FlowAndRulesDesigner({
                               )}
                             </div>
                           )}
-                          <div className="text-[#5A6877]">
-                            <span className="font-medium text-[#25364A]">Mostrar número de solicitud al cliente:</span>{' '}
-                            {conv.latestPublished.showReferenceInClosure === false
-                              ? 'Oculto internamente (se registra igual)'
-                              : 'Visible para el cliente'}
-                          </div>
+                          {!conv.latestPublished.closureUsesInlineReference && (
+                            <div className="text-[#5A6877]">
+                              <span className="font-medium text-[#25364A]">Mostrar número de solicitud al cliente:</span>{' '}
+                              {conv.latestPublished.showReferenceInClosure === false
+                                ? 'Oculto internamente (se registra igual)'
+                                : 'Visible para el cliente'}
+                            </div>
+                          )}
                         </div>
                       )}
 

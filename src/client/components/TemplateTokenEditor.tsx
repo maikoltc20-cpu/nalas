@@ -300,7 +300,7 @@ export function TemplateTokenEditor({
                 onClick={() => insertTokenAtCaret(v.key)}
                 className="px-2.5 py-1 text-[11px] font-medium text-[#116B70] bg-[#EAF5F2] border border-[#D4EAE4] rounded-[7px] hover:bg-[#DCEFE9]"
               >
-                + {v.key === 'referencia' ? 'Número de solicitud' : v.label}
+                + {v.label}
               </button>
             ))}
           </div>

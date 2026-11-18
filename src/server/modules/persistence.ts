@@ -190,8 +190,9 @@ export function repairNonOptingBrokenDraftsIfNeeded(store: NalasStore): boolean 
   for (let i = 0; i < store.flowVersions.length; i++) {
     const flow = store.flowVersions[i];
     if (flow.status !== 'borrador') continue;
+    if (flow.businessId === 'biz_opting') continue;
     const key = getFlowKey(flow);
-    if (key === 'opting') continue;
+    if (key === 'opting' && flow.businessId !== 'biz_nexo') continue;
     const result = repairExistingFlowDraft(flow);
     if (result.repaired) {
       store.flowVersions[i] = result.flow;

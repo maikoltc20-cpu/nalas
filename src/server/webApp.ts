@@ -1167,6 +1167,7 @@ webApp.post('/api/flows/draft', async (c) => {
       alreadyRegisteredTemplate?: string | null;
       cancelMessage?: string | null;
       showReferenceInClosure?: boolean | null;
+      closureUsesInlineReference?: boolean | null;
       hideInternalCategorizationInClosure?: boolean | null;
     };
     const result = await withFlowConfigTransaction(businessId, (store) => {
@@ -1189,6 +1190,7 @@ webApp.post('/api/flows/draft', async (c) => {
           alreadyRegisteredTemplate: body.alreadyRegisteredTemplate,
           cancelMessage: body.cancelMessage,
           showReferenceInClosure: body.showReferenceInClosure,
+          closureUsesInlineReference: body.closureUsesInlineReference,
           hideInternalCategorizationInClosure: body.hideInternalCategorizationInClosure,
         }
       );

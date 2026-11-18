@@ -337,6 +337,7 @@ export const nalasApi = {
       alreadyRegisteredTemplate?: string | null;
       cancelMessage?: string | null;
       showReferenceInClosure?: boolean | null;
+      closureUsesInlineReference?: boolean | null;
       hideInternalCategorizationInClosure?: boolean | null;
     }
   ) {

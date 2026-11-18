@@ -645,7 +645,7 @@ export function createFlowConversation(
       title: '3. Despedida',
       type: 'cierre',
       prompt:
-        '¡Gracias por tu mensaje! Registramos tu solicitud y nuestro equipo te responderá pronto.',
+        '¡Gracias por tu mensaje! Registramos tu solicitud y nuestro equipo te responderá pronto.\n\nReferencia de tu solicitud: {{referencia}}',
       required: false,
       nextStepId: null,
     },
@@ -660,10 +660,10 @@ export function createFlowConversation(
     status: 'borrador',
     steps: starterSteps,
     outOfScriptRules: [],
-    referenceTemplate: 'Referencia de tu solicitud: {{referencia}}',
     alreadyRegisteredTemplate:
       'Tu solicitud ya quedó registrada. Tu referencia es {{referencia}}. ¡Gracias por escribirnos!',
     showReferenceInClosure: true,
+    closureUsesInlineReference: true,
     humanHandoffConfig: resolveHumanHandoffConfig(undefined),
     handoffMessage:
       'Dejamos registrada tu solicitud de atención con nuestro equipo. El asistente automático quedará en pausa en esta conversación.',
@@ -704,6 +704,7 @@ export interface FlowDraftTemplateOverrides {
   alreadyRegisteredTemplate?: string | null;
   cancelMessage?: string | null;
   showReferenceInClosure?: boolean | null;
+  closureUsesInlineReference?: boolean | null;
   hideInternalCategorizationInClosure?: boolean | null;
 }
 
@@ -824,6 +825,14 @@ export function saveFlowDraft(
             ? undefined
             : Boolean(templateOverrides.showReferenceInClosure)
           : sameKeyActive?.showReferenceInClosure,
+      closureUsesInlineReference:
+        templateOverrides?.closureUsesInlineReference !== undefined
+          ? templateOverrides.closureUsesInlineReference === null
+            ? undefined
+            : Boolean(templateOverrides.closureUsesInlineReference)
+          : templateOverrides?.referenceTemplate?.trim()
+            ? false
+            : sameKeyActive?.closureUsesInlineReference,
       handoffMessage: sameKeyActive?.handoffMessage,
       handoffNoContactMessage: sameKeyActive?.handoffNoContactMessage,
       outOfScriptPrompt: sameKeyActive?.outOfScriptPrompt,
@@ -891,6 +900,14 @@ export function saveFlowDraft(
           templateOverrides.showReferenceInClosure === null
             ? undefined
             : Boolean(templateOverrides.showReferenceInClosure);
+      }
+      if (templateOverrides.closureUsesInlineReference !== undefined) {
+        draft.closureUsesInlineReference =
+          templateOverrides.closureUsesInlineReference === null
+            ? undefined
+            : Boolean(templateOverrides.closureUsesInlineReference);
+      } else if (templateOverrides.referenceTemplate?.trim()) {
+        draft.closureUsesInlineReference = false;
       }
       if (templateOverrides.hideInternalCategorizationInClosure !== undefined) {
         draft.hideInternalCategorizationInClosure =
@@ -1825,6 +1842,7 @@ export function getAssistantProductionSummary(
             referenceTemplate: pub.referenceTemplate,
             alreadyRegisteredTemplate: pub.alreadyRegisteredTemplate,
             showReferenceInClosure: pub.showReferenceInClosure,
+            closureUsesInlineReference: pub.closureUsesInlineReference,
             handoffMessage: pub.handoffMessage,
             cancelMessage: pub.cancelMessage,
             outOfScriptPrompt: pub.outOfScriptPrompt,
