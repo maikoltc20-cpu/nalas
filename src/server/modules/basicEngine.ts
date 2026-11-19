@@ -219,13 +219,18 @@ function getChannelModeForSession(session: Session): 'whatsapp' | 'email' | 'gen
 }
 
 function getEffectiveStepPrompt(step: FlowStep, session: Session): string {
-  if (step.dynamicMode === 'channel_contact_value' && step.conditionalPrompts) {
-    const mode = getChannelModeForSession(session);
-    if (mode === 'whatsapp' && step.conditionalPrompts.whatsapp) {
-      return interpolateTemplate(step.conditionalPrompts.whatsapp, session);
+  if (step.dynamicMode === 'channel_contact_value') {
+    if (step.prompt?.trim()) {
+      return interpolateTemplate(step.prompt, session);
     }
-    if (mode === 'email' && step.conditionalPrompts.email) {
-      return interpolateTemplate(step.conditionalPrompts.email, session);
+    if (step.conditionalPrompts) {
+      const mode = getChannelModeForSession(session);
+      if (mode === 'whatsapp' && step.conditionalPrompts.whatsapp) {
+        return interpolateTemplate(step.conditionalPrompts.whatsapp, session);
+      }
+      if (mode === 'email' && step.conditionalPrompts.email) {
+        return interpolateTemplate(step.conditionalPrompts.email, session);
+      }
     }
   }
   if (session.correctionReturnToStepId && step.correctionPrompt) {

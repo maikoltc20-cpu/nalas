@@ -662,3 +662,350 @@ test('4) Adaptación de transporte (botones vs fallback numerado) preserva intac
     `${customBody}\n\n1. Registrar mi solicitud ahora\n2. Corregir un dato ingresado`
   );
 });
+
+test('5) Pregunta #7 Dato de contacto con versión heredada (conservando conditionalPrompts.whatsapp/email y correctionPrompt): WhatsApp, correo, reintento inválido y corrección desde Confirmación en payload WasapFlow', async () => {
+  const origCwd = process.cwd();
+  const origFetch = globalThis.fetch;
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'nalas-q7-legacy-'));
+
+  try {
+    process.chdir(tmpDir);
+    await fs.mkdir(path.join(tmpDir, 'data'), { recursive: true });
+    resetMemoryCacheForTests(undefined);
+
+    const store = createInitialStore();
+    const nexoBiz = store.businesses.find((b) => b.id === 'biz_nexo')!;
+    const nexoAssistant = store.assistants.find((a) => a.businessId === 'biz_nexo')!;
+
+    store.channelConnections = store.channelConnections.filter(
+      (c) => c.id !== WASAPFLOW_CONNECTION_ID
+    );
+    store.channelConnections.push({
+      id: WASAPFLOW_CONNECTION_ID,
+      businessId: 'biz_nexo',
+      assistantId: nexoAssistant.id,
+      environment: 'produccion',
+      channelType: 'whatsapp_prueba',
+      adapterId: 'adapter_wasapflow_bridge',
+      displayName: 'WhatsApp NEXO · WasapFlow (+506 7058 2232)',
+      destinationAddress: 'phone_nexo_real_01',
+      supportsButtons: true,
+      maxButtons: 3,
+      implementationStatus: 'Producción conectada',
+      status: 'activa',
+    });
+
+    const visibleQ7Prompt =
+      'Perfecto. ¿Cuál es tu número de WhatsApp o correo electrónico?\n(Pregunta 7 de 10)';
+
+    // Simular versión publicada heredada (como v7) que conserva conditionalPrompts.whatsapp/email y correctionPrompt oculto
+    const legacyOpting = store.flowVersions.find(
+      (f) => f.businessId === 'biz_nexo' && f.flowKey === 'opting' && f.status === 'publicada'
+    )!;
+    assert.ok(legacyOpting);
+    legacyOpting.versionNumber = 7;
+    const datoStep = legacyOpting.steps.find((s) => s.id === 'opt_dato_contacto')!;
+    datoStep.prompt = visibleQ7Prompt;
+    datoStep.correctionPrompt = 'CORRECCION_OCULTA: Indicá nuevamente tu dato de contacto.';
+    datoStep.dynamicMode = 'channel_contact_value';
+    datoStep.conditionalPrompts = {
+      whatsapp: 'Perfecto. ¿Cuál es tu número de WhatsApp, incluyendo el código de país?',
+      whatsappInvalid:
+        '¿Podés revisar el número? Incluí el código de país; por ejemplo, +506 seguido de tu número.',
+      email: 'Perfecto. ¿Cuál es tu correo electrónico?',
+      emailInvalid:
+        '¿Podés revisar el correo? Debe incluir el nombre, el símbolo @ y el dominio; por ejemplo, nombre@empresa.com.',
+    };
+    assert.equal(nexoBiz.activeFlowVersionId, legacyOpting.id);
+
+    await fs.writeFile(
+      path.join(tmpDir, 'data', 'nalas-store.json'),
+      JSON.stringify(store, null, 2),
+      'utf8'
+    );
+    resetMemoryCacheForTests(undefined);
+
+    await saveWasapFlowBridgeState({
+      status: 'conectado',
+      businessId: 'biz_nexo',
+      connectionId: WASAPFLOW_CONNECTION_ID,
+      wabaId: '1134905979085055',
+      phoneNumberId: 'phone_nexo_real_01',
+      displayPhoneNumber: '+50670582232',
+      verifiedName: 'NEXO Technologies',
+      connectionMode: 'coexistence',
+      connectionState: 'connected',
+      connectedAt: new Date(Date.now() - 60_000).toISOString(),
+      statusReason: 'Conectado en prueba',
+    });
+
+    const capturedCalls: CapturedWasapFlowCall[] = [];
+    let msgSeq = 1;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : {};
+      capturedCalls.push({ url, body });
+      return new Response(
+        JSON.stringify({ ok: true, message_id: `wamid.q7_out_${msgSeq++}` }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    }) as typeof fetch;
+
+    const dispatchEvent = async (
+      ev: ReturnType<typeof makeWebhookEvent>
+    ): Promise<CapturedWasapFlowCall[]> => {
+      const before = capturedCalls.length;
+      const pending: Array<Promise<unknown>> = [];
+      await runWithRuntimeContext(
+        {
+          env: {
+            WASAPFLOW_PARTNER_KEY: 'test_partner_key',
+            WASAPFLOW_OUTBOUND_ENABLED: 'true',
+          },
+          isWorker: false,
+          requestId: `req_q7_${ev.data.message_id}`,
+          execCtx: {
+            waitUntil(p) {
+              pending.push(p);
+            },
+          },
+        },
+        async () => {
+          await processWasapFlowWebhookEvent(ev);
+        }
+      );
+      await Promise.all(pending);
+      return capturedCalls.slice(before);
+    };
+
+    // === CHAT 1 (WhatsApp + reintento inválido + out-of-script + corrección desde Confirmación) ===
+    const phoneWa = '50681112233';
+    await dispatchEvent(makeWebhookEvent({ messageId: 'q7.wa.1', from: phoneWa, text: 'Hola' }));
+    await dispatchEvent(
+      makeWebhookEvent({
+        messageId: 'q7.wa.2',
+        from: phoneWa,
+        selectedOptionId: 'prod_nexo_opting',
+        selectedTitle: 'Opting',
+      })
+    );
+    await dispatchEvent(
+      makeWebhookEvent({ messageId: 'q7.wa.3', from: phoneWa, text: 'Aumentar ventas.' })
+    );
+    await dispatchEvent(
+      makeWebhookEvent({ messageId: 'q7.wa.4', from: phoneWa, text: 'Queremos vender más.' })
+    );
+    await dispatchEvent(
+      makeWebhookEvent({
+        messageId: 'q7.wa.5',
+        from: phoneWa,
+        selectedOptionId: 'plazo_1_3_meses',
+        selectedTitle: 'Entre 1 y 3 meses.',
+      })
+    );
+    await dispatchEvent(
+      makeWebhookEvent({ messageId: 'q7.wa.6', from: phoneWa, text: 'Laura Méndez' })
+    );
+    await dispatchEvent(
+      makeWebhookEvent({ messageId: 'q7.wa.7', from: phoneWa, text: 'Comercial Méndez' })
+    );
+
+    // 1) Selección WhatsApp -> debe enviar texto completo visible de pregunta #7
+    const turnSelectWa = await dispatchEvent(
+      makeWebhookEvent({
+        messageId: 'q7.wa.8',
+        from: phoneWa,
+        selectedOptionId: 'canal_whatsapp',
+        selectedTitle: 'WhatsApp.',
+      })
+    );
+    assert.equal(turnSelectWa.length, 1);
+    assert.equal(getWasapFlowBodyText(turnSelectWa[0].body), visibleQ7Prompt);
+
+    // 2) Reintento tras dato inválido en WhatsApp -> conserva mensaje de error de teléfono
+    const turnInvalidWa = await dispatchEvent(
+      makeWebhookEvent({ messageId: 'q7.wa.9_bad', from: phoneWa, text: '81112233' })
+    );
+    assert.equal(turnInvalidWa.length, 1);
+    assert.equal(
+      getWasapFlowBodyText(turnInvalidWa[0].body),
+      '¿Podés revisar el número? Incluí el código de país; por ejemplo, +506 seguido de tu número.'
+    );
+
+    // Reintento de re-pregunta (regla fuera de guion en #7 -> Seguir con las preguntas) -> vuelve a mostrar pregunta #7 visible
+    await dispatchEvent(
+      makeWebhookEvent({ messageId: 'q7.wa.9_oos', from: phoneWa, text: '¿Cuál es el horario?' })
+    );
+    const turnOosResume = await dispatchEvent(
+      makeWebhookEvent({
+        messageId: 'q7.wa.9_oos_resume',
+        from: phoneWa,
+        selectedOptionId: 'cmd_seguir',
+        selectedTitle: 'Seguir con las preguntas.',
+      })
+    );
+    assert.equal(turnOosResume.length, 1);
+    assert.equal(getWasapFlowBodyText(turnOosResume[0].body), visibleQ7Prompt);
+
+    // Dato válido -> avanza a Resumen/Confirmación
+    const turnValidWa = await dispatchEvent(
+      makeWebhookEvent({ messageId: 'q7.wa.9_ok', from: phoneWa, text: '+50681112233' })
+    );
+    assert.equal(turnValidWa.length, 1);
+
+    // 3) Corrección del dato desde Confirmación (siguiendo el menú de Opting -> Correo y directo)
+    await dispatchEvent(
+      makeWebhookEvent({
+        messageId: 'q7.wa.10_fix',
+        from: phoneWa,
+        selectedOptionId: 'corregir',
+        selectedTitle: 'Corregir un dato.',
+      })
+    );
+    await dispatchEvent(
+      makeWebhookEvent({
+        messageId: 'q7.wa.11_field',
+        from: phoneWa,
+        selectedOptionId: 'fix:opt_canal_contacto',
+        selectedTitle: 'Medio o dato de contacto.',
+      })
+    );
+    const turnFixToEmail = await dispatchEvent(
+      makeWebhookEvent({
+        messageId: 'q7.wa.12_email_mode',
+        from: phoneWa,
+        selectedOptionId: 'canal_correo',
+        selectedTitle: 'Correo electrónico.',
+      })
+    );
+    assert.equal(turnFixToEmail.length, 1);
+    assert.equal(
+      getWasapFlowBodyText(turnFixToEmail[0].body),
+      visibleQ7Prompt,
+      'En corrección hacia correo no debe usar conditionalPrompts.email ni correctionPrompt oculto'
+    );
+
+    // Reintento tras correo inválido en corrección -> conserva error de correo
+    const turnInvalidEmailInFix = await dispatchEvent(
+      makeWebhookEvent({ messageId: 'q7.wa.13_bad_mail', from: phoneWa, text: 'correo-malo' })
+    );
+    assert.equal(turnInvalidEmailInFix.length, 1);
+    assert.equal(
+      getWasapFlowBodyText(turnInvalidEmailInFix[0].body),
+      '¿Podés revisar el correo? Debe incluir el nombre, el símbolo @ y el dominio; por ejemplo, nombre@empresa.com.'
+    );
+
+    // Correo válido -> vuelve al resumen/confirmación
+    const turnValidEmailInFix = await dispatchEvent(
+      makeWebhookEvent({ messageId: 'q7.wa.13_ok_mail', from: phoneWa, text: 'laura@mendez.cr' })
+    );
+    assert.equal(turnValidEmailInFix.length, 1);
+    assert.match(getWasapFlowBodyText(turnValidEmailInFix[0].body), /laura@mendez\.cr/);
+
+    // === CHAT 2 (Selección directa de Correo + corrección directa del paso #7 sin followUpStepId) ===
+    const savedStore = JSON.parse(
+      await fs.readFile(path.join(tmpDir, 'data', 'nalas-store.json'), 'utf8')
+    ) as NalasStore;
+    const flowForDirectFix = savedStore.flowVersions.find((f) => f.id === legacyOpting.id)!;
+    const confirmForDirectFix = flowForDirectFix.steps.find((s) => s.id === 'opt_confirmacion')!;
+    confirmForDirectFix.correctionFields = [
+      ...(confirmForDirectFix.correctionFields ?? []),
+      { stepId: 'opt_dato_contacto', label: 'Dato de contacto.' },
+    ];
+    // Verificar que otro paso (opt_empresa) conserva su correctionPrompt intacto
+    const empresaStep = flowForDirectFix.steps.find((s) => s.id === 'opt_empresa')!;
+    assert.equal(
+      empresaStep.correctionPrompt,
+      '¿Cuál es el nombre correcto de tu negocio o empresa?'
+    );
+    await fs.writeFile(
+      path.join(tmpDir, 'data', 'nalas-store.json'),
+      JSON.stringify(savedStore, null, 2),
+      'utf8'
+    );
+    resetMemoryCacheForTests(undefined);
+
+    const phoneMail = '50684445566';
+    await dispatchEvent(makeWebhookEvent({ messageId: 'q7.em.1', from: phoneMail, text: 'Hola' }));
+    await dispatchEvent(
+      makeWebhookEvent({
+        messageId: 'q7.em.2',
+        from: phoneMail,
+        selectedOptionId: 'prod_nexo_opting',
+        selectedTitle: 'Opting',
+      })
+    );
+    await dispatchEvent(
+      makeWebhookEvent({ messageId: 'q7.em.3', from: phoneMail, text: 'Aumentar ventas.' })
+    );
+    await dispatchEvent(
+      makeWebhookEvent({ messageId: 'q7.em.4', from: phoneMail, text: 'Contexto correo.' })
+    );
+    await dispatchEvent(
+      makeWebhookEvent({
+        messageId: 'q7.em.5',
+        from: phoneMail,
+        selectedOptionId: 'plazo_1_3_meses',
+        selectedTitle: 'Entre 1 y 3 meses.',
+      })
+    );
+    await dispatchEvent(
+      makeWebhookEvent({ messageId: 'q7.em.6', from: phoneMail, text: 'Diego Solano' })
+    );
+    await dispatchEvent(
+      makeWebhookEvent({ messageId: 'q7.em.7', from: phoneMail, text: 'Solano Tech' })
+    );
+
+    // 4) Selección Correo -> debe enviar texto completo visible de pregunta #7
+    const turnSelectEmail = await dispatchEvent(
+      makeWebhookEvent({
+        messageId: 'q7.em.8',
+        from: phoneMail,
+        selectedOptionId: 'canal_correo',
+        selectedTitle: 'Correo electrónico.',
+      })
+    );
+    assert.equal(turnSelectEmail.length, 1);
+    assert.equal(getWasapFlowBodyText(turnSelectEmail[0].body), visibleQ7Prompt);
+
+    // Reintento tras correo inválido -> conserva error de correo
+    const turnBadEmail = await dispatchEvent(
+      makeWebhookEvent({ messageId: 'q7.em.9_bad', from: phoneMail, text: 'diego.sin.arroba' })
+    );
+    assert.equal(turnBadEmail.length, 1);
+    assert.equal(
+      getWasapFlowBodyText(turnBadEmail[0].body),
+      '¿Podés revisar el correo? Debe incluir el nombre, el símbolo @ y el dominio; por ejemplo, nombre@empresa.com.'
+    );
+
+    // Correo válido -> avanza a resumen/confirmación
+    await dispatchEvent(
+      makeWebhookEvent({ messageId: 'q7.em.9_ok', from: phoneMail, text: 'diego@solano.io' })
+    );
+
+    // Corrección directa a Dato de contacto (fix:opt_dato_contacto) -> debe mostrar visibleQ7Prompt sin correctionPrompt ni conditionalPrompts
+    await dispatchEvent(
+      makeWebhookEvent({
+        messageId: 'q7.em.10_fix',
+        from: phoneMail,
+        selectedOptionId: 'corregir',
+        selectedTitle: 'Corregir un dato.',
+      })
+    );
+    const turnDirectFixDato = await dispatchEvent(
+      makeWebhookEvent({
+        messageId: 'q7.em.11_direct',
+        from: phoneMail,
+        selectedOptionId: 'fix:opt_dato_contacto',
+        selectedTitle: 'Dato de contacto.',
+      })
+    );
+    assert.equal(turnDirectFixDato.length, 1);
+    assert.equal(getWasapFlowBodyText(turnDirectFixDato[0].body), visibleQ7Prompt);
+  } finally {
+    globalThis.fetch = origFetch;
+    resetMemoryCacheForTests(undefined);
+    process.chdir(origCwd);
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});
